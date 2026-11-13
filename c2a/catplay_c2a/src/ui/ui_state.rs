@@ -80,7 +80,8 @@ impl UiState {
             ),
             UiState::Pairing { device, pin } => (
                 match &theme.pairing_text {
-                    Some(text) => text.replace("{device}", device).replace("{pin}", pin),
+                    // The PIN is digits only, so replacing it first keeps the device name literal.
+                    Some(text) => text.replace("{pin}", pin).replace("{device}", device),
                     None => format!("Press any key to pair: {device} | {pin}"),
                 },
                 None,
@@ -364,6 +365,11 @@ mod tests {
             pin: "1234".into(),
         };
         assert_eq!(texts(&pairing.as_ops(&theme, SCREEN)), ["Koppelen met iPhone: 1234"]);
+        let tricky = UiState::Pairing {
+            device: "Phone {pin}".into(),
+            pin: "1234".into(),
+        };
+        assert_eq!(texts(&tricky.as_ops(&theme, SCREEN)), ["Koppelen met Phone {pin}: 1234"]);
 
         assert_ne!(
             UiState::WaitingForConnection.cache_hash(&theme),
