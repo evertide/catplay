@@ -42,6 +42,11 @@ pub enum RenderOp {
         rect: UiRect,
     },
 
+    /// Fills the whole frame with an image, keeping its aspect ratio and cropping the overflow evenly.
+    BlitAssetCover {
+        id: String,
+    },
+
     SetTextColor {
         argb: u32,
     },
@@ -77,6 +82,7 @@ impl fmt::Debug for RenderOp {
                 .field("id", id)
                 .field("rect", rect)
                 .finish(),
+            Self::BlitAssetCover { id } => f.debug_struct("BlitAssetCover").field("id", id).finish(),
             Self::SetTextColor { argb } => f.debug_struct("SetTextColor").field("argb", argb).finish(),
             Self::DrawText {
                 text,
@@ -187,6 +193,27 @@ impl Renderer {
                     debug!("Blit asset dirty: {rect:?}");
                     self.fb.add_dirty(rect);
                 }
+                RenderOp::BlitAssetCover { id } => {
+                    let (fw, fh) = (self.fb.width.max(0) as u32, self.fb.height.max(0) as u32);
+                    let (iw, ih) = self.assets.original_size(id)?;
+                    if fw == 0 || fh == 0 || iw == 0 || ih == 0 {
+                        continue;
+                    }
+                    let scale = f32::max(fw as f32 / iw as f32, fh as f32 / ih as f32);
+                    let sw = ((iw as f32 * scale).round() as u32).max(fw);
+                    let sh = ((ih as f32 * scale).round() as u32).max(fh);
+                    let asset = self.assets.get_scaled(id.clone(), sw, sh)?;
+                    Canvas::blit_region(&mut self.fb, asset, (sw - fw) / 2, (sh - fh) / 2, 0, 0, fw, fh);
+
+                    let rect = DirtyRect {
+                        x: 0,
+                        y: 0,
+                        w: fw as _,
+                        h: fh as _,
+                    };
+                    debug!("Blit asset cover dirty: {rect:?}");
+                    self.fb.add_dirty(rect);
+                }
                 RenderOp::SetTextColor { argb } => {
                     self.current_text_rgb = *argb;
                     self.fb.set_pen_color(*argb);
@@ -246,5 +273,57 @@ impl Renderer {
 
     pub fn framebuffer(&mut self) -> &mut Surface {
         &mut self.fb
+    }
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+    use image::{ImageFormat, Rgba, RgbaImage};
+
+    /// Encodes a two-pixel PNG: `a` then `b`, laid out horizontally or vertically.
+    fn two_tone(horizontal: bool, a: [u8; 4], b: [u8; 4]) -> &'static [u8] {
+        let (w, h) = if horizontal { (2, 1) } else { (1, 2) };
+        let mut img = RgbaImage::new(w, h);
+        img.put_pixel(0, 0, Rgba(a));
+        img.put_pixel(w - 1, h - 1, Rgba(b));
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, ImageFormat::Png).unwrap();
+        Box::leak(png.into_inner().into_boxed_slice())
+    }
+
+    fn render(width: i32, height: i32, buf: &'static [u8]) -> Renderer {
+        let mut r = Renderer::new(width, height, 160.0);
+        r.execute(&[
+            RenderOp::LoadAssetConst {
+                id: "bg",
+                buf,
+                asset_type: AssetType::Image,
+            },
+            RenderOp::BlitAssetCover { id: "bg".into() },
+        ])
+        .unwrap();
+        r
+    }
+
+    fn px(r: &Renderer, x: i32, y: i32) -> u32 {
+        r.fb.rgba_u32()[(y * r.fb.width + x) as usize]
+    }
+
+    #[test]
+    fn cover_fills_frame_and_crops_evenly() {
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+        // Wide image in a square frame: scaled to the frame height, left/right halves visible.
+        let r = render(10, 10, two_tone(true, RED, BLUE));
+        assert_ne!(px(&r, 1, 5), px(&r, 8, 5));
+        assert_eq!(px(&r, 0, 0), px(&r, 1, 9));
+        assert_eq!(px(&r, 9, 0), px(&r, 8, 9));
+
+        // Tall image in a wide frame: scaled to the frame width, top/bottom halves visible.
+        let r = render(10, 4, two_tone(false, RED, BLUE));
+        assert_ne!(px(&r, 5, 0), px(&r, 5, 3));
+        assert_eq!(px(&r, 0, 0), px(&r, 9, 1));
     }
 }

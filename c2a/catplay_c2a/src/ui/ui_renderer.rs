@@ -12,7 +12,7 @@ use catplay_fb::{
 use catplay_tracing_macro::trace_time;
 use log::{info, warn};
 
-use crate::ui::UiState;
+use crate::ui::{UiState, UiTheme};
 
 pub struct UiRenderer {
     width: i32,
@@ -24,6 +24,7 @@ pub struct UiRenderer {
     headers: BytesMut,
     last_state: UiState,
     persist_dir: Option<PathBuf>,
+    theme: UiTheme,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -51,6 +52,7 @@ impl UiRenderer {
             h264: None,
             last_state: UiState::Hidden,
             headers: BytesMut::new(),
+            theme: UiTheme::load(persist_dir.as_deref()),
             persist_dir,
         })
     }
@@ -69,7 +71,7 @@ impl UiRenderer {
         if reset {
             self.fb.reset(self.width, self.height, self.dpi);
         }
-        self.fb.execute(&state.as_ops())?;
+        self.fb.execute(&state.as_ops(&self.theme))?;
         self.last_state = state;
         Ok(())
     }
@@ -109,7 +111,7 @@ impl UiRenderer {
 
     fn keyframe_cache_key(&self, state: &UiState) -> KeyframeCacheKey {
         KeyframeCacheKey {
-            hash: state.cache_hash(),
+            hash: state.cache_hash(&self.theme),
             width: self.width as u32,
             height: self.height as u32,
             dpi: self.dpi.round() as u32,

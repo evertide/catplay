@@ -90,6 +90,15 @@ impl AssetCache {
         debug!("Releasing font {id}");
     }
 
+    /// Size of a loaded image before any scaling.
+    pub fn original_size(&self, id: &str) -> Result<(u32, u32), AssetCacheError> {
+        let orig = self
+            .img_originals
+            .get(id)
+            .ok_or_else(|| AssetCacheError::AssetNotFound(id.into()))?;
+        Ok((orig.width.max(0) as u32, orig.height.max(0) as u32))
+    }
+
     pub fn get_scaled(&mut self, id: String, w: u32, h: u32) -> Result<&Surface, AssetCacheError> {
         let key = (id.clone(), w, h);
 
