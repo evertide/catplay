@@ -183,6 +183,10 @@ impl FileTransferTransmitter {
         }
     }
 
+    pub(crate) fn has_reservations(&self) -> bool {
+        self.taken_ids.iter().any(|&taken| taken)
+    }
+
     pub fn reserve(&mut self) -> Option<FileTransferReserved> {
         let valid_range = if self.server { 128u8..255 } else { 0u8..127 };
 

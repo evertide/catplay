@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    FileTransferOp, FileTransferPayload, LSPPayload, LinkEvent, LinkLayer, LinkStatus, Packet, SessionType,
+    FileTransferOp, FileTransferPayload, LSPPayload, LinkEvent, LinkLayer, LinkSession, LinkStatus, Packet, SessionType,
     SimpleLSPNegotiator,
     clock::MockClock,
     files::{FileTransferEvent, FileTransferOutgoingSource, FileTransferReserved},
@@ -36,15 +36,11 @@ impl LinkLayerFileTest {
         let server_queue = Arc::new(Mutex::new(VecDeque::new()));
         let clock = MockClock::new(Instant::now());
 
-        let client = LinkLayer::with_clock_and_lsp_negotiator(
-            false,
-            Box::new(clock.clone()),
-            Box::new(SimpleLSPNegotiator::new(client_lsp)),
-            {
+        let client =
+            LinkLayer::with_clock_and_lsp_negotiator(false, Box::new(clock.clone()), Box::new(SimpleLSPNegotiator::new(client_lsp)), {
                 let client_queue = client_queue.clone();
                 move |ev| client_queue.lock().unwrap().push_back(ev)
-            },
-        );
+            });
         let server = LinkLayer::with_clock(true, Box::new(clock), {
             let server_queue = server_queue.clone();
             move |ev| server_queue.lock().unwrap().push_back(ev)
@@ -229,6 +225,16 @@ fn setup_for_unknown_transfer_id_is_cancelled_and_reclaimed_end_to_end() {
 }
 
 #[test]
+fn reserve_file_tx_succeeds_when_file_session_negotiated() {
+    let mut test = LinkLayerFileTest::new();
+    test.sync();
+
+    assert!(test.server.has_session_of_type(SessionType::FileTransfer));
+    assert!(test.server.reserve_file_tx().is_some());
+    assert!(test.client.reserve_file_tx().is_some());
+}
+
+#[test]
 fn file_transfer_without_negotiated_file_session_does_not_panic() {
     // Some head units (seen on a Volvo XC90 / Sensus) negotiate only a Control session.
     let mut control_only = LSPPayload::bluetooth();
@@ -236,27 +242,45 @@ fn file_transfer_without_negotiated_file_session_does_not_panic() {
         .sessions
         .retain(|s| s.session_type == SessionType::Control);
     let mut test = LinkLayerFileTest::with_client_lsp(control_only);
+
+    // Work queued before negotiation finished (our default LSP still offers File/EA)...
+    let early = test
+        .server
+        .reserve_file_tx()
+        .expect("file id before negotiation");
+    let early_id = early.0;
+    test.server
+        .files()
+        .send_file(early, 0x1234, &[], FileTransferOutgoingSource::VecData(vec![1, 2, 3]));
+    test.server.ea().enqueue_tx(vec![0xea]);
+
     test.sync();
 
     assert_eq!(test.client.status(), &LinkStatus::Writable);
     assert_eq!(test.server.status(), &LinkStatus::Writable);
     assert!(!test.server.has_session_of_type(SessionType::FileTransfer));
 
+    // ...is released once the peer turns out not to support it.
+    assert!(!test.server.files().has_tx_pending());
+    assert!(!test.server.ea().has_tx_pending());
+
     // Callers asking the link for a file id learn that no transfer is possible.
     assert!(test.server.reserve_file_tx().is_none());
 
     // A transfer queued anyway (bypassing the link-level check) must not take the link down.
     let reserved = test.server.files().reserve_file_tx().expect("file id");
-    test.server.files().send_file(
-        reserved,
-        0x1234,
-        &[],
-        FileTransferOutgoingSource::VecData(vec![1, 2, 3]),
-    );
+    assert_eq!(reserved.0, early_id, "early reservation was not released");
+    test.server
+        .files()
+        .send_file(reserved, 0x1234, &[], FileTransferOutgoingSource::VecData(vec![1, 2, 3]));
+    for _ in 0..5 {
+        test.sync();
+    }
+
+    // Control traffic queued after the blocked transfer still gets through.
     let control = vec![0x40, 0x40, 0x00, 0x06, 0x00, 0x00];
     test.server.csm().enqueue_tx(control.clone());
-
-    for _ in 0..10 {
+    for _ in 0..5 {
         test.sync();
     }
 

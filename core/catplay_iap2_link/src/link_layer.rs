@@ -384,10 +384,11 @@ impl LinkLayer {
         counter
     }
 
-    /// Whether the negotiated link has a session of the given type.
+    /// Whether the local LSP has a session of the given type.
     ///
-    /// The peer decides which sessions exist; e.g. some head units negotiate
-    /// only a Control session and no FileTransfer session.
+    /// Before negotiation completes this reflects our default offer; afterwards it is the
+    /// negotiated set. The peer may drop sessions, e.g. some head units negotiate only a
+    /// Control session and no FileTransfer session.
     pub fn has_session_of_type(&self, session_type: SessionType) -> bool {
         self.find_session_of_type(session_type).is_some()
     }
@@ -399,6 +400,17 @@ impl LinkLayer {
             return None;
         }
         self.files.reserve_file_tx()
+    }
+
+    /// Drops work queued before negotiation finished for sessions the peer did not negotiate,
+    /// releasing reserved file ids instead of keeping them (and their data) forever.
+    fn release_unsupported_sessions(&mut self) {
+        if !self.has_session_of_type(SessionType::FileTransfer) && self.files.reset_tx() {
+            warn!(target: self.logger, "Peer negotiated no FileTransfer session; dropped queued file transfers");
+        }
+        if !self.has_session_of_type(SessionType::ExternalAccessory) && self.ea.clear_tx() {
+            warn!(target: self.logger, "Peer negotiated no ExternalAccessory session; dropped queued EA payloads");
+        }
     }
 
     fn find_session_of_type(&self, session_type: SessionType) -> Option<u8> {
@@ -725,6 +737,7 @@ impl LinkLayer {
                 self.negotiation.note_lsp_accepted_by_us(lsp.clone());
                 self.peer_lsp = lsp.clone();
                 self.local_lsp = self.negotiation.local_lsp().clone();
+                self.release_unsupported_sessions();
                 debug!(
                     target: self.logger,
                     "Accessory accepted peer LSP {:?}; local LSP {:?}; waiting to transmit final ACK",
@@ -765,6 +778,7 @@ impl LinkLayer {
                 .accepted_peer_lsp()
                 .cloned()
                 .unwrap_or_else(|| self.local_lsp.clone());
+            self.release_unsupported_sessions();
             self.negotiation.transition_accepted();
             self.change_state(LinkStatus::Writable);
             debug!(target: self.logger, "Host has successfully negotiated link");
