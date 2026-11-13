@@ -76,7 +76,7 @@ impl CsmSession for Iap2LocationBridge {
             }
             consumed = true;
         }
-        if let Some(update) = self.updates.take() {
+        if let Some(update) = mpsc::PeekReceiver::take(&mut self.updates) {
             // Drop queued data if the car has disconnected. The server's gps_sub
             // check also rejects data queued before the iPhone's Stop request.
             if self.car.is_available() {
