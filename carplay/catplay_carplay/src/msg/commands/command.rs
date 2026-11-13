@@ -9,7 +9,7 @@ use crate::{
     msg::{
         CommandChangeMapZoomLevel, CommandDisableBluetooth, CommandDuckAudio, CommandForceKeyFrame, CommandHidSendReport,
         CommandHidSetInputMode, CommandIApSendMessage, CommandModesChanged, CommandRequestSiri, CommandRequestUI, CommandSetLimitedUI,
-        CommandSetNightMode, CommandType, CommandUnduckAudio,
+        CommandSetNightMode, CommandShowUI, CommandStopUI, CommandSuggestUI, CommandType, CommandUnduckAudio,
     },
     rtsp_frame::RtspString,
 };
@@ -29,6 +29,9 @@ pub enum Command {
     HidSetInputMode(CommandHidSetInputMode),
     RequestSiri(CommandRequestSiri),
     RequestUI(CommandRequestUI),
+    ShowUI(CommandShowUI),
+    StopUI(CommandStopUI),
+    SuggestUI(CommandSuggestUI),
     SetNightMode(CommandSetNightMode),
     SetLimitedUI(CommandSetLimitedUI),
     ChangeMapZoomLevel(CommandChangeMapZoomLevel),
@@ -49,6 +52,9 @@ impl Command {
             Command::HidSetInputMode(_) => CommandType::HidSetInputMode,
             Command::RequestSiri(_) => CommandType::RequestSiri,
             Command::RequestUI(_) => CommandType::RequestUI,
+            Command::ShowUI(_) => CommandType::ShowUI,
+            Command::StopUI(_) => CommandType::StopUI,
+            Command::SuggestUI(_) => CommandType::SuggestUI,
             Command::SetNightMode(_) => CommandType::SetNightMode,
             Command::SetLimitedUI(_) => CommandType::SetLimitedUI,
             Command::ChangeMapZoomLevel(_) => CommandType::ChangeMapZoomLevel,
@@ -120,6 +126,9 @@ impl Serialize for Command {
             Command::HidSetInputMode(data) => map.serialize_entry("params", data)?,
             Command::RequestSiri(data) => map.serialize_entry("params", data)?,
             Command::RequestUI(data) => map.serialize_entry("params", data)?,
+            Command::ShowUI(data) => map.serialize_entry("params", data)?,
+            Command::StopUI(data) => map.serialize_entry("params", data)?,
+            Command::SuggestUI(data) => map.serialize_entry("params", data)?,
             Command::SetNightMode(data) => map.serialize_entry("params", data)?,
             Command::SetLimitedUI(data) => map.serialize_entry("params", data)?,
             Command::ChangeMapZoomLevel(data) => map.serialize_entry("params", data)?,
@@ -159,6 +168,9 @@ impl<'de> Deserialize<'de> for Command {
             CommandType::HidSetInputMode => from_value(&from_nested(&mut map)?).map(Command::HidSetInputMode),
             CommandType::RequestSiri => from_value(&from_nested(&mut map)?).map(Command::RequestSiri),
             CommandType::RequestUI => from_value(&from_nested(&mut map)?).map(Command::RequestUI),
+            CommandType::ShowUI => from_value(&from_nested(&mut map)?).map(Command::ShowUI),
+            CommandType::StopUI => from_value(&from_nested(&mut map)?).map(Command::StopUI),
+            CommandType::SuggestUI => from_value(&from_nested(&mut map)?).map(Command::SuggestUI),
             CommandType::SetNightMode => from_value(&from_nested(&mut map)?).map(Command::SetNightMode),
             CommandType::SetLimitedUI => from_value(&from_nested(&mut map)?).map(Command::SetLimitedUI),
             CommandType::ChangeMapZoomLevel => from_value(&from_nested(&mut map)?).map(Command::ChangeMapZoomLevel),
@@ -179,7 +191,7 @@ struct CommandRawTypeRef {
 mod tests {
     use catplay_plist::{Dictionary, Value, from_bytes, to_writer_binary};
 
-    use crate::msg::{Command, CommandChangeMapZoomLevel, CommandForceKeyFrame, CommandRequestUI};
+    use crate::msg::{Command, CommandChangeMapZoomLevel, CommandForceKeyFrame, CommandRequestUI, CommandShowUI, CommandStopUI};
 
     #[test]
     fn test_serialize_payload_direct_hid() {
@@ -259,8 +271,44 @@ mod tests {
                 deserialized,
                 Command::RequestUI(CommandRequestUI {
                     url: expected_url.map(str::to_owned),
+                    uuid: None,
                 })
             );
+        }
+    }
+
+    #[test]
+    fn test_show_and_stop_ui_round_trip() {
+        // Sent by a Volvo XC90 (AirTunes 365.10.4) when the driver switches the instrument cluster to and from CarPlay.
+        const CLUSTER: &str = "a5d9a926-fb90-48de-9a02-7c8882c1bb4f";
+        let cases = [
+            (
+                "showUI",
+                vec![("url", "maps:/car/instrumentcluster?showCompass=user&showETA=yes&showSpeedLimit=no"), ("uuid", CLUSTER)],
+                Command::ShowUI(CommandShowUI {
+                    url: Some("maps:/car/instrumentcluster?showCompass=user&showETA=yes&showSpeedLimit=no".into()),
+                    uuid: Some(CLUSTER.into()),
+                }),
+            ),
+            ("stopUI", vec![("uuid", CLUSTER)], Command::StopUI(CommandStopUI { uuid: Some(CLUSTER.into()) })),
+        ];
+
+        for (command_type, params, expected) in cases {
+            let mut dict = Dictionary::new();
+            for (key, value) in params {
+                dict.insert(key.into(), value.into());
+            }
+            let mut command = Dictionary::new();
+            command.insert("type".into(), command_type.into());
+            command.insert("params".into(), dict.into());
+            let mut payload = Vec::new();
+            to_writer_binary(&mut payload, &command).unwrap();
+
+            let deserialized = Command::deserialize(&payload).unwrap();
+            assert_eq!(deserialized, expected);
+            // Proxied to the iPhone as-is.
+            let reserialized = from_bytes::<Value>(&deserialized.serialize().unwrap()).unwrap();
+            assert_eq!(reserialized, Value::Dictionary(command));
         }
     }
 
