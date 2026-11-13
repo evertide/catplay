@@ -26,7 +26,7 @@ const TEXT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 8.0..=72.0;
 /// connecting_text = "Connecting to device: {device}"
 /// pairing_text = "Press any key to pair: {device} | {pin}"
 /// ```
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiTheme {
     /// Full-screen background image (JPEG), scaled to cover the screen.
@@ -46,6 +46,22 @@ pub struct UiTheme {
     /// Content digest of `background_bytes`, part of the keyframe cache key.
     #[serde(skip)]
     pub background_digest: Option<u64>,
+}
+
+impl std::fmt::Debug for UiTheme {
+    /// Like the derived impl, but shows only the size of the background bytes.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UiTheme")
+            .field("background", &self.background)
+            .field("background_len", &self.background_bytes.as_ref().map(|bytes| bytes.len()))
+            .field("waiting_text", &self.waiting_text)
+            .field("subtitle", &self.subtitle)
+            .field("text_size", &self.text_size)
+            .field("connecting_text", &self.connecting_text)
+            .field("pairing_text", &self.pairing_text)
+            .field("background_digest", &self.background_digest)
+            .finish()
+    }
 }
 
 impl UiTheme {
@@ -114,13 +130,16 @@ impl UiTheme {
 
     /// Validates size, format, dimensions and decodability; returns the bytes and their digest.
     fn check_background(path: &Path) -> Result<(Arc<[u8]>, u64), String> {
-        let len = std::fs::metadata(path)
-            .map_err(|err| err.to_string())?
-            .len();
-        if len > MAX_BACKGROUND_BYTES {
-            return Err(format!("file is {len} bytes, limit {MAX_BACKGROUND_BYTES}"));
+        use std::io::Read;
+        // Read at most one byte past the limit, so neither a growing file nor a device that
+        // reports no size can exceed it.
+        let mut buf = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(MAX_BACKGROUND_BYTES + 1).read_to_end(&mut buf))
+            .map_err(|err| err.to_string())?;
+        if buf.len() as u64 > MAX_BACKGROUND_BYTES {
+            return Err(format!("file is larger than {MAX_BACKGROUND_BYTES} bytes"));
         }
-        let buf = std::fs::read(path).map_err(|err| err.to_string())?;
         let (w, h) = AssetCache::jpeg_dimensions(&buf).map_err(|err| err.to_string())?;
         if w == 0 || h == 0 || w > MAX_BACKGROUND_SIDE || h > MAX_BACKGROUND_SIDE || w as u64 * h as u64 > MAX_BACKGROUND_PIXELS {
             return Err(format!(

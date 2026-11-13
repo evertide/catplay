@@ -431,8 +431,12 @@ mod tests {
         let too_many_pixels = theme_with_background(&dir, &jpeg_claiming(1200, 1000), "");
         assert_eq!(too_many_pixels.background_bytes, None);
 
-        let big_file = theme_with_background(&dir, &vec![0xFF; (1 << 20) + 1], "");
+        // A valid JPEG padded past the limit (decoders ignore trailing data).
+        let mut padded = SMALL_JPEG.to_vec();
+        padded.resize((1 << 20) + 1, 0);
+        let big_file = theme_with_background(&dir, &padded, "");
         assert_eq!(big_file.background_bytes, None, "files over the size limit are rejected");
+        assert!(format!("{ok:?}").len() < 500, "Debug must not dump the image bytes");
 
         let mut changed = ok.clone();
         changed.background_digest = Some(ok.background_digest.unwrap() ^ 1);
