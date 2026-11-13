@@ -112,65 +112,47 @@ impl EventReconciler for MockSink {
     type Error = RtspError;
 }
 
-#[tokio::test]
-async fn sends_pair_request() {
-    // setup_test_logger(true);
+/// Returns the receiver handle too: dropping it would stop the mock receiver.
+async fn connect_to_mock_receiver(pair_first: bool) -> (impl Sized, AirPlayTransmitterImpl) {
     let hk_rx = HomekitStorageFile::memory();
     let hk_tx = HomekitStorageFile::memory();
-
-    let shared = AirPlayServerShared::new();
 
     let receiver = AirPlayReceiver::new(
         "fake_iface",
         MacAddr6::default(),
         hk_rx,
         None,
-        shared,
+        AirPlayServerShared::new(),
         Box::new(MockSink {}),
         AirPlayReceiverProfile::CarPlay,
     );
     let session = RtspReceiver::new(receiver);
-    let (_rx, bind) = TcpHelper::accept_timeout(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0), Duration::ZERO, session).unwrap();
+    let (rx, bind) = TcpHelper::accept_timeout(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0), Duration::ZERO, session).unwrap();
 
     let bootstrap = AirPlayTransmitterBootstrap {
         homekit: hk_tx,
         peer_ip: bind,
         controller_features: vec![],
         remote_homekit_id: None,
-        pair_first: false,
+        pair_first,
     };
-    let _transmitter = AirPlayTransmitterImpl::connect(bootstrap).await.unwrap();
-    debug!("Paired!")
+    (rx, AirPlayTransmitterImpl::connect(bootstrap).await.unwrap())
+}
+
+#[tokio::test]
+async fn sends_pair_request() {
+    let (_rx, _transmitter) = connect_to_mock_receiver(false).await;
+}
+
+/// Recent HomeKit receivers (Volvo XC90, srcvers 365.x) are paired before the first SETUP.
+#[tokio::test]
+async fn pairs_before_setup_when_requested() {
+    let (_rx, _transmitter) = connect_to_mock_receiver(true).await;
 }
 
 #[tokio::test]
 async fn setups_video_audio_streams() {
     setup_test_logger(true);
-    let hk_rx = HomekitStorageFile::memory();
-    let hk_tx = HomekitStorageFile::memory();
-
-    let shared = AirPlayServerShared::new();
-
-    let receiver = AirPlayReceiver::new(
-        "fake_iface",
-        MacAddr6::default(),
-        hk_rx,
-        None,
-        shared,
-        Box::new(MockSink {}),
-        AirPlayReceiverProfile::CarPlay,
-    );
-    let session = RtspReceiver::new(receiver);
-    let (_rx, bind) = TcpHelper::accept_timeout(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0), Duration::ZERO, session).unwrap();
-
-    let bootstrap = AirPlayTransmitterBootstrap {
-        homekit: hk_tx,
-        peer_ip: bind,
-        controller_features: vec![],
-        remote_homekit_id: None,
-        pair_first: false,
-    };
-
     let sps_pps: Vec<u8> = vec![
         0x00, 0x00, 0x00, 0x01, // start code
         0x67, 0x64, 0x00, 0x28, 0xAC, 0x2B, 0x40, 0x78, 0x02, 0x27, 0xE5, 0xC0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00,
@@ -187,7 +169,7 @@ async fn setups_video_audio_streams() {
         respect_timestamps: true,
     };
 
-    let mut _transmitter = AirPlayTransmitterImpl::connect(bootstrap).await.unwrap();
+    let (_rx, mut _transmitter) = connect_to_mock_receiver(false).await;
     let mut sink = _transmitter
         .do_setup_video(StreamType::Screen, Duration::from_millis(75), None)
         .await
