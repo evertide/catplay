@@ -1,110 +1,159 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 
 use catplay_csm::{
     decoder::{CsmFlag, CsmPacketId},
-    msg::{
-        IdentificationInformation, LocationInformation, LocationInformationComponent, PowerSourceUpdate, StartLocationInformation,
-        StartPowerUpdates, StopLocationInformation,
-    },
+    msg::{IdentificationInformation, LocationInformation, LocationInformationComponent, StartLocationInformation, StopLocationInformation},
 };
 use catplay_iap2_client::{CsmClientHandleRef, CsmSessionResult};
-use catplay_util::{EventSleeper, mpsc, notify::Notify};
+use catplay_util::{EventSleeper, EventToken};
 use log::info;
+use tokio::sync::watch;
 
-/// The current Bluetooth request, shared with each successive USB iAP2 session.
+type LocationRequest = (StartLocationInformation, watch::Sender<Option<LocationInformation>>);
+
+/// The current iPhone request, shared with each successive USB iAP2 session.
 /// Negotiation and the active car request remain local to the USB session.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct LocationBridge {
-    current: Arc<Mutex<Option<(StartLocationInformation, mpsc::UnboundedSender<LocationInformation>)>>>,
-    changed: Notify,
+    request: watch::Sender<Option<LocationRequest>>,
+    car: Arc<Mutex<Weak<AtomicBool>>>,
 }
 
-impl LocationBridge {
-    pub fn subscribe(&self, request: StartLocationInformation) -> LocationSubscription {
-        let (tx, updates) = mpsc::unbounded();
-        *self.current.lock().unwrap() = Some((request, tx));
-        self.changed.notify();
-        LocationSubscription {
-            updates,
-            changed: self.changed.clone(),
+impl Default for LocationBridge {
+    fn default() -> Self {
+        Self {
+            request: watch::channel(None).0,
+            car: Default::default(),
         }
     }
 }
 
-/// Closing this receiver cancels its request and wakes the car to send Stop.
-#[derive(EventSleeper)]
+impl LocationBridge {
+    /// Only the newest USB session determines whether to open the AirPlay endpoint.
+    pub fn is_available(&self) -> bool {
+        self.car
+            .lock()
+            .unwrap()
+            .upgrade()
+            .is_some_and(|car| car.load(Ordering::Relaxed))
+    }
+
+    pub fn subscribe(&self, request: StartLocationInformation) -> LocationSubscription {
+        let (tx, updates) = watch::channel(None);
+        self.request.send_replace(Some((request, tx)));
+        LocationSubscription {
+            updates: Some(updates),
+            pending: false,
+            request: self.request.clone(),
+        }
+    }
+}
+
+/// Keeps only the latest fix. Closing the receiver cancels its request and wakes
+/// every USB session, including briefly overlapping sessions during reconnects.
 pub struct LocationSubscription {
-    #[sleep]
-    updates: mpsc::UnboundedReceiver<LocationInformation>,
-    changed: Notify,
+    updates: Option<watch::Receiver<Option<LocationInformation>>>,
+    pending: bool,
+    request: watch::Sender<Option<LocationRequest>>,
+}
+
+impl EventSleeper for LocationSubscription {
+    async fn sleep(&mut self) -> Option<EventToken> {
+        let updates = self.updates.as_mut()?;
+        if !self.pending {
+            updates.changed().await.ok()?;
+            self.pending = true;
+        }
+        Some(EventToken(1))
+    }
 }
 
 impl LocationSubscription {
     pub fn take(&mut self) -> Option<LocationInformation> {
-        mpsc::PeekReceiver::take(&mut self.updates)
+        let updates = self.updates.as_mut()?;
+        if !self.pending && !updates.has_changed().unwrap_or(false) {
+            return None;
+        }
+        self.pending = false;
+        updates.borrow_and_update().clone()
     }
 }
 
 impl Drop for LocationSubscription {
     fn drop(&mut self) {
-        self.updates.close();
-        self.changed.notify();
+        // Close before publishing cancellation. Dropping an old subscription must
+        // not clear a replacement request that already has its own live receiver.
+        self.updates.take();
+        self.request.send_if_modified(|request| {
+            if request.as_ref().is_some_and(|(_, updates)| updates.is_closed()) {
+                *request = None;
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 
-#[derive(Default)]
 pub(crate) struct CarLocation {
-    pub bridge: LocationBridge,
-    pub started: bool,
-    pub authenticated: bool,
-    pub power_source_replied: bool,
-    pub power_updates_replied: bool,
+    bridge: LocationBridge,
+    requests: watch::Receiver<Option<LocationRequest>>,
+    supported: Arc<AtomicBool>,
+    started: bool,
+    authenticated: bool,
     active: Option<StartLocationInformation>,
-    power_wait_logged: bool,
+}
+
+impl Default for CarLocation {
+    fn default() -> Self {
+        Self::new(LocationBridge::default())
+    }
 }
 
 impl CarLocation {
-    pub async fn wait_event(&mut self) {
-        let _ = self.bridge.changed.sleep().await;
+    pub fn new(bridge: LocationBridge) -> Self {
+        let supported = Arc::new(AtomicBool::new(false));
+        *bridge.car.lock().unwrap() = Arc::downgrade(&supported);
+        Self {
+            requests: bridge.request.subscribe(),
+            bridge,
+            supported,
+            started: false,
+            authenticated: false,
+            active: None,
+        }
     }
 
-    pub fn reset(&mut self, handle: &CsmClientHandleRef) -> CsmSessionResult<()> {
+    pub fn start(&mut self, handle: &CsmClientHandleRef) {
+        self.started = !handle.is_downgrade();
+    }
+
+    pub fn authenticate(&mut self) {
+        self.authenticated = true;
+    }
+
+    pub async fn wait_event(&mut self) {
+        let _ = self.requests.changed().await;
+    }
+
+    pub fn identify(&mut self, id: &IdentificationInformation, handle: &CsmClientHandleRef) -> CsmSessionResult<()> {
         self.stop(handle)?;
         self.authenticated = false;
-        self.power_source_replied = false;
-        self.power_updates_replied = false;
-        self.power_wait_logged = false;
+        self.supported
+            .store(self.started && supports_location(id), Ordering::Relaxed);
         Ok(())
     }
 
     pub fn reconcile(&mut self, id: &IdentificationInformation, handle: &CsmClientHandleRef) -> CsmSessionResult<bool> {
-        let mut current = self.bridge.current.lock().unwrap();
-        if current.as_ref().is_some_and(|(_, updates)| updates.is_closed()) {
-            *current = None;
-        }
-        let request = current
-            .as_ref()
-            .and_then(|(request, _)| intersect(request, id.location_information_component.as_ref()));
-        drop(current);
-
-        // At least one real power exchange is required. If both were advertised,
-        // both replies (including the complete StartPowerUpdates burst) must be sent.
-        let power_ready = (self.power_source_replied || self.power_updates_replied)
-            && (!id.wants_tx(PowerSourceUpdate::PACKET_ID) || self.power_source_replied)
-            && (!id.wants_tx(StartPowerUpdates::PACKET_ID) || self.power_updates_replied);
-        let allowed = self.started
-            && self.authenticated
-            && id.wants_rx(StartLocationInformation::PACKET_ID)
-            && id.wants_rx(StopLocationInformation::PACKET_ID);
-        if request.is_some() && allowed && !power_ready {
-            if !self.power_wait_logged {
-                info!("Car GPS deferred: waiting for a power exchange and all advertised power replies");
-                self.power_wait_logged = true;
-            }
-        } else {
-            self.power_wait_logged = false;
-        }
-        let wanted = request.filter(|_| allowed && power_ready);
+        let request = self.requests.borrow_and_update().clone();
+        // Authentication and explicit location capabilities are sufficient. Power
+        // messages are independent and some cars advertise them without sending any.
+        let wanted = request
+            .filter(|(_, updates)| !updates.is_closed() && self.authenticated && self.supported.load(Ordering::Relaxed))
+            .and_then(|(request, _)| intersect(&request, id.location_information_component.as_ref()));
         if wanted == self.active {
             return Ok(false);
         }
@@ -119,10 +168,9 @@ impl CarLocation {
 
     pub fn forward(&self, packet: &LocationInformation) {
         if self.active.is_some()
-            && let Some((_, updates)) = self.bridge.current.lock().unwrap().as_ref()
+            && let Some((_, updates)) = self.bridge.request.borrow().as_ref()
         {
-            // A closed receiver is handled by the subscription's wakeup above.
-            let _ = updates.unbounded_send(packet.clone());
+            updates.send_replace(Some(packet.clone()));
         }
     }
 
@@ -133,6 +181,13 @@ impl CarLocation {
         }
         Ok(())
     }
+}
+
+fn supports_location(id: &IdentificationInformation) -> bool {
+    id.wants_rx(StartLocationInformation::PACKET_ID)
+        && id.wants_rx(StopLocationInformation::PACKET_ID)
+        && id.wants_tx(LocationInformation::PACKET_ID)
+        && intersect(&StartLocationInformation::all(), id.location_information_component.as_ref()).is_some()
 }
 
 fn intersect(request: &StartLocationInformation, component: Option<&LocationInformationComponent>) -> Option<StartLocationInformation> {

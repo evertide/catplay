@@ -26,9 +26,10 @@ pub struct CarPlayClientSession {
 
 impl CarPlayClientSession {
     pub fn with_location(bridge: LocationBridge) -> Self {
-        let mut session = Self::default();
-        session.location.bridge = bridge;
-        session
+        Self {
+            location: CarLocation::new(bridge),
+            ..Self::default()
+        }
     }
 
     pub fn send(&mut self, packet: &dyn AsCsmPacket, handle: &CsmClientHandleRef) -> CsmSessionResult<()> {
@@ -699,7 +700,7 @@ impl CsmSession for CarPlayClientSession {
         if !_handle.is_downgrade() {
             self.send(&StartIdentification::default(), &_handle)?;
         }
-        self.location.started = !_handle.is_downgrade();
+        self.location.start(&_handle);
         Ok(())
     }
 
@@ -719,7 +720,7 @@ impl CsmSession for CarPlayClientSession {
 
         if let Some(_id) = IdentificationInformation::cast(&packet) {
             self.id = _id.clone();
-            self.location.reset(&_handle)?;
+            self.location.identify(&self.id, &_handle)?;
             let supports_modern_carplay =
                 IdentificationInformation::unpack_ids(&_id.messages_sent_by_accessory).contains(&CarPlayStartSession::PACKET_ID);
             debug!("Identification accepted! Modern CarPlay: {supports_modern_carplay}");
@@ -749,7 +750,7 @@ impl CsmSession for CarPlayClientSession {
         if let Some(_response) = packet.cast::<AuthenticationResponse>() {
             debug!("Authentication accepted!");
             self.send(&AuthenticationSucceeded::default(), &_handle)?;
-            self.location.authenticated = true;
+            self.location.authenticate();
             if self.id.wants_rx(DeviceUUIDUpdate::PACKET_ID) {
                 self.send(
                     &DeviceUUIDUpdate {
@@ -828,7 +829,6 @@ impl CsmSession for CarPlayClientSession {
                 },
                 &_handle,
             )?;
-            self.location.power_source_replied = true;
         }
 
         if packet.cast::<StartPowerUpdates>().is_some() {
@@ -857,7 +857,6 @@ impl CsmSession for CarPlayClientSession {
             ] {
                 self.send(&update, &_handle)?;
             }
-            self.location.power_updates_replied = true;
         }
 
         if packet.cast::<StartCommunicationsUpdates>().is_some() {
