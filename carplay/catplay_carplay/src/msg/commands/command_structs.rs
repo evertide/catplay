@@ -120,6 +120,7 @@ plist_struct! {
 // Sent by the iPhone with the app URLs it suggests the car to show.
 plist_struct! {
     pub struct CommandSuggestUI {
+        #[serde(default)]
         pub urls: Vec<String>,
     }
 }

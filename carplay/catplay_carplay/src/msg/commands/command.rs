@@ -340,6 +340,15 @@ mod tests {
     }
 
     #[test]
+    fn test_suggest_ui_without_urls() {
+        let mut command = Dictionary::new();
+        command.insert("type".into(), "suggestUI".into());
+        let mut payload = Vec::new();
+        to_writer_binary(&mut payload, &command).unwrap();
+        assert_eq!(Command::deserialize(&payload).unwrap(), Command::SuggestUI(CommandSuggestUI { urls: vec![] }));
+    }
+
+    #[test]
     fn test_deserialize_change_map_zoom_level() {
         // Sent by a VW MMX head unit when zooming the map on the instrument cluster.
         let mut params = Dictionary::new();
