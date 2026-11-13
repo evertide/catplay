@@ -18,6 +18,9 @@ const TEXT_COLOR: u32 = 0xFFFFFFFF;
 const SUBTITLE_COLOR: u32 = 0xFFAAA096;
 /// `SetBackground` takes 0xRRGGBBAA.
 const PHOTO_BACKDROP: u32 = 0x000000FF;
+/// A 1x1 white image, stretched into the "OK" button of the pairing screen.
+const BUTTON_IMAGE: &[u8] = include_bytes!("../../assets/button.png");
+const BUTTON_TEXT_COLOR: u32 = 0xFF202020;
 
 /// Optional, user-provided look of the built-in screens, read from `<persist_dir>/ui.toml`.
 ///
@@ -222,7 +225,11 @@ impl UiTheme {
                     RenderOp::ReleaseAsset { id: "background".into() },
                 ]),
                 (RenderOp::BlitAsset { .. }, Some(_)) => {}
-                (RenderOp::DrawText { .. }, _) => ops.extend(self.text_ops(text.clone(), subtitle.clone(), screen)),
+                (RenderOp::DrawText { .. }, _) => {
+                    // Any key or touch confirms pairing; the button only makes that visible.
+                    let button = matches!(state, UiState::Pairing { .. });
+                    ops.extend(self.text_ops(text.clone(), subtitle.clone(), button, screen))
+                }
                 (op, _) => ops.push(op),
             }
         }
@@ -251,17 +258,21 @@ impl UiTheme {
         Some(custom.unwrap_or(upstream_text))
     }
 
-    /// Bottom-aligned text block in pixels: the main line, then an optional smaller subtitle.
+    /// Bottom-aligned text block in pixels: an optional "OK" button, the main line, then an
+    /// optional smaller subtitle.
     ///
     /// The block is shrunk to at most a third of the screen height and keeps a bottom margin,
     /// so it stays on screen for any text size. `DrawText` treats `y` as the top of the line
     /// (the font renderer adds the ascent).
-    fn text_ops(&self, text: String, subtitle: Option<String>, screen: UiScreen) -> Vec<RenderOp> {
+    fn text_ops(&self, text: String, subtitle: Option<String>, button: bool, screen: UiScreen) -> Vec<RenderOp> {
         const LINE: f32 = 1.25;
         const SUBTITLE_SCALE: f32 = 0.6;
+        // Button height and the gap below it, in main-text lines.
+        const BUTTON_LINES: f32 = 1.6;
+        const BUTTON_GAP: f32 = 0.5;
         let height = screen.height.max(1) as f32;
         let px_per_pt = screen.dpi.max(1.0) / 72.0;
-        let lines = 1.0 + if subtitle.is_some() { SUBTITLE_SCALE } else { 0.0 };
+        let lines = 1.0 + if subtitle.is_some() { SUBTITLE_SCALE } else { 0.0 } + if button { BUTTON_LINES + BUTTON_GAP } else { 0.0 };
 
         let mut size = self.text_size.unwrap_or(DEFAULT_TEXT_SIZE);
         let max_block = height / 3.0;
@@ -287,9 +298,34 @@ impl UiTheme {
             font_size_pt,
             color,
         };
-        let mut ops = vec![line(text, top, size, TEXT_COLOR)];
+        let mut ops = Vec::new();
+        let mut y = top;
+        if button {
+            let button_h = main_h * BUTTON_LINES;
+            ops.extend([
+                RenderOp::LoadAssetConst {
+                    id: "button",
+                    buf: BUTTON_IMAGE,
+                    asset_type: AssetType::Image,
+                },
+                RenderOp::BlitAsset {
+                    id: "button".into(),
+                    rect: UiRect {
+                        x: Unit::Percent(0.5),
+                        y: Unit::Px(y),
+                        w: Unit::Px(button_h * 2.5),
+                        h: Unit::Px(button_h),
+                        anchor: Anchor::TopCenter,
+                    },
+                },
+                RenderOp::ReleaseAsset { id: "button".into() },
+                line("OK".into(), y + (button_h - main_h) / 2.0, size, BUTTON_TEXT_COLOR),
+            ]);
+            y += button_h + main_h * BUTTON_GAP;
+        }
+        ops.push(line(text, y, size, TEXT_COLOR));
         if let Some(subtitle) = subtitle {
-            ops.push(line(subtitle, top + main_h, size * SUBTITLE_SCALE, SUBTITLE_COLOR));
+            ops.push(line(subtitle, y + main_h, size * SUBTITLE_SCALE, SUBTITLE_COLOR));
         }
         ops
     }
@@ -371,8 +407,12 @@ mod tests {
         };
         assert!(theme.is_default());
         for state in all_states() {
-            // No custom text or background: the only change is the text layout.
-            assert_eq!(texts(&theme.ops(&state, SCREEN)), texts(&state.as_ops()), "{state}");
+            // No custom text or background: only the text layout changes, plus the pairing button.
+            let mut expected = texts(&state.as_ops());
+            if matches!(state, UiState::Pairing { .. }) {
+                expected.insert(0, "OK".into());
+            }
+            assert_eq!(texts(&theme.ops(&state, SCREEN)), expected, "{state}");
         }
         assert_eq!(UiState::Hidden.as_ops(), theme.ops(&UiState::Hidden, SCREEN));
     }
@@ -413,7 +453,13 @@ mod tests {
             device: "Phone {pin}".into(),
             pin: "1234".into(),
         };
-        assert_eq!(texts(&theme.ops(&pairing, SCREEN)), ["Koppelen met Phone {pin}: 1234"]);
+        let pairing_ops = theme.ops(&pairing, SCREEN);
+        assert_eq!(texts(&pairing_ops), ["OK", "Koppelen met Phone {pin}: 1234"]);
+        assert!(
+            pairing_ops
+                .iter()
+                .any(|op| matches!(op, RenderOp::BlitAsset { id, .. } if id == "button"))
+        );
 
         let state = UiState::WaitingForConnection;
         assert_ne!(theme.cache_hash(&state), state.cache_hash());
@@ -445,6 +491,15 @@ mod tests {
                 };
                 let lines = text_lines(&theme.ops(&UiState::WaitingForConnection, screen));
                 assert_eq!(lines.len(), 1 + subtitle.is_some() as usize);
+                let pairing = UiState::Pairing {
+                    device: "iPhone".into(),
+                    pin: "1234".into(),
+                };
+                let pairing_lines = text_lines(&theme.ops(&pairing, screen));
+                let (button_top, _) = pairing_lines[0];
+                let (pin_top, pin_size) = *pairing_lines.last().unwrap();
+                assert!(button_top >= 0.0, "{screen:?} {size}: button starts at {button_top}");
+                assert!(pin_top + pin_size * screen.dpi / 72.0 * 1.25 <= screen.height as f32);
                 let (last_top, last_size) = *lines.last().unwrap();
                 let bottom = last_top + last_size * screen.dpi / 72.0 * 1.25;
                 assert!(lines.iter().all(|(y, _)| *y >= 0.0), "{screen:?} {size} {lines:?}");
