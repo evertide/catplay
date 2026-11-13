@@ -55,7 +55,10 @@ impl CsmClientHandle for Capture {
     fn send(&self, packet: &dyn AsCsmPacket) -> CsmSessionResult<()> {
         let registry = CsmPacketRegistry::static_registry();
         let bytes = registry.encode(packet).unwrap();
-        self.0.lock().unwrap().push(registry.decode(&bytes).unwrap());
+        self.0
+            .lock()
+            .unwrap()
+            .push(registry.decode(&bytes).unwrap());
         Ok(())
     }
     fn send_all(&self, packets: &[CsmPacketBox]) -> CsmSessionResult<()> {
@@ -176,7 +179,11 @@ fn early_request_waits_for_identification_and_authentication_but_not_power() {
         respond(&mut car, &car_out, StartPowerUpdates::default());
         let power = car_out.take();
         assert_eq!(power.len(), 6);
-        assert!(power.iter().all(|packet| packet.cast::<PowerUpdate>().is_some()));
+        assert!(
+            power
+                .iter()
+                .all(|packet| packet.cast::<PowerUpdate>().is_some())
+        );
     }
 }
 
@@ -501,7 +508,9 @@ fn assert_proxied(sink: &mut CarPlayRxSession, proxy: &mut mpsc::UnboundedReceiv
     let Some(Some(TxAdapterOp::Command { response, .. })) = proxy.next().now_or_never() else {
         panic!("iAP2 commands must still reach the car proxy");
     };
-    response.send(RtspResponse::new(None, HttpStatus::Ok)).unwrap();
+    response
+        .send(RtspResponse::new(None, HttpStatus::Ok))
+        .unwrap();
     assert_eq!(block_on(future).unwrap().status, HttpStatus::Ok);
 }
 
@@ -534,7 +543,13 @@ fn airplay_without_a_car_or_wireless_identity_does_not_wait_or_claim_iap2() {
     let (mut no_identity, mut proxy) = airplay_sink(location, None);
     assert!(no_identity.open_iap2().now_or_never().unwrap().is_none());
     assert_proxied(&mut no_identity, &mut proxy);
-    assert!(CarPlayRxSession::reject().open_iap2().now_or_never().unwrap().is_none());
+    assert!(
+        CarPlayRxSession::reject()
+            .open_iap2()
+            .now_or_never()
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -553,11 +568,21 @@ fn airplay_uses_the_wireless_identity_and_keeps_ownership_after_endpoint_failure
     let packets = out.take();
     assert_eq!(packets.len(), 1);
     assert_eq!(packets[0].cast::<IdentificationInformation>(), Some(&expected));
-    assert_eq!(block_on(sink.on_command_raw(&iap2_command())).unwrap().status, HttpStatus::Ok);
+    assert_eq!(
+        block_on(sink.on_command_raw(&iap2_command()))
+            .unwrap()
+            .status,
+        HttpStatus::Ok
+    );
     assert!(proxy.next().now_or_never().is_none());
     // Optional endpoint failure must not reroute its remaining frames to USB.
     drop(endpoint);
-    assert_eq!(block_on(sink.on_command_raw(&iap2_command())).unwrap().status, HttpStatus::Ok);
+    assert_eq!(
+        block_on(sink.on_command_raw(&iap2_command()))
+            .unwrap()
+            .status,
+        HttpStatus::Ok
+    );
     assert!(proxy.next().now_or_never().is_none());
 }
 

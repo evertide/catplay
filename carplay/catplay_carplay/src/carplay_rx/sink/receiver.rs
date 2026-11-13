@@ -1156,7 +1156,14 @@ mod iap2_tests {
             } else {
                 drain.feed(RtspResponse::new(None, HttpStatus::BadRequest));
             }
-            assert!(streams.iap2_commands.sleep().now_or_never().flatten().is_some());
+            assert!(
+                streams
+                    .iap2_commands
+                    .sleep()
+                    .now_or_never()
+                    .flatten()
+                    .is_some()
+            );
             block_on(streams.reconcile()).unwrap();
             assert!(streams.iap2.is_none());
             assert!(streams.iap2_drain.is_none());
@@ -1182,7 +1189,14 @@ mod iap2_tests {
         assert!(!dropped.load(Ordering::Relaxed));
 
         drain.feed(RtspResponse::new(None, HttpStatus::Ok));
-        assert!(streams.iap2_commands.sleep().now_or_never().flatten().is_some());
+        assert!(
+            streams
+                .iap2_commands
+                .sleep()
+                .now_or_never()
+                .flatten()
+                .is_some()
+        );
         block_on(streams.reconcile()).unwrap();
         assert!(streams.iap2.is_some());
         assert!(streams.iap2_drain.is_some());

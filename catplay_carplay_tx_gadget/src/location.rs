@@ -5,7 +5,9 @@ use std::sync::{
 
 use catplay_csm::{
     decoder::{CsmFlag, CsmPacketId},
-    msg::{IdentificationInformation, LocationInformation, LocationInformationComponent, StartLocationInformation, StopLocationInformation},
+    msg::{
+        IdentificationInformation, LocationInformation, LocationInformationComponent, StartLocationInformation, StopLocationInformation,
+    },
 };
 use catplay_iap2_client::{CsmClientHandleRef, CsmSessionResult};
 use catplay_util::{EventSleeper, EventToken};
@@ -88,7 +90,10 @@ impl Drop for LocationSubscription {
         // not clear a replacement request that already has its own live receiver.
         self.updates.take();
         self.request.send_if_modified(|request| {
-            if request.as_ref().is_some_and(|(_, updates)| updates.is_closed()) {
+            if request
+                .as_ref()
+                .is_some_and(|(_, updates)| updates.is_closed())
+            {
                 *request = None;
                 true
             } else {

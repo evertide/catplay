@@ -58,7 +58,11 @@ impl CsmSession for Iap2LocationBridge {
             }
             consumed = true;
         }
-        if let Some(update) = self.subscription.as_mut().and_then(LocationSubscription::take) {
+        if let Some(update) = self
+            .subscription
+            .as_mut()
+            .and_then(LocationSubscription::take)
+        {
             self.session
                 .on_event(CarPlayServerSessionEventRx::FeedGpsNmea(update), handle)?;
             consumed = true;
