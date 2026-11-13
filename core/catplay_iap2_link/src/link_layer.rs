@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 use catplay_util::{ModSeq, ModSeq8};
 use core::{cmp::Ordering, time::Duration};
-use log::{debug, trace};
+use log::{debug, trace, warn};
 
 #[cfg(test)]
 mod tests;
@@ -9,7 +9,7 @@ mod tests;
 use crate::{
     EAKPayload, LSPPayload, LinkSession, PayloadDecodable, PayloadSession, SessionType,
     clock::{Clock, ClockInstant},
-    files::{FileSession, FileTransferEvent},
+    files::{FileSession, FileTransferEvent, FileTransferReserved},
     negotiate::{LSPNegotiator, Negotiation, NegotiationTx, SimpleLSPNegotiator},
     packet::*,
 };
@@ -384,6 +384,23 @@ impl LinkLayer {
         counter
     }
 
+    /// Whether the negotiated link has a session of the given type.
+    ///
+    /// The peer decides which sessions exist; e.g. some head units negotiate
+    /// only a Control session and no FileTransfer session.
+    pub fn has_session_of_type(&self, session_type: SessionType) -> bool {
+        self.find_session_of_type(session_type).is_some()
+    }
+
+    /// Reserves an outgoing file transfer id, or `None` when the link has no
+    /// FileTransfer session to carry it.
+    pub fn reserve_file_tx(&mut self) -> Option<FileTransferReserved> {
+        if !self.has_session_of_type(SessionType::FileTransfer) {
+            return None;
+        }
+        self.files.reserve_file_tx()
+    }
+
     fn find_session_of_type(&self, session_type: SessionType) -> Option<u8> {
         self.local_lsp
             .sessions
@@ -584,9 +601,11 @@ impl LinkLayer {
             && let Some(v) = self.next_payload()
         {
             let peer_seq = self.peer_seq?;
-            let session = self
-                .find_session_of_type(v.0)
-                .expect("missing session but wants to transmit");
+            // next_payload() only yields payloads for negotiated sessions; never panic on peer capabilities.
+            let Some(session) = self.find_session_of_type(v.0) else {
+                warn!(target: self.logger, "Dropping {:?} payload: session was not negotiated", v.0);
+                return None;
+            };
             let packet = Packet::new_ack(self.take_own_seq(), peer_seq, session, Some(v.1));
 
             if packet.size() > self.peer_lsp.max_len as _ {
@@ -636,11 +655,20 @@ impl LinkLayer {
     fn next_payload(&mut self) -> Option<(SessionType, Vec<u8>)> {
         let max_payload_len = (self.peer_lsp.max_len as usize).saturating_sub(Packet::PACKET_OVERHEAD);
 
+        // File/EA payloads stay queued (and are never sent) when the peer did not negotiate that session.
         if let Some(v) = self.csm.dequeue_tx(max_payload_len) {
             Some((SessionType::Control, v))
-        } else if let Some(v) = self.files.dequeue_tx(max_payload_len) {
+        } else if let Some(v) = self
+            .has_session_of_type(SessionType::FileTransfer)
+            .then(|| self.files.dequeue_tx(max_payload_len))
+            .flatten()
+        {
             Some((SessionType::FileTransfer, v))
-        } else if let Some(v) = self.ea.dequeue_tx(max_payload_len) {
+        } else if let Some(v) = self
+            .has_session_of_type(SessionType::ExternalAccessory)
+            .then(|| self.ea.dequeue_tx(max_payload_len))
+            .flatten()
+        {
             Some((SessionType::ExternalAccessory, v))
         } else {
             None

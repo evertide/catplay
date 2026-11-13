@@ -9,7 +9,8 @@ use std::{
 };
 
 use crate::{
-    FileTransferOp, FileTransferPayload, LinkEvent, LinkLayer, LinkStatus, Packet,
+    FileTransferOp, FileTransferPayload, LSPPayload, LinkEvent, LinkLayer, LinkStatus, Packet, SessionType,
+    SimpleLSPNegotiator,
     clock::MockClock,
     files::{FileTransferEvent, FileTransferOutgoingSource, FileTransferReserved},
 };
@@ -21,18 +22,29 @@ struct LinkLayerFileTest {
     server: LinkLayer,
     client_files: VecDeque<(u8, FileTransferEvent)>,
     server_files: VecDeque<(u8, FileTransferEvent)>,
+    client_csm: VecDeque<Vec<u8>>,
 }
 
 impl LinkLayerFileTest {
     fn new() -> Self {
+        Self::with_client_lsp(LSPPayload::bluetooth())
+    }
+
+    /// The client (accessory) proposes `client_lsp`; the server (host) accepts it as-is.
+    fn with_client_lsp(client_lsp: LSPPayload) -> Self {
         let client_queue = Arc::new(Mutex::new(VecDeque::new()));
         let server_queue = Arc::new(Mutex::new(VecDeque::new()));
         let clock = MockClock::new(Instant::now());
 
-        let client = LinkLayer::with_clock(false, Box::new(clock.clone()), {
-            let client_queue = client_queue.clone();
-            move |ev| client_queue.lock().unwrap().push_back(ev)
-        });
+        let client = LinkLayer::with_clock_and_lsp_negotiator(
+            false,
+            Box::new(clock.clone()),
+            Box::new(SimpleLSPNegotiator::new(client_lsp)),
+            {
+                let client_queue = client_queue.clone();
+                move |ev| client_queue.lock().unwrap().push_back(ev)
+            },
+        );
         let server = LinkLayer::with_clock(true, Box::new(clock), {
             let server_queue = server_queue.clone();
             move |ev| server_queue.lock().unwrap().push_back(ev)
@@ -45,6 +57,7 @@ impl LinkLayerFileTest {
             server,
             client_files: VecDeque::new(),
             server_files: VecDeque::new(),
+            client_csm: VecDeque::new(),
         }
     }
 
@@ -64,6 +77,7 @@ impl LinkLayerFileTest {
             match ev {
                 LinkEvent::Write(packet) => self.server.read(packet),
                 LinkEvent::FileTransfer(id, event) => self.client_files.push_back((id, event)),
+                LinkEvent::ReadCsm(data) => self.client_csm.push_back(data),
                 _ => {}
             }
         }
@@ -212,4 +226,41 @@ fn setup_for_unknown_transfer_id_is_cancelled_and_reclaimed_end_to_end() {
         .reserve_file_tx()
         .expect("reclaimed server file id");
     assert_eq!(reclaimed.0, file_id);
+}
+
+#[test]
+fn file_transfer_without_negotiated_file_session_does_not_panic() {
+    // Some head units (seen on a Volvo XC90 / Sensus) negotiate only a Control session.
+    let mut control_only = LSPPayload::bluetooth();
+    control_only
+        .sessions
+        .retain(|s| s.session_type == SessionType::Control);
+    let mut test = LinkLayerFileTest::with_client_lsp(control_only);
+    test.sync();
+
+    assert_eq!(test.client.status(), &LinkStatus::Writable);
+    assert_eq!(test.server.status(), &LinkStatus::Writable);
+    assert!(!test.server.has_session_of_type(SessionType::FileTransfer));
+
+    // Callers asking the link for a file id learn that no transfer is possible.
+    assert!(test.server.reserve_file_tx().is_none());
+
+    // A transfer queued anyway (bypassing the link-level check) must not take the link down.
+    let reserved = test.server.files().reserve_file_tx().expect("file id");
+    test.server.files().send_file(
+        reserved,
+        0x1234,
+        &[],
+        FileTransferOutgoingSource::VecData(vec![1, 2, 3]),
+    );
+    let control = vec![0x40, 0x40, 0x00, 0x06, 0x00, 0x00];
+    test.server.csm().enqueue_tx(control.clone());
+
+    for _ in 0..10 {
+        test.sync();
+    }
+
+    assert!(test.client_files.is_empty());
+    assert_eq!(test.client_csm.pop_front(), Some(control));
+    assert!(matches!(test.server.status(), &LinkStatus::Writable | &LinkStatus::Unwritable));
 }
