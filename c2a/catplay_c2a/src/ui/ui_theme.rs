@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Limits that keep a user-provided background well within the dongle's RAM.
-const MAX_BACKGROUND_BYTES: u64 = 1 << 20;
+/// `/persist` is only 768 KiB on the B12 and also holds pairings, so keep the photo small.
+const MAX_BACKGROUND_BYTES: u64 = 256 << 10;
 const MAX_BACKGROUND_SIDE: u32 = 2048;
 const MAX_BACKGROUND_PIXELS: u64 = 1_000_000;
 const MAX_TEXT_CHARS: usize = 120;
@@ -25,7 +26,7 @@ const BUTTON_TEXT_COLOR: u32 = 0xFFFFFFFF;
 /// Optional, user-provided look of the built-in screens, read from `<persist_dir>/ui.toml`.
 ///
 /// Every field is optional; without the file the upstream screens are rendered unchanged.
-/// Invalid values are ignored with a warning. The background must be a JPEG of at most 1 MiB,
+/// Invalid values are ignored with a warning. The background must be a JPEG of at most 256 KiB,
 /// 2048 px per side and 1 megapixel, ideally already the screen's size; a relative path is
 /// resolved against the persist directory. Text is only shrunk to fit vertically, so keep it
 /// short or lower `text_size` on narrow screens.
@@ -88,7 +89,7 @@ impl UiTheme {
 
     /// Loads the theme from the persist directory; any problem falls back to the default look.
     ///
-    /// Reads at most 1 MiB and parses only the JPEG header; the image is decoded when rendered.
+    /// Reads at most 256 KiB and parses only the JPEG header; the image is decoded when rendered.
     pub fn load(persist_dir: Option<&Path>) -> Self {
         let Some(dir) = persist_dir else {
             return Self::default();
@@ -558,7 +559,7 @@ mod tests {
 
         // A valid JPEG padded past the limit (decoders ignore trailing data).
         let mut padded = SMALL_JPEG.to_vec();
-        padded.resize((1 << 20) + 1, 0);
+        padded.resize(MAX_BACKGROUND_BYTES as usize + 1, 0);
         let big_file = load_with_background(&dir, &padded, "");
         assert_eq!(big_file.background_bytes, None, "files over the size limit are rejected");
 
