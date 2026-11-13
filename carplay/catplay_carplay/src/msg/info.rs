@@ -3,7 +3,7 @@ use crate::{
     modes::ChangeModes,
     msg::{AudioFormat, AudioType, DisplayFeature, ExtendedFeature, LimitedUIElement, PrimaryInputDevice, StreamType},
 };
-use catplay_plist::{FlexBool, PlistByteArray, downcast_enum_to_legacy_u64, plist_struct};
+use catplay_plist::{FlexBool, PlistByteArray, Value, downcast_enum_to_legacy_u64, plist_struct};
 
 plist_struct! {
     pub struct InfoMessage {
@@ -146,6 +146,10 @@ plist_struct! {
         /// Set when the display has more than one view area to switch between.
         pub view_area_transition_control: Option<FlexBool>,
         pub corner_masks: Option<FlexBool>,
+        /// Per-display night mode (Volvo XC90 instrument cluster). The iPhone draws the cluster
+        /// map in day colours without it, so it is proxied exactly as the car sent it.
+        pub night_mode: Option<Value>,
+        pub adjacent_view_areas: Option<Value>,
     }
 }
 
@@ -312,16 +316,12 @@ mod display_tests {
         assert_eq!(display.features, None);
         assert_eq!(display.stream_type, Some(StreamType::AltScreen));
 
-        // Proxied to the iPhone without a made-up "features" key. (`adjacentViewAreas` and the
-        // per-display `nightMode` are not modelled yet and are dropped, as before.)
+        // Proxied to the iPhone exactly as the car sent it: no made-up "features" key, and the
+        // per-display nightMode / adjacentViewAreas kept (a missing nightMode made the iPhone draw
+        // a white cluster map at night).
         binary.clear();
         to_writer_binary(&mut binary, &display).unwrap();
-        let Value::Dictionary(proxied) = from_bytes::<Value>(&binary).unwrap() else {
-            panic!("expected a dictionary");
-        };
-        assert!(proxied.get("features").is_none());
-        assert_eq!(proxied.get("widthPixels"), Some(&Value::from(1920u64)));
-        assert_eq!(proxied.get("type"), Some(&Value::from(111u64)));
+        assert_eq!(from_bytes::<Value>(&binary).unwrap(), display_entry);
     }
 
     #[test]
