@@ -41,13 +41,12 @@ impl FileSession {
 
     /// Forgets all outgoing transfers and reservations. Returns whether anything was dropped.
     pub(crate) fn reset_tx(&mut self) -> bool {
-        let had_work = self.has_tx_state();
-        if !had_work {
+        if !self.has_tx_state() {
             return false;
         }
         self.tx = FileTransferTransmitter::new(self.server);
         self.queue_tx.clear();
-        had_work
+        true
     }
 
     pub fn send_file(&mut self, id: FileTransferReserved, file_type: u16, setup_data: &[u8], source: FileTransferOutgoingSource) {

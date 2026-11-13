@@ -386,9 +386,9 @@ impl LinkLayer {
 
     /// Whether the local LSP has a session of the given type.
     ///
-    /// Before negotiation completes this reflects our default offer; afterwards it is the
-    /// negotiated set. The peer may drop sessions, e.g. some head units negotiate only a
-    /// Control session and no FileTransfer session.
+    /// Until negotiation completes the local LSP is a placeholder listing every session type;
+    /// on the host side it then becomes the set the accessory offered, which may lack sessions
+    /// (e.g. some head units negotiate only a Control session).
     pub fn has_session_of_type(&self, session_type: SessionType) -> bool {
         self.find_session_of_type(session_type).is_some()
     }
@@ -402,8 +402,9 @@ impl LinkLayer {
         self.files.reserve_file_tx()
     }
 
-    /// Drops work queued before negotiation finished for sessions the peer did not negotiate,
-    /// releasing reserved file ids instead of keeping them (and their data) forever.
+    /// Drops queued File/EA work for sessions that are not in the local LSP, releasing reserved
+    /// file ids and data instead of keeping them forever. Runs when the LSP is finalised and before
+    /// every payload dequeue. Dropped transfers emit no cancel event.
     fn release_unsupported_sessions(&mut self) {
         if !self.has_session_of_type(SessionType::FileTransfer) && self.files.reset_tx() {
             warn!(target: self.logger, "Peer negotiated no FileTransfer session; dropped queued file transfers");
@@ -613,7 +614,8 @@ impl LinkLayer {
             && let Some(v) = self.next_payload()
         {
             let peer_seq = self.peer_seq?;
-            // next_payload() only yields payloads for negotiated sessions; never panic on peer capabilities.
+            // Unreachable in practice (next_payload() releases unsupported sessions first), but peer
+            // capabilities must never be able to panic the link.
             let Some(session) = self.find_session_of_type(v.0) else {
                 warn!(target: self.logger, "Dropping {:?} payload: session was not negotiated", v.0);
                 return None;

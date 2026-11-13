@@ -15,6 +15,9 @@ use crate::{
     files::{FileTransferEvent, FileTransferOutgoingSource, FileTransferReserved},
 };
 
+/// A minimal Control session payload (CSM header only).
+const CONTROL_MSG: [u8; 6] = [0x40, 0x40, 0x00, 0x06, 0x00, 0x00];
+
 struct LinkLayerFileTest {
     client_queue: Arc<Mutex<VecDeque<LinkEvent>>>,
     server_queue: Arc<Mutex<VecDeque<LinkEvent>>>,
@@ -161,7 +164,7 @@ fn two_link_layers_transfer_file_end_to_end() {
     assert_eq!(received, file);
     assert!(sender_success);
     assert!(matches!(test.client.status(), &LinkStatus::Writable | &LinkStatus::Unwritable));
-    assert!(matches!(test.server.status(), &LinkStatus::Writable | &LinkStatus::Unwritable));
+    assert_eq!(test.server.status(), &LinkStatus::Writable);
 }
 
 #[test]
@@ -278,7 +281,7 @@ fn file_transfer_without_negotiated_file_session_does_not_panic() {
     }
 
     // Control traffic queued after the blocked transfer still gets through.
-    let control = vec![0x40, 0x40, 0x00, 0x06, 0x00, 0x00];
+    let control = CONTROL_MSG.to_vec();
     test.server.csm().enqueue_tx(control.clone());
     for _ in 0..5 {
         test.sync();
@@ -286,7 +289,7 @@ fn file_transfer_without_negotiated_file_session_does_not_panic() {
 
     assert!(test.client_files.is_empty());
     assert_eq!(test.client_csm.pop_front(), Some(control));
-    assert!(matches!(test.server.status(), &LinkStatus::Writable | &LinkStatus::Unwritable));
+    assert_eq!(test.server.status(), &LinkStatus::Writable);
 }
 
 #[test]
@@ -309,7 +312,7 @@ fn work_submitted_after_negotiation_for_unsupported_sessions_is_dropped() {
         .files()
         .send_file(early, 0x1234, &[], FileTransferOutgoingSource::VecData(vec![1, 2, 3]));
     test.server.ea().enqueue_tx(vec![0xea]);
-    let control = vec![0x40, 0x40, 0x00, 0x06, 0x00, 0x00];
+    let control = CONTROL_MSG.to_vec();
     test.server.csm().enqueue_tx(control.clone());
     for _ in 0..5 {
         test.sync();
