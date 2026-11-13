@@ -191,7 +191,7 @@ struct CommandRawTypeRef {
 mod tests {
     use catplay_plist::{Dictionary, Value, from_bytes, to_writer_binary};
 
-    use crate::msg::{Command, CommandChangeMapZoomLevel, CommandForceKeyFrame, CommandRequestUI, CommandShowUI, CommandStopUI};
+    use crate::msg::{Command, CommandChangeMapZoomLevel, CommandForceKeyFrame, CommandRequestUI, CommandSetNightMode, CommandShowUI, CommandStopUI, CommandSuggestUI};
 
     #[test]
     fn test_serialize_payload_direct_hid() {
@@ -309,6 +309,33 @@ mod tests {
             // Proxied to the iPhone as-is.
             let reserialized = from_bytes::<Value>(&deserialized.serialize().unwrap()).unwrap();
             assert_eq!(reserialized, Value::Dictionary(command));
+        }
+    }
+
+    #[test]
+    fn test_optional_display_uuids_and_suggest_ui_round_trip() {
+        const CLUSTER: &str = "a5d9a926-fb90-48de-9a02-7c8882c1bb4f";
+        let cases = [
+            Command::RequestUI(CommandRequestUI { url: None, uuid: None }),
+            Command::RequestUI(CommandRequestUI { url: None, uuid: Some(CLUSTER.into()) }),
+            Command::SetNightMode(CommandSetNightMode { night_mode: true, uuid: None }),
+            Command::SetNightMode(CommandSetNightMode { night_mode: true, uuid: Some(CLUSTER.into()) }),
+            Command::SuggestUI(CommandSuggestUI { urls: vec![] }),
+        ];
+        for command in cases {
+            let payload = command.serialize().unwrap();
+            assert_eq!(Command::deserialize(&payload).unwrap(), command);
+            // Cars that never send a uuid keep the exact old wire shape.
+            let params = match from_bytes::<Value>(&payload).unwrap() {
+                Value::Dictionary(mut dict) => dict.remove("params"),
+                _ => None,
+            };
+            let has_uuid = matches!(&params, Some(Value::Dictionary(p)) if p.contains_key("uuid"));
+            let sent_uuid = matches!(
+                &command,
+                Command::RequestUI(CommandRequestUI { uuid: Some(_), .. }) | Command::SetNightMode(CommandSetNightMode { uuid: Some(_), .. })
+            );
+            assert_eq!(has_uuid, sent_uuid, "{command:?}");
         }
     }
 
