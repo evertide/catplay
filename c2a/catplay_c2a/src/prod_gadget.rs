@@ -240,13 +240,17 @@ impl Reconcilable for ProdGadget {
             ));
             let car_location = self.car_location.clone();
             let mfi = self.cfg.mfi.clone();
-            self.rx.as_mut().unwrap().child_mut().set_iap2_factory(move |identity| {
-                let car = car_location.lock().unwrap().clone();
-                match car {
-                    Some(car) => Iap2LocationBridge::new(mfi.clone(), identity, car),
-                    None => Box::new(CarPlayServerSession::new(mfi.clone(), identity).0),
-                }
-            });
+            self.rx
+                .as_mut()
+                .unwrap()
+                .child_mut()
+                .set_iap2_factory(move |identity| {
+                    let car = car_location.lock().unwrap().clone();
+                    match car {
+                        Some(car) => Iap2LocationBridge::new(mfi.clone(), identity, car),
+                        None => Box::new(CarPlayServerSession::new(mfi.clone(), identity).0),
+                    }
+                });
         }
 
         if self.tx.is_none() {

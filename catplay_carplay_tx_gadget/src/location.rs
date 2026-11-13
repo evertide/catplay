@@ -44,7 +44,11 @@ pub struct CarPlayLocationSession {
 }
 
 impl CarPlayLocationSession {
-    pub fn new() -> (Self, mpsc::UnboundedSender<LocationRequest>, mpsc::UnboundedReceiver<LocationInformation>) {
+    pub fn new() -> (
+        Self,
+        mpsc::UnboundedSender<LocationRequest>,
+        mpsc::UnboundedReceiver<LocationInformation>,
+    ) {
         let (requests_tx, requests) = mpsc::unbounded();
         let (updates, updates_rx) = mpsc::unbounded();
         (Self { requests, updates }, requests_tx, updates_rx)
@@ -161,7 +165,11 @@ impl CarLocation {
             }
             consumed = true;
         }
-        if self.peer.as_ref().is_some_and(|peer| peer.updates.is_closed()) {
+        if self
+            .peer
+            .as_ref()
+            .is_some_and(|peer| peer.updates.is_closed())
+        {
             self.requested = None;
             self.peer = None;
         }

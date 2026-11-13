@@ -103,7 +103,10 @@ impl AirPlayReceiverSink for CarPlayRxSession {
         if self.reject {
             return None;
         }
-        let car = self.car_location.as_ref().filter(|car| car.is_available())?;
+        let car = self
+            .car_location
+            .as_ref()
+            .filter(|car| car.is_available())?;
         Some(Iap2LocationBridge::new(
             self.mfi.clone(),
             CarPlaySessionIdentity {

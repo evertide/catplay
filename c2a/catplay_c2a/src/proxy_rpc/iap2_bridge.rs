@@ -67,7 +67,9 @@ impl CsmSession for Iap2LocationBridge {
                     if let Some(peer) = self.peer.take() {
                         self.car.connect(peer);
                     }
-                    let _ = self.requests.unbounded_send(LocationRequest::Start(request));
+                    let _ = self
+                        .requests
+                        .unbounded_send(LocationRequest::Start(request));
                 }
                 CarPlayServerSessionEventTx::StopLocationInformat(_) => {
                     let _ = self.requests.unbounded_send(LocationRequest::Stop);
@@ -96,8 +98,8 @@ mod tests {
     use catplay_csm::{
         decoder::{AsCsmPacket, CsmFlag, CsmPacketId, CsmPacketRegistry},
         msg::{
-            AuthenticationResponse, IdentificationInformation, LocationInformationComponent, StartLocationInformation,
-            StartPowerUpdates, StopLocationInformation,
+            AuthenticationResponse, IdentificationInformation, LocationInformationComponent, StartLocationInformation, StartPowerUpdates,
+            StopLocationInformation,
         },
     };
     use catplay_iap2_client::{CsmClientHandle, CsmRemote, CsmSessionStatus};
@@ -145,7 +147,10 @@ mod tests {
         fn send(&self, packet: &dyn AsCsmPacket) -> CsmSessionResult<()> {
             let registry = CsmPacketRegistry::static_registry();
             let bytes = registry.encode(packet).unwrap();
-            self.packets.lock().unwrap().push(registry.decode(&bytes).unwrap());
+            self.packets
+                .lock()
+                .unwrap()
+                .push(registry.decode(&bytes).unwrap());
             Ok(())
         }
         fn send_all(&self, packets: &[CsmPacketBox]) -> CsmSessionResult<()> {
@@ -167,29 +172,40 @@ mod tests {
     }
 
     fn pump(session: &mut dyn CsmSession, handle: &Arc<Capture>) {
-        session.wait_event().now_or_never().expect("queued bridge event must wake the session");
+        session
+            .wait_event()
+            .now_or_never()
+            .expect("queued bridge event must wake the session");
         assert!(session.process_event(handle.clone()).unwrap());
     }
 
     fn ready(car: &mut CarPlayClientSession, handle: &Arc<Capture>) {
         block_on(car.start(handle.clone())).unwrap();
-        respond(car, handle, IdentificationInformation {
-            location_information_component: Some(LocationInformationComponent {
-                recommended_minimum_specific_gps_transit_data: CsmFlag::Yes,
-                ..LocationInformationComponent::default()
-            }),
-            messages_sent_by_accessory: IdentificationInformation::pack_ids(&[StartPowerUpdates::PACKET_ID]),
-            ..IdentificationInformation::default()
-        });
+        respond(
+            car,
+            handle,
+            IdentificationInformation {
+                location_information_component: Some(LocationInformationComponent {
+                    recommended_minimum_specific_gps_transit_data: CsmFlag::Yes,
+                    ..LocationInformationComponent::default()
+                }),
+                messages_sent_by_accessory: IdentificationInformation::pack_ids(&[StartPowerUpdates::PACKET_ID]),
+                ..IdentificationInformation::default()
+            },
+        );
         respond(car, handle, AuthenticationResponse::default());
         respond(car, handle, StartPowerUpdates::default());
     }
 
     fn phone(car: CarPlayLocationControl) -> CsmSessionBox {
-        Iap2LocationBridge::new(None, CarPlaySessionIdentity {
-            has_gps: true,
-            ..CarPlaySessionIdentity::default()
-        }, car)
+        Iap2LocationBridge::new(
+            None,
+            CarPlaySessionIdentity {
+                has_gps: true,
+                ..CarPlaySessionIdentity::default()
+            },
+            car,
+        )
     }
 
     #[test]
@@ -206,9 +222,17 @@ mod tests {
         assert!(car_handle.take().is_empty());
         ready(&mut car, &car_handle);
         let packets = car_handle.take();
-        assert!(packets.last().unwrap().cast::<StartLocationInformation>().is_some());
+        assert!(
+            packets
+                .last()
+                .unwrap()
+                .cast::<StartLocationInformation>()
+                .is_some()
+        );
 
-        let update = LocationInformation { nmea_sentence: vec!["$GPRMC,120000,V,,,,,,,131126,,,N*00\r\n".into()] };
+        let update = LocationInformation {
+            nmea_sentence: vec!["$GPRMC,120000,V,,,,,,,131126,,,N*00\r\n".into()],
+        };
         respond(&mut car, &car_handle, update.clone());
         pump(&mut phone, &phone_handle);
         let packets = phone_handle.take();
@@ -259,7 +283,13 @@ mod tests {
         pump(&mut bluetooth, &phone_handle);
         drop(bluetooth);
         assert!(car.wait_event().now_or_never().is_none());
-        respond(&mut car, &car_handle, LocationInformation { nmea_sentence: vec!["$PASCD,0*00\r\n".into()] });
+        respond(
+            &mut car,
+            &car_handle,
+            LocationInformation {
+                nmea_sentence: vec!["$PASCD,0*00\r\n".into()],
+            },
+        );
         drop(car);
         pump(&mut airplay, &phone_handle);
         assert!(phone_handle.take().is_empty());

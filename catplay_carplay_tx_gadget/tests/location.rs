@@ -31,9 +31,10 @@ impl Capture {
     }
 
     fn location_commands(&self) -> Vec<CsmPacketBox> {
-        self.take().into_iter().filter(|packet| {
-            packet.cast::<StartLocationInformation>().is_some() || packet.cast::<StopLocationInformation>().is_some()
-        }).collect()
+        self.take()
+            .into_iter()
+            .filter(|packet| packet.cast::<StartLocationInformation>().is_some() || packet.cast::<StopLocationInformation>().is_some())
+            .collect()
     }
 }
 
@@ -61,7 +62,10 @@ impl CsmClientHandle for Capture {
         // Exercise the actual packet registry and wire encoders in both directions.
         let registry = CsmPacketRegistry::static_registry();
         let bytes = registry.encode(packet).unwrap();
-        self.packets.lock().unwrap().push(registry.decode(&bytes).unwrap());
+        self.packets
+            .lock()
+            .unwrap()
+            .push(registry.decode(&bytes).unwrap());
         Ok(())
     }
     fn send_all(&self, packets: &[CsmPacketBox]) -> CsmSessionResult<()> {
@@ -83,7 +87,10 @@ fn respond(session: &mut dyn CsmSession, handle: &Arc<Capture>, packet: impl Int
 }
 
 fn pump(session: &mut dyn CsmSession, handle: &Arc<Capture>) {
-    session.wait_event().now_or_never().expect("queued application event must wake the session");
+    session
+        .wait_event()
+        .now_or_never()
+        .expect("queued application event must wake the session");
     assert!(session.process_event(handle.clone()).unwrap());
 }
 
@@ -97,11 +104,15 @@ fn volvo() -> LocationInformationComponent {
 }
 
 fn identify(session: &mut CarPlayClientSession, handle: &Arc<Capture>, component: Option<LocationInformationComponent>) {
-    respond(session, handle, IdentificationInformation {
-        location_information_component: component,
-        messages_sent_by_accessory: IdentificationInformation::pack_ids(&[StartPowerUpdates::PACKET_ID, PowerSourceUpdate::PACKET_ID]),
-        ..IdentificationInformation::default()
-    });
+    respond(
+        session,
+        handle,
+        IdentificationInformation {
+            location_information_component: component,
+            messages_sent_by_accessory: IdentificationInformation::pack_ids(&[StartPowerUpdates::PACKET_ID, PowerSourceUpdate::PACKET_ID]),
+            ..IdentificationInformation::default()
+        },
+    );
 }
 
 fn ready(session: &mut CarPlayClientSession, handle: &Arc<Capture>, component: Option<LocationInformationComponent>) {
@@ -125,7 +136,9 @@ fn connect(
 
 fn sample() -> LocationInformation {
     // Multiple sentences in one packet must survive unchanged, including invalid fixes.
-    LocationInformation { nmea_sentence: vec!["$GPRMC,120000,V,,,,,,,131126,,,N*00\r\n".into(), "$PASCD,0*00\r\n".into()] }
+    LocationInformation {
+        nmea_sentence: vec!["$GPRMC,120000,V,,,,,,,131126,,,N*00\r\n".into(), "$PASCD,0*00\r\n".into()],
+    }
 }
 
 #[test]
@@ -134,7 +147,9 @@ fn early_subscription_waits_for_authentication_and_both_power_replies_in_either_
         let (mut session, control) = CarPlayClientSession::new();
         let handle = Capture::new();
         let (requests, _updates) = connect(&mut session, &handle, &control);
-        requests.unbounded_send(LocationRequest::Start(StartLocationInformation::all())).unwrap();
+        requests
+            .unbounded_send(LocationRequest::Start(StartLocationInformation::all()))
+            .unwrap();
         pump(&mut session, &handle);
         assert!(handle.location_commands().is_empty());
 
@@ -155,15 +170,26 @@ fn early_subscription_waits_for_authentication_and_both_power_replies_in_either_
             respond(&mut session, &handle, PowerSourceUpdate::default());
         }
         let packets = handle.take();
-        let start = packets.last().unwrap().cast::<StartLocationInformation>().unwrap();
-        assert_eq!(start, &StartLocationInformation {
-            global_positioning_system_fix_data: CsmFlag::Yes,
-            recommended_minimum_specific_gps_transit_data: CsmFlag::Yes,
-            vehicle_speed_data: CsmFlag::Yes,
-            ..StartLocationInformation::default()
-        });
+        let start = packets
+            .last()
+            .unwrap()
+            .cast::<StartLocationInformation>()
+            .unwrap();
+        assert_eq!(
+            start,
+            &StartLocationInformation {
+                global_positioning_system_fix_data: CsmFlag::Yes,
+                recommended_minimum_specific_gps_transit_data: CsmFlag::Yes,
+                vehicle_speed_data: CsmFlag::Yes,
+                ..StartLocationInformation::default()
+            }
+        );
         assert_eq!(packets.len(), if source_first { 6 } else { 2 });
-        assert!(packets[..packets.len() - 1].iter().all(|p| p.cast::<PowerUpdate>().is_some()));
+        assert!(
+            packets[..packets.len() - 1]
+                .iter()
+                .all(|p| p.cast::<PowerUpdate>().is_some())
+        );
         respond(&mut session, &handle, StartPowerUpdates::default());
         assert!(handle.location_commands().is_empty());
     }
@@ -175,13 +201,19 @@ fn power_replies_do_not_bypass_authentication_and_unadvertised_power_messages_ar
         let (mut session, control) = CarPlayClientSession::new();
         let handle = Capture::new();
         block_on(session.start(handle.clone())).unwrap();
-        respond(&mut session, &handle, IdentificationInformation {
-            location_information_component: Some(volvo()),
-            messages_sent_by_accessory: IdentificationInformation::pack_ids(&[power_message]),
-            ..IdentificationInformation::default()
-        });
+        respond(
+            &mut session,
+            &handle,
+            IdentificationInformation {
+                location_information_component: Some(volvo()),
+                messages_sent_by_accessory: IdentificationInformation::pack_ids(&[power_message]),
+                ..IdentificationInformation::default()
+            },
+        );
         let (requests, _updates) = connect(&mut session, &handle, &control);
-        requests.unbounded_send(LocationRequest::Start(StartLocationInformation::all())).unwrap();
+        requests
+            .unbounded_send(LocationRequest::Start(StartLocationInformation::all()))
+            .unwrap();
         pump(&mut session, &handle);
         if power_message == StartPowerUpdates::PACKET_ID {
             respond(&mut session, &handle, StartPowerUpdates::default());
@@ -205,10 +237,12 @@ fn no_subscription_no_component_and_empty_intersection_send_no_location_commands
         assert!(handle.location_commands().is_empty());
         let (requests, mut updates) = connect(&mut session, &handle, &control);
         // Volvo doesn't advertise gyro data; the other cases advertise nothing.
-        requests.unbounded_send(LocationRequest::Start(StartLocationInformation {
-            vehicle_gyro_data: CsmFlag::Yes,
-            ..StartLocationInformation::default()
-        })).unwrap();
+        requests
+            .unbounded_send(LocationRequest::Start(StartLocationInformation {
+                vehicle_gyro_data: CsmFlag::Yes,
+                ..StartLocationInformation::default()
+            }))
+            .unwrap();
         pump(&mut session, &handle);
         respond(&mut session, &handle, sample());
         assert!(updates.next().now_or_never().is_none());
@@ -226,7 +260,9 @@ fn stop_or_disconnect_before_power_ready_cancels_deferred_start() {
         let (mut session, control) = CarPlayClientSession::new();
         let handle = Capture::new();
         let (requests, _updates) = connect(&mut session, &handle, &control);
-        requests.unbounded_send(LocationRequest::Start(StartLocationInformation::all())).unwrap();
+        requests
+            .unbounded_send(LocationRequest::Start(StartLocationInformation::all()))
+            .unwrap();
         pump(&mut session, &handle);
         if disconnect {
             drop(requests);
@@ -250,13 +286,17 @@ fn queued_stop_is_consumed_before_the_last_power_reply_can_start_the_feed() {
     respond(&mut session, &handle, AuthenticationResponse::default());
     respond(&mut session, &handle, PowerSourceUpdate::default());
     let (requests, _updates) = connect(&mut session, &handle, &control);
-    requests.unbounded_send(LocationRequest::Start(StartLocationInformation::all())).unwrap();
+    requests
+        .unbounded_send(LocationRequest::Start(StartLocationInformation::all()))
+        .unwrap();
     pump(&mut session, &handle);
     requests.unbounded_send(LocationRequest::Stop).unwrap();
     // Deliberately do not pump the application channel before the car packet.
     respond(&mut session, &handle, StartPowerUpdates::default());
     assert!(handle.location_commands().is_empty());
-    requests.unbounded_send(LocationRequest::Start(StartLocationInformation::all())).unwrap();
+    requests
+        .unbounded_send(LocationRequest::Start(StartLocationInformation::all()))
+        .unwrap();
     requests.unbounded_send(LocationRequest::Stop).unwrap();
     pump(&mut session, &handle);
     assert!(handle.location_commands().is_empty());
@@ -270,17 +310,25 @@ fn forwarding_stops_on_stop_and_request_channel_close() {
     let (requests, mut updates) = connect(&mut session, &handle, &control);
     respond(&mut session, &handle, sample());
     assert!(updates.next().now_or_never().is_none());
-    requests.unbounded_send(LocationRequest::Start(StartLocationInformation::all())).unwrap();
+    requests
+        .unbounded_send(LocationRequest::Start(StartLocationInformation::all()))
+        .unwrap();
     pump(&mut session, &handle);
     assert_eq!(handle.location_commands().len(), 1);
     respond(&mut session, &handle, sample());
     assert_eq!(updates.next().now_or_never(), Some(Some(sample())));
     requests.unbounded_send(LocationRequest::Stop).unwrap();
     pump(&mut session, &handle);
-    assert!(handle.location_commands()[0].cast::<StopLocationInformation>().is_some());
+    assert!(
+        handle.location_commands()[0]
+            .cast::<StopLocationInformation>()
+            .is_some()
+    );
     respond(&mut session, &handle, sample());
     assert!(updates.next().now_or_never().is_none());
-    requests.unbounded_send(LocationRequest::Start(StartLocationInformation::all())).unwrap();
+    requests
+        .unbounded_send(LocationRequest::Start(StartLocationInformation::all()))
+        .unwrap();
     pump(&mut session, &handle);
     handle.take();
     drop(requests);
@@ -297,10 +345,14 @@ fn repeated_start_is_idempotent_and_changed_request_replaces_the_subscription() 
     let handle = Capture::new();
     ready(&mut session, &handle, Some(volvo()));
     let (requests, _updates) = connect(&mut session, &handle, &control);
-    requests.unbounded_send(LocationRequest::Start(StartLocationInformation::all())).unwrap();
+    requests
+        .unbounded_send(LocationRequest::Start(StartLocationInformation::all()))
+        .unwrap();
     pump(&mut session, &handle);
     handle.take();
-    requests.unbounded_send(LocationRequest::Start(StartLocationInformation::all())).unwrap();
+    requests
+        .unbounded_send(LocationRequest::Start(StartLocationInformation::all()))
+        .unwrap();
     pump(&mut session, &handle);
     assert!(handle.location_commands().is_empty());
     let request = StartLocationInformation {
@@ -308,13 +360,17 @@ fn repeated_start_is_idempotent_and_changed_request_replaces_the_subscription() 
         nmea_sentence_pascd_interval_min: Some(500),
         ..StartLocationInformation::default()
     };
-    requests.unbounded_send(LocationRequest::Start(request.clone())).unwrap();
+    requests
+        .unbounded_send(LocationRequest::Start(request.clone()))
+        .unwrap();
     pump(&mut session, &handle);
     let commands = handle.location_commands();
     assert_eq!(commands.len(), 2);
     assert!(commands[0].cast::<StopLocationInformation>().is_some());
     assert_eq!(commands[1].cast::<StartLocationInformation>(), Some(&request));
-    requests.unbounded_send(LocationRequest::Start(StartLocationInformation::default())).unwrap();
+    requests
+        .unbounded_send(LocationRequest::Start(StartLocationInformation::default()))
+        .unwrap();
     pump(&mut session, &handle);
     let commands = handle.location_commands();
     assert_eq!(commands.len(), 1);
@@ -327,14 +383,22 @@ fn replacing_a_phone_isolates_old_stop_and_car_teardown_closes_updates() {
     let handle = Capture::new();
     ready(&mut session, &handle, Some(volvo()));
     let (old_requests, mut old_updates) = connect(&mut session, &handle, &control);
-    old_requests.unbounded_send(LocationRequest::Start(StartLocationInformation::all())).unwrap();
+    old_requests
+        .unbounded_send(LocationRequest::Start(StartLocationInformation::all()))
+        .unwrap();
     pump(&mut session, &handle);
     handle.take();
     let (requests, mut updates) = connect(&mut session, &handle, &control);
-    assert!(handle.location_commands()[0].cast::<StopLocationInformation>().is_some());
+    assert!(
+        handle.location_commands()[0]
+            .cast::<StopLocationInformation>()
+            .is_some()
+    );
     assert!(old_requests.unbounded_send(LocationRequest::Stop).is_err());
     assert_eq!(old_updates.next().now_or_never(), Some(None));
-    requests.unbounded_send(LocationRequest::Start(StartLocationInformation::all())).unwrap();
+    requests
+        .unbounded_send(LocationRequest::Start(StartLocationInformation::all()))
+        .unwrap();
     pump(&mut session, &handle);
     handle.take();
     drop(old_requests);
@@ -350,29 +414,44 @@ fn replacing_a_phone_isolates_old_stop_and_car_teardown_closes_updates() {
 
 #[test]
 fn iphone_event_pump_forwards_nmea_only_while_subscribed_including_queued_data_after_stop() {
-    let (session, feeds, mut events) = CarPlayServerSession::new(None, CarPlaySessionIdentity {
-        has_gps: true,
-        ..CarPlaySessionIdentity::default()
-    });
+    let (session, feeds, mut events) = CarPlayServerSession::new(
+        None,
+        CarPlaySessionIdentity {
+            has_gps: true,
+            ..CarPlaySessionIdentity::default()
+        },
+    );
     // Also exercise the Box<dyn CsmSession> event-hook delegation used by AsyncClient.
     let mut session: Box<dyn CsmSession> = Box::new(session);
     let handle = Capture::new();
-    feeds.unbounded_send(CarPlayServerSessionEventRx::FeedGpsNmea(sample())).unwrap();
+    feeds
+        .unbounded_send(CarPlayServerSessionEventRx::FeedGpsNmea(sample()))
+        .unwrap();
     pump(&mut session, &handle);
     assert!(handle.take().is_empty());
     respond(&mut session, &handle, StartLocationInformation::all());
-    assert!(matches!(events.next().now_or_never(), Some(Some(CarPlayServerSessionEventTx::StartLocationInformation(_)))));
-    feeds.unbounded_send(CarPlayServerSessionEventRx::FeedGpsNmea(sample())).unwrap();
+    assert!(matches!(
+        events.next().now_or_never(),
+        Some(Some(CarPlayServerSessionEventTx::StartLocationInformation(_)))
+    ));
+    feeds
+        .unbounded_send(CarPlayServerSessionEventRx::FeedGpsNmea(sample()))
+        .unwrap();
     pump(&mut session, &handle);
     let packets = handle.take();
     assert_eq!(packets.len(), 1);
     assert_eq!(packets[0].cast::<LocationInformation>(), Some(&sample()));
 
-    feeds.unbounded_send(CarPlayServerSessionEventRx::FeedGpsNmea(sample())).unwrap();
+    feeds
+        .unbounded_send(CarPlayServerSessionEventRx::FeedGpsNmea(sample()))
+        .unwrap();
     respond(&mut session, &handle, StopLocationInformation::default());
     pump(&mut session, &handle);
     assert!(handle.take().is_empty());
-    assert!(matches!(events.next().now_or_never(), Some(Some(CarPlayServerSessionEventTx::StopLocationInformat(_)))));
+    assert!(matches!(
+        events.next().now_or_never(),
+        Some(Some(CarPlayServerSessionEventTx::StopLocationInformat(_)))
+    ));
     drop(session);
     assert_eq!(events.next().now_or_never().map(|event| event.is_none()), Some(true));
 }
