@@ -15,6 +15,3 @@ pub use csm_remote::*;
 pub use csm_session::*;
 pub use csm_session_error::*;
 pub use csm_session_status::*;
-
-#[cfg(feature = "test-support")]
-pub mod test_support;

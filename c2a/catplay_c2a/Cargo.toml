@@ -58,7 +58,6 @@ bytes = "1.11.0"
 mimalloc = { version = "0.1.46", optional = true, default-features = false }
 
 [dev-dependencies]
-catplay_iap2_client = { path = "../../async/catplay_iap2_client", features = ["test-support"] }
 insta = "1.44.3"
 
 [target.'cfg(not(target_arch = "riscv32"))'.dependencies]

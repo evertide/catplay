@@ -14,7 +14,7 @@ use catplay_lingo::{
 };
 use log::{debug, warn};
 
-use crate::location::{CarLocation, CarPlayLocationControl};
+use crate::location::{CarLocation, LocationBridge};
 
 #[derive(Default)]
 pub struct CarPlayClientSession {
@@ -25,11 +25,10 @@ pub struct CarPlayClientSession {
 }
 
 impl CarPlayClientSession {
-    pub fn new() -> (Self, CarPlayLocationControl) {
-        let (location, control) = CarLocation::new();
+    pub fn with_location(bridge: LocationBridge) -> Self {
         let mut session = Self::default();
-        session.location = location;
-        (session, control)
+        session.location.bridge = bridge;
+        session
     }
 
     pub fn send(&mut self, packet: &dyn AsCsmPacket, handle: &CsmClientHandleRef) -> CsmSessionResult<()> {
@@ -700,7 +699,7 @@ impl CsmSession for CarPlayClientSession {
         if !_handle.is_downgrade() {
             self.send(&StartIdentification::default(), &_handle)?;
         }
-        self.location.start(_handle);
+        self.location.started = !_handle.is_downgrade();
         Ok(())
     }
 
@@ -709,7 +708,7 @@ impl CsmSession for CarPlayClientSession {
     }
 
     fn process_event(&mut self, handle: CsmClientHandleRef) -> CsmSessionResult<bool> {
-        self.location.process_event(&handle)
+        self.location.reconcile(&self.id, &handle)
     }
 
     async fn respond(&mut self, packet: CsmPacketBox, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
@@ -720,7 +719,7 @@ impl CsmSession for CarPlayClientSession {
 
         if let Some(_id) = IdentificationInformation::cast(&packet) {
             self.id = _id.clone();
-            self.location.identify(_id, &_handle)?;
+            self.location.reset(&_handle)?;
             let supports_modern_carplay =
                 IdentificationInformation::unpack_ids(&_id.messages_sent_by_accessory).contains(&CarPlayStartSession::PACKET_ID);
             debug!("Identification accepted! Modern CarPlay: {supports_modern_carplay}");
@@ -908,9 +907,9 @@ impl CsmSession for CarPlayClientSession {
             debug!("Got modern CarPlay handshake: {cpss:?}");
         }
 
-        self.location.reconcile(&_handle)?;
+        self.location.reconcile(&self.id, &_handle)?;
         if let Some(location) = packet.cast::<LocationInformation>() {
-            self.location.forward(location, &_handle)?;
+            self.location.forward(location);
         }
 
         Ok(())

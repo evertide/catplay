@@ -2,7 +2,6 @@ mod audio_info;
 mod alt_screen_manager;
 mod car_manager;
 mod car_to_iphone_command_task;
-mod gps_config;
 mod iap2_bridge;
 mod modes_arbiter;
 mod overlay_default;
@@ -13,7 +12,6 @@ mod tx_adapter;
 
 pub use alt_screen_manager::*;
 pub use car_manager::*;
-pub use gps_config::*;
 pub use iap2_bridge::*;
 pub use modes_arbiter::*;
 pub use overlay_default::*;

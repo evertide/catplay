@@ -28,7 +28,6 @@ pub struct CarPlayServerSession {
 
     gps_sub: bool,
 
-    events_rx: mpsc::UnboundedReceiver<CarPlayServerSessionEventRx>,
     events_tx: mpsc::UnboundedSender<CarPlayServerSessionEventTx>,
 }
 
@@ -215,13 +214,8 @@ impl CarPlayServerSession {
     pub fn new(
         mfi: Option<MfiDeficeRef>,
         identity: CarPlaySessionIdentity,
-    ) -> (
-        Self,
-        mpsc::UnboundedSender<CarPlayServerSessionEventRx>,
-        mpsc::UnboundedReceiver<CarPlayServerSessionEventTx>,
-    ) {
-        let (events_tx0, events_rx0) = mpsc::unbounded();
-        let (events_tx1, events_rx1) = mpsc::unbounded();
+    ) -> (Self, mpsc::UnboundedReceiver<CarPlayServerSessionEventTx>) {
+        let (events_tx, events_rx) = mpsc::unbounded();
 
         (
             Self {
@@ -234,12 +228,10 @@ impl CarPlayServerSession {
                 now_playing_summary: NowPlayingSummary::default(),
                 now_playing_next_cover_art: None,
                 cover_art_transfer_start: None,
-                events_rx: events_rx0,
-                events_tx: events_tx1,
+                events_tx,
                 gps_sub: false,
             },
-            events_tx0,
-            events_rx1,
+            events_rx,
         )
     }
 

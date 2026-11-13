@@ -22,5 +22,4 @@ futures = "0.3.31"
 thiserror = "2.0.17"
 
 [dev-dependencies]
-catplay_iap2_client = { path = "../async/catplay_iap2_client", features = ["test-support"] }
 catplay_carplay_rx_gadget = { path = "../catplay_carplay_rx_gadget" }
