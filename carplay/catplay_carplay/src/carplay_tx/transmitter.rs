@@ -8,7 +8,7 @@ use catplay_hap::{HomekitStorageRef, auth_setup::MfiSapSuccess};
 use catplay_tokio::{TcpHelper, UdpHelper};
 use catplay_util::{AsyncShutdown, EventReconciler, EventSink, EventSleeper, LazyAsync};
 use futures::{TryFutureExt, channel::oneshot};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use rand::Rng;
 use uuid::Uuid;
 
@@ -308,7 +308,7 @@ impl AirPlayTransmitterBootstrapSession {
     fn handle_pair_failure(&mut self, resp: BootstrapResult) {
         if std::mem::take(&mut self.unpaired_fallback) {
             if let Err(err) = &resp {
-                warn!("Pairing first failed, falling back to unpaired SETUP: {err}");
+                error!("Pairing first failed, falling back to unpaired SETUP (receivers that need encryption may show a black screen): {err}");
             }
             self.start_setup_task();
             return;

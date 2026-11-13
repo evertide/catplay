@@ -542,9 +542,6 @@ impl CarManager {
 
         let proxy = match command.get_type() {
             CommandType::DuckAudio | CommandType::UnduckAudio | CommandType::HidSetInputMode | CommandType::RequestUI => true,
-            // Only parsed so the iPhone gets 200 instead of 501; not forwarded, because a car that never answers it would
-            // hit the proxy timeout and tear the session down (Volvo advertises no suggestion URLs anyway).
-            CommandType::SuggestUI => false,
             CommandType::DisableBluetooth => {
                 let command = command.clone();
                 let task = spawn(async move {
@@ -560,6 +557,8 @@ impl CarManager {
                 task.detach();
                 true
             }
+            // suggestUI is only parsed so the iPhone gets 200 instead of 501; it is not forwarded, because a car that never
+            // answers it would hit the proxy timeout and tear the session down (Volvo advertises no suggestion URLs anyway).
             _ => false,
         };
 
@@ -632,7 +631,15 @@ impl CarManager {
         }
 
         if let Command::SetNightMode(mode) = cmd.command() {
-            self.night_mode = mode.night_mode;
+            if is_main_display(&self.car_state.info_cached().displays, mode.uuid.as_deref()) {
+                self.night_mode = mode.night_mode;
+            }
+        }
+
+        // Display switches only make sense for displays the iPhone was told about (see restrict_to_main_display).
+        if matches!(cmd_type, CommandType::ShowUI | CommandType::StopUI) && !self.iphone_features.contains(&ControllerFeature::AltScreen) {
+            cmd.respond_status(HttpStatus::NotImplemented);
+            return;
         }
 
         if let Command::ChangeModes(cm) = cmd.command() {
@@ -719,9 +726,13 @@ impl CarManager {
                 cmd.respond_ok();
             }
             Command::SetNightMode(v) => {
-                self.night_mode = v.night_mode;
+                if is_main_display(&self.car_state.info_cached().displays, v.uuid.as_deref()) {
+                    self.night_mode = v.night_mode;
+                }
                 cmd.respond_ok();
             }
+            // Without an iPhone there is nothing to show; answer as before instead of pretending it worked.
+            Command::ShowUI(_) | Command::StopUI(_) => cmd.respond_status(HttpStatus::NotImplemented),
             Command::RequestUI(_) => {
                 warn!("requestUI during overlay!");
                 self.modes
@@ -751,6 +762,11 @@ fn negotiate_proxied_features(offered: &[ControllerFeature], car_enabled: &[Cont
 /// Keeps only the main display, and the HID devices that belong to it.
 ///
 /// This assumes that the car lists its main display first, which holds for all head units observed so far.
+/// The global night mode tracks the main display; a setNightMode scoped to another display (e.g. the cluster) is not global.
+fn is_main_display(displays: &[Display], uuid: Option<&str>) -> bool {
+    uuid.is_none_or(|uuid| displays.first().is_none_or(|main| main.uuid == uuid))
+}
+
 fn restrict_to_main_display(displays: &mut Vec<Display>, hid_devices: &mut Vec<HidDevice>) {
     displays.truncate(1);
     hid_devices.retain(|hid| {
@@ -777,6 +793,17 @@ mod tests {
 
     const MAIN_UUID: &str = "e5f7a68d-7b0f-4305-984b-974f677a150b";
     const CLUSTER_UUID: &str = "b7e6c5a0-2222-4000-8000-000000000002";
+
+    #[test]
+    fn night_mode_follows_main_display_only() {
+        let displays = [MAIN_UUID, CLUSTER_UUID].map(|uuid| Display {
+            uuid: uuid.into(),
+            ..Default::default()
+        });
+        assert!(is_main_display(&displays, None));
+        assert!(is_main_display(&displays, Some(MAIN_UUID)));
+        assert!(!is_main_display(&displays, Some(CLUSTER_UUID)));
+    }
 
     /// Subset of the features offered by the iPhone in the logs of issue #40.
     const IPHONE_OFFERED: [ControllerFeature; 5] = [

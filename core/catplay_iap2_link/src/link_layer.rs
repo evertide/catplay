@@ -403,8 +403,8 @@ impl LinkLayer {
     }
 
     /// Drops queued File/EA work for sessions that are not in the local LSP, releasing reserved
-    /// file ids and data instead of keeping them forever. Runs when the LSP is finalised and before
-    /// every payload dequeue. Dropped transfers emit no cancel event.
+    /// file ids and data instead of keeping them forever. Runs before every payload dequeue.
+    /// Dropped transfers emit no cancel event.
     fn release_unsupported_sessions(&mut self) {
         if !self.has_session_of_type(SessionType::FileTransfer) && self.files.reset_tx() {
             warn!(target: self.logger, "Peer negotiated no FileTransfer session; dropped queued file transfers");
