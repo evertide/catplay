@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 
 /// Live night mode as reported by the car: one global value (the main display's) plus overrides for displays
-/// the car switched individually with a scoped setNightMode (e.g. the Volvo instrument cluster).
+/// the car switched individually with a scoped setNightMode.
+///
+/// Displays without an override deliberately follow the global value, and the values from /info are not
+/// seeded as overrides: the Volvo XC90 lists `nightMode` on its cluster but only sends setNightMode scoped to
+/// the main display, so the cluster must follow the main display or it would stay dark (or light) forever.
 #[derive(Debug, Default)]
 pub struct NightModes {
     global: bool,
