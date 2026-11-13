@@ -175,7 +175,7 @@ fn no_commands_without_subscription_capabilities_or_power() {
             true,
             false,
             IdentificationInformation {
-                messages_sent_by_accessory: None,
+                messages_sent_by_accessory: IdentificationInformation::pack_ids(&[]),
                 ..car_id()
             },
         ),
