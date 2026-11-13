@@ -541,11 +541,10 @@ impl CarManager {
         let car = self.car_state.clone();
 
         let proxy = match command.get_type() {
-            CommandType::DuckAudio
-            | CommandType::UnduckAudio
-            | CommandType::HidSetInputMode
-            | CommandType::RequestUI
-            | CommandType::SuggestUI => true,
+            CommandType::DuckAudio | CommandType::UnduckAudio | CommandType::HidSetInputMode | CommandType::RequestUI => true,
+            // Only parsed so the iPhone gets 200 instead of 501; not forwarded, because a car that never answers it would
+            // hit the proxy timeout and tear the session down (Volvo advertises no suggestion URLs anyway).
+            CommandType::SuggestUI => false,
             CommandType::DisableBluetooth => {
                 let command = command.clone();
                 let task = spawn(async move {
