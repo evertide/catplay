@@ -8,8 +8,12 @@ use catplay_carplay::{
     carplay_rx::sink::AirPlayServerShared,
     carplay_tx::{AirPlayTransmitterImpl, AirPlayTransmitterSessionError, TeardownGuard},
 };
-use catplay_carplay_rx_gadget::{CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState};
-use catplay_carplay_tx_gadget::client::{CarPlayUsbClientGadget, CarPlayUsbClientGadgetError, CarPlayUsbClientGadgetStatus};
+use catplay_carplay_rx_gadget::{CarPlaySessionIdentity, CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState};
+use catplay_carplay_tx_gadget::{
+    carplay_client_session::CarPlayClientSession,
+    client::{CarPlayUsbClientGadget, CarPlayUsbClientGadgetError, CarPlayUsbClientGadgetStatus},
+    location::LocationBridge,
+};
 use catplay_hap::HomekitStorageRef;
 use catplay_iap2_usb::GadgetError;
 use catplay_mfi::MfiDeficeRef;
@@ -52,6 +56,7 @@ pub struct ProdGadget {
     pending_transmitter: Arc<TokioMutex<Option<TeardownGuard<AirPlayTransmitterImpl>>>>,
 
     last_tx: Arc<Mutex<Option<ProdGadgetSession>>>,
+    location: LocationBridge,
     burst_wakeups: bool,
 }
 
@@ -111,6 +116,7 @@ impl ProdGadget {
                 tx: None,
                 pending_transmitter: Default::default(),
                 last_tx: Default::default(),
+                location: Default::default(),
                 burst_wakeups: false,
             },
             Ok(ProdGadgetState::Initial),
@@ -205,6 +211,7 @@ impl Reconcilable for ProdGadget {
         let shared = AirPlayServerShared::new();
 
         if self.rx.is_none() {
+            let identity: Arc<Mutex<Option<CarPlaySessionIdentity>>> = Default::default();
             self.rx.replace(CarPlayWirelessGadget::new(
                 self.cfg.homekit_rx.clone(),
                 self.cfg.mfi.clone(),
@@ -219,6 +226,9 @@ impl Reconcilable for ProdGadget {
                 Some(&self.cfg.bt_cache_file),
                 {
                     let car = self.last_tx.clone();
+                    let location = self.location.clone();
+                    let identity = identity.clone();
+                    let mfi = self.cfg.mfi.clone();
 
                     move || {
                         let Some(car) = car.lock().unwrap().clone() else {
@@ -226,19 +236,28 @@ impl Reconcilable for ProdGadget {
                         };
 
                         let sess = TxAdapter::new(car.proxy_tx.clone());
-                        CarPlayRxSession::new(sess)
+                        CarPlayRxSession::new(sess, location.clone(), identity.clone(), mfi.clone())
                     }
                 },
             ));
+            self.rx
+                .as_mut()
+                .unwrap()
+                .child_mut()
+                .set_identity_callback(move |wireless_identity| {
+                    identity.lock().unwrap().replace(wireless_identity);
+                });
         }
 
         if self.tx.is_none() {
-            let gadget = CarPlayUsbClientGadget::new(
+            let location = self.location.clone();
+            let gadget = CarPlayUsbClientGadget::new_with_csm(
                 "default",
                 "aa:bb:cc:dd:ee:ff",
                 self.cfg.udc_tx.as_deref(),
                 self.cfg.homekit_tx.clone(),
                 false,
+                move || CarPlayClientSession::with_location(location.clone()),
             )
             .map_err(|err| LocalError::FailedToSetupUsbClient(err))?;
             self.tx.replace(gadget);

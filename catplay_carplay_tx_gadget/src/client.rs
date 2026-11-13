@@ -15,6 +15,7 @@ use catplay_carplay::{
     msg::ControllerFeature,
 };
 use catplay_hap::HomekitStorageRef;
+use catplay_iap2_client::CsmSession;
 use catplay_iap2_usb::GadgetResult;
 use catplay_iap2_usb_host::{CarPlayPhoneGadget, CarPlayPhoneGadgetError, CarPlayPhoneGadgetStatus};
 use catplay_util::{
@@ -55,7 +56,18 @@ impl CarPlayUsbClientGadget {
         homekit: HomekitStorageRef,
         pinned: bool,
     ) -> GadgetResult<Reconciler<Self>> {
-        let g = CarPlayPhoneGadget::new_with_csm(udc, iphone_instance, pinned, || CarPlayClientSession::default())?;
+        Self::new_with_csm(iphone_instance, bonjour_id, udc, homekit, pinned, CarPlayClientSession::default)
+    }
+
+    pub fn new_with_csm<T: CsmSession, F: Fn() -> T + Send + Sync + 'static>(
+        iphone_instance: &str,
+        bonjour_id: &str,
+        udc: Option<&str>,
+        homekit: HomekitStorageRef,
+        pinned: bool,
+        cb: F,
+    ) -> GadgetResult<Reconciler<Self>> {
+        let g = CarPlayPhoneGadget::new_with_csm(udc, iphone_instance, pinned, cb)?;
         Ok(Reconciler::new(
             Self {
                 g,

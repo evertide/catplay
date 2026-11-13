@@ -269,6 +269,12 @@ pub trait AirPlayReceiverSink: AsyncShutdownDyn + EventReconcilerDyn<Error = Rts
         None
     }
 
+    /// Whether failure of the extra iAP2 endpoint should leave the media session
+    /// running. The default preserves mandatory endpoint error handling.
+    fn iap2_is_optional(&self) -> bool {
+        false
+    }
+
     async fn on_modes(&mut self, modes: &AirPlayModeState) {}
 }
 
