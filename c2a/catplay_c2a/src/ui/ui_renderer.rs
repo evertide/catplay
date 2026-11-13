@@ -12,7 +12,7 @@ use catplay_fb::{
 use catplay_tracing_macro::trace_time;
 use log::{info, warn};
 
-use crate::ui::{UiState, UiTheme};
+use crate::ui::{Screen, UiState, UiTheme};
 
 pub struct UiRenderer {
     width: i32,
@@ -63,6 +63,14 @@ impl UiRenderer {
         }
     }
 
+    fn screen(&self) -> Screen {
+        Screen {
+            width: self.width,
+            height: self.height,
+            dpi: self.dpi,
+        }
+    }
+
     fn render_framebuffer(&mut self, state: UiState, reset: bool) -> UiResult<()> {
         if state == UiState::Hidden || (!reset && self.last_state == state) {
             return Ok(());
@@ -71,15 +79,15 @@ impl UiRenderer {
         if reset {
             self.fb.reset(self.width, self.height, self.dpi);
         }
-        if let Err(err) = self.fb.execute(&state.as_ops(&self.theme)) {
-            if self.theme.background.is_none() {
+        if let Err(err) = self.fb.execute(&state.as_ops(&self.theme, self.screen())) {
+            if self.theme.background_bytes.is_none() {
                 return Err(err.into());
             }
             // The background was validated at load time, but the file may have changed since.
             warn!("Rendering the UI theme background failed ({err}); falling back to the default background");
             self.theme = self.theme.without_background();
             self.fb.reset(self.width, self.height, self.dpi);
-            self.fb.execute(&state.as_ops(&self.theme))?;
+            self.fb.execute(&state.as_ops(&self.theme, self.screen()))?;
         }
         self.last_state = state;
         Ok(())
@@ -339,40 +347,22 @@ fn test_waiting_for_connection_keyframe_cache_cycle() {
 #[test]
 fn test_broken_theme_background_falls_back_to_default() {
     use catplay_tracing::logger::setup_test_logger;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     setup_test_logger(true);
 
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let persist_dir = std::env::temp_dir().join(format!("catplay-ui-fallback-test-{}-{unique}", std::process::id()));
-    std::fs::create_dir(&persist_dir).unwrap();
-
-    // A valid 2x2 PNG, accepted when the theme is loaded...
-    const SMALL_PNG: &[u8] = &[
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 6, 0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 17,
-        73, 68, 65, 84, 120, 156, 99, 16, 80, 48, 248, 15, 194, 12, 48, 6, 0, 43, 180, 5, 125, 93, 178, 111, 66, 0, 0, 0, 0, 73, 69, 78,
-        68, 174, 66, 96, 130,
-    ];
-    let background = persist_dir.join("bg.png");
-    std::fs::write(&background, SMALL_PNG).unwrap();
-    std::fs::write(
-        persist_dir.join(UiTheme::FILE_NAME),
-        format!("background = {:?}\n", background.display().to_string()),
-    )
-    .unwrap();
-
-    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, Some(persist_dir.clone())).unwrap();
-    assert!(renderer.theme.background.is_some());
-
-    // ...but corrupted before the first render.
-    std::fs::write(&background, b"not an image").unwrap();
+    // Normally impossible (the bytes are validated when the theme loads), but a decode failure
+    // while rendering must still leave a usable screen instead of no screen at all.
+    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, None).unwrap();
+    renderer.theme = UiTheme {
+        background: Some("/persist/ui/background.jpg".into()),
+        background_bytes: Some((*b"\xFF\xD8\xFF not really a jpeg").into()),
+        waiting_text: Some("Wachten".into()),
+        ..Default::default()
+    };
     renderer
         .render_and_encode_frame(UiState::WaitingForConnection, Duration::ZERO, false)
         .expect("a broken background must not suppress the screen");
-    assert!(renderer.theme.background.is_none());
-
-    let _ = std::fs::remove_dir_all(persist_dir);
+    assert!(renderer.theme.background_bytes.is_none());
+    assert_eq!(renderer.theme.waiting_text.as_deref(), Some("Wachten"));
 }

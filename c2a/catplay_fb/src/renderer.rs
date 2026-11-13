@@ -1,5 +1,5 @@
 use core::fmt;
-use std::{path::PathBuf, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use ab_glyph::InvalidFont;
 use image::ImageError;
@@ -34,6 +34,13 @@ pub enum RenderOp {
     LoadAssetConst {
         id: &'static str,
         buf: &'static [u8],
+        asset_type: AssetType,
+    },
+
+    /// Loads an asset from a shared in-memory buffer (e.g. one validated earlier).
+    LoadAssetShared {
+        id: String,
+        buf: Arc<[u8]>,
         asset_type: AssetType,
     },
 
@@ -75,6 +82,12 @@ impl fmt::Debug for RenderOp {
             Self::LoadAssetConst { id, asset_type, .. } => f
                 .debug_struct("LoadAssetConst")
                 .field("id", id)
+                .field("asset_type", asset_type)
+                .finish(),
+            Self::LoadAssetShared { id, buf, asset_type } => f
+                .debug_struct("LoadAssetShared")
+                .field("id", id)
+                .field("len", &buf.len())
                 .field("asset_type", asset_type)
                 .finish(),
             Self::BlitAsset { id, rect } => f
@@ -183,6 +196,14 @@ impl Renderer {
                     }
                     AssetType::Font => {
                         self.assets.load_font((*id).into(), (*buf).into())?;
+                    }
+                },
+                RenderOp::LoadAssetShared { id, buf, asset_type } => match asset_type {
+                    AssetType::Image => {
+                        self.assets.load_buf(id.clone(), buf)?;
+                    }
+                    AssetType::Font => {
+                        self.assets.load_font(id.clone(), buf.to_vec())?;
                     }
                 },
                 RenderOp::BlitAsset { id, rect } => {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use ab_glyph::{FontArc, InvalidFont, PxScale};
-use image::{ImageError, RgbaImage, imageops::FilterType};
+use image::{ImageError, RgbaImage};
 use log::debug;
 use turbojpeg::PixelFormat;
 
@@ -31,6 +31,8 @@ pub enum AssetCacheError {
     InvalidFont(#[from] InvalidFont),
     #[error("Asset not found: {0}")]
     AssetNotFound(String),
+    #[error("Not a JPEG image")]
+    NotJpeg,
 }
 
 impl AssetCache {
@@ -93,16 +95,13 @@ impl AssetCache {
         debug!("Releasing font {id}");
     }
 
-    /// Reads an image's dimensions from its header, without decoding the pixels.
-    pub fn image_dimensions(buf: &[u8]) -> Result<(u32, u32), AssetCacheError> {
-        if buf.starts_with(JPEG_MAGIC) {
-            let header = turbojpeg::read_header(buf)?;
-            return Ok((header.width as u32, header.height as u32));
+    /// Reads a JPEG's dimensions from its header, without decoding the pixels.
+    pub fn jpeg_dimensions(buf: &[u8]) -> Result<(u32, u32), AssetCacheError> {
+        if !buf.starts_with(JPEG_MAGIC) {
+            return Err(AssetCacheError::NotJpeg);
         }
-        let reader = image::ImageReader::new(std::io::Cursor::new(buf))
-            .with_guessed_format()
-            .map_err(ImageError::IoError)?;
-        Ok(reader.into_dimensions()?)
+        let header = turbojpeg::read_header(buf)?;
+        Ok((header.width as u32, header.height as u32))
     }
 
     /// Fully decodes an image to check that it can be loaded later.
@@ -112,7 +111,7 @@ impl AssetCache {
 
     /// The image scaled to cover `w`x`h` (aspect kept, overflow cropped evenly).
     ///
-    /// Only the visible part of the original is resized, so memory stays at the output size.
+    /// Only the visible part of the original is sampled, so memory stays at the output size.
     pub fn get_cover(&mut self, id: String, w: u32, h: u32) -> Result<&Surface, AssetCacheError> {
         let key = (id.clone(), w, h);
 
@@ -124,6 +123,7 @@ impl AssetCache {
             let (iw, ih) = (orig.width.max(1) as u64, orig.height.max(1) as u64);
             let (fw, fh) = (w.max(1) as u64, h.max(1) as u64);
             // Largest centred source region with the frame's aspect ratio.
+            // (`w` and `h` are at least 1: callers pass the frame size.)
             let (cw, ch) = if iw * fh > ih * fw {
                 (ih * fw / fh, ih)
             } else {
@@ -132,9 +132,13 @@ impl AssetCache {
             let (cw, ch) = (cw.max(1) as u32, ch.max(1) as u32);
             let (x, y) = ((iw as u32 - cw) / 2, (ih as u32 - ch) / 2);
 
+            // Nearest-neighbour sampling straight into the output: no intermediate buffers.
             let image = orig.as_image();
-            let visible = image::imageops::crop_imm(&image, x, y, cw, ch);
-            let scaled = image::imageops::resize(&*visible, w, h, FilterType::Nearest);
+            let scaled = RgbaImage::from_fn(w, h, |ox, oy| {
+                let sx = x + (ox as u64 * cw as u64 / w as u64) as u32;
+                let sy = y + (oy as u64 * ch as u64 / h as u64) as u32;
+                *image.get_pixel(sx, sy)
+            });
             self.img_cover
                 .insert(key.clone(), Surface::from_image(scaled));
         }

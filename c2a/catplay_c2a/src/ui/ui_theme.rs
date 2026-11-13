@@ -3,19 +3,20 @@ use log::{info, warn};
 use serde::Deserialize;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Limits that keep a user-provided background well within the dongle's RAM.
-const MAX_BACKGROUND_BYTES: u64 = 4 << 20;
+const MAX_BACKGROUND_BYTES: u64 = 1 << 20;
 const MAX_BACKGROUND_SIDE: u32 = 2048;
-const MAX_BACKGROUND_PIXELS: u64 = 1_500_000;
+const MAX_BACKGROUND_PIXELS: u64 = 1_000_000;
 const MAX_TEXT_CHARS: usize = 120;
 const TEXT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 8.0..=72.0;
 
 /// Optional, user-provided look of the built-in screens, read from `<persist_dir>/ui.toml`.
 ///
 /// Every field is optional; without the file the screens look exactly as before. Invalid values
-/// are ignored with a warning. The background should already be about the screen's size
-/// (at most 2048 px per side and 1.5 megapixels).
+/// are ignored with a warning. The background must be a JPEG of at most 1 MiB, 2048 px per side
+/// and 1 megapixel; ideally it already has the screen's size.
 ///
 /// ```toml
 /// background = "/persist/ui/background.jpg"
@@ -28,7 +29,7 @@ const TEXT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 8.0..=72.0;
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiTheme {
-    /// Full-screen background image (JPEG/PNG), scaled to cover the screen.
+    /// Full-screen background image (JPEG), scaled to cover the screen.
     pub background: Option<PathBuf>,
     pub waiting_text: Option<String>,
     /// Smaller second line under the main text.
@@ -39,7 +40,10 @@ pub struct UiTheme {
     pub connecting_text: Option<String>,
     /// `{device}` and `{pin}` are replaced.
     pub pairing_text: Option<String>,
-    /// Content digest of the validated background, part of the keyframe cache key.
+    /// The validated background bytes; rendering uses these, never the file again.
+    #[serde(skip)]
+    pub background_bytes: Option<Arc<[u8]>>,
+    /// Content digest of `background_bytes`, part of the keyframe cache key.
     #[serde(skip)]
     pub background_digest: Option<u64>,
 }
@@ -94,11 +98,13 @@ impl UiTheme {
                 *text = text.chars().take(MAX_TEXT_CHARS).collect();
             }
         }
+        self.background_bytes = None;
         self.background_digest = None;
         if let Some(background) = self.background.take() {
             match Self::check_background(&background) {
-                Ok(digest) => {
+                Ok((bytes, digest)) => {
                     self.background = Some(background);
+                    self.background_bytes = Some(bytes);
                     self.background_digest = Some(digest);
                 }
                 Err(err) => warn!("UI theme background {background:?} not used: {err}"),
@@ -106,8 +112,8 @@ impl UiTheme {
         }
     }
 
-    /// Validates size, dimensions and decodability; returns a digest of the file content.
-    fn check_background(path: &Path) -> Result<u64, String> {
+    /// Validates size, format, dimensions and decodability; returns the bytes and their digest.
+    fn check_background(path: &Path) -> Result<(Arc<[u8]>, u64), String> {
         let len = std::fs::metadata(path)
             .map_err(|err| err.to_string())?
             .len();
@@ -115,7 +121,7 @@ impl UiTheme {
             return Err(format!("file is {len} bytes, limit {MAX_BACKGROUND_BYTES}"));
         }
         let buf = std::fs::read(path).map_err(|err| err.to_string())?;
-        let (w, h) = AssetCache::image_dimensions(&buf).map_err(|err| err.to_string())?;
+        let (w, h) = AssetCache::jpeg_dimensions(&buf).map_err(|err| err.to_string())?;
         if w == 0 || h == 0 || w > MAX_BACKGROUND_SIDE || h > MAX_BACKGROUND_SIDE || w as u64 * h as u64 > MAX_BACKGROUND_PIXELS {
             return Err(format!(
                 "image is {w}x{h}, limit {MAX_BACKGROUND_SIDE} px per side and {MAX_BACKGROUND_PIXELS} pixels"
@@ -125,7 +131,7 @@ impl UiTheme {
 
         let mut hasher = DefaultHasher::new();
         buf.hash(&mut hasher);
-        Ok(hasher.finish())
+        Ok((buf.into(), hasher.finish()))
     }
 
     /// Changes whenever the rendered result may change, so cached frames are not reused.
@@ -146,6 +152,7 @@ impl UiTheme {
     pub fn without_background(&self) -> Self {
         Self {
             background: None,
+            background_bytes: None,
             background_digest: None,
             ..self.clone()
         }
