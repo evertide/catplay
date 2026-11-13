@@ -118,7 +118,8 @@ plist_struct! {
 plist_struct! {
     pub struct Display {
         pub edid: Option<PlistByteArray>,
-        pub features: DisplayFeature,
+        /// Absent for the instrument cluster of a Volvo XC90 (Android Automotive, AirTunes 365.10).
+        pub features: Option<DisplayFeature>,
         #[serde(rename = "maxFPS")]
         pub max_fps: Option<u32>,
         pub height_pixels: u32,
@@ -272,6 +273,55 @@ mod display_tests {
         binary.clear();
         to_writer_binary(&mut binary, &display).unwrap();
         assert_eq!(from_bytes::<Value>(&binary).unwrap(), display_entry);
+    }
+
+    #[test]
+    fn alt_display_without_features_round_trips() {
+        // Instrument cluster as reported in /info by a Volvo XC90 (Android Automotive, AirTunes/365.10.4):
+        // no "features" key at all. Rejecting it failed the whole /info response.
+        let safe_area = Value::Dictionary(Dictionary::from_iter([
+            ("widthPixels", Value::from(720u64)),
+            ("heightPixels", Value::from(404u64)),
+            ("originYPixels", Value::from(160u64)),
+            ("originXPixels", Value::from(600u64)),
+        ]));
+        let view_areas = Value::Array(vec![Value::Dictionary(Dictionary::from_iter([
+            ("safeArea", safe_area),
+            ("widthPixels", Value::from(1920u64)),
+            ("heightPixels", Value::from(720u64)),
+            ("originYPixels", Value::from(0u64)),
+            ("originXPixels", Value::from(0u64)),
+        ]))]);
+        let display_entry = Value::Dictionary(Dictionary::from_iter([
+            ("adjacentViewAreas", Value::Array(vec![])),
+            ("uuid", "ad607503-f70a-4a1d-9b0a-aae7040be390".into()),
+            ("heightPixels", Value::from(720u64)),
+            ("nightMode", Value::from(1u64)),
+            ("widthPhysical", Value::from(293u64)),
+            ("type", Value::from(111u64)),
+            ("viewAreas", view_areas),
+            ("widthPixels", Value::from(1920u64)),
+            ("heightPhysical", Value::from(110u64)),
+            ("maxFPS", Value::from(60u64)),
+            ("initialViewArea", Value::from(0u64)),
+        ]));
+
+        let mut binary = Vec::new();
+        to_writer_binary(&mut binary, &display_entry).unwrap();
+        let display: Display = from_bytes(&binary).unwrap();
+        assert_eq!(display.features, None);
+        assert_eq!(display.stream_type, Some(StreamType::AltScreen));
+
+        // Proxied to the iPhone without a made-up "features" key. (`adjacentViewAreas` and the
+        // per-display `nightMode` are not modelled yet and are dropped, as before.)
+        binary.clear();
+        to_writer_binary(&mut binary, &display).unwrap();
+        let Value::Dictionary(proxied) = from_bytes::<Value>(&binary).unwrap() else {
+            panic!("expected a dictionary");
+        };
+        assert!(proxied.get("features").is_none());
+        assert_eq!(proxied.get("widthPixels"), Some(&Value::from(1920u64)));
+        assert_eq!(proxied.get("type"), Some(&Value::from(111u64)));
     }
 
     #[test]
