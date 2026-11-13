@@ -734,7 +734,6 @@ impl LinkLayer {
                 self.negotiation.note_lsp_accepted_by_us(lsp.clone());
                 self.peer_lsp = lsp.clone();
                 self.local_lsp = self.negotiation.local_lsp().clone();
-                self.release_unsupported_sessions();
                 debug!(
                     target: self.logger,
                     "Accessory accepted peer LSP {:?}; local LSP {:?}; waiting to transmit final ACK",
@@ -775,7 +774,6 @@ impl LinkLayer {
                 .accepted_peer_lsp()
                 .cloned()
                 .unwrap_or_else(|| self.local_lsp.clone());
-            self.release_unsupported_sessions();
             self.negotiation.transition_accepted();
             self.change_state(LinkStatus::Writable);
             debug!(target: self.logger, "Host has successfully negotiated link");

@@ -10,6 +10,7 @@ use catplay_carplay::{
     screen::tx::ScreenTransmitProxy,
     video::Pts,
 };
+use catplay_plist::Value;
 use catplay_tracing::ainfo;
 use catplay_util::{EventToken, LazyAsync, sleep, spawn};
 use catplay_util::{event_select, filling_slot, filling_slot_value, futures_xordered::FuturesOrdered, mpsc, oneshot};
@@ -489,6 +490,14 @@ impl CarManager {
 
             let mut displays = other.displays;
             let mut hid_devices = other.hid_devices;
+            // Per-display night mode (Volvo cluster) is a snapshot from when the car was probed; keep it in sync with the
+            // live value like the top-level one, preserving the car's value type.
+            for night_mode in displays.iter_mut().filter_map(|display| display.night_mode.as_mut()) {
+                *night_mode = match night_mode {
+                    Value::Boolean(_) => Value::Boolean(self.night_mode),
+                    _ => Value::Integer((self.night_mode as u64).into()),
+                };
+            }
             if !self.iphone_features.contains(&ControllerFeature::AltScreen) {
                 // Without altScreen only the main display can be driven. Advertising additional displays (e.g. an instrument cluster)
                 // anyway makes the iPhone tear down the session right after RECORD.
