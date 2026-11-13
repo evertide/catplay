@@ -26,6 +26,33 @@ CatPlay is designed to run on so-called "wireless CarPlay dongles"; this is beca
   
 CatPlay ships with a custom, heavily customized Yocto-based firmware.
 
+### Experimental GPS bridge
+
+The Bluetooth iAP2 bridge forwards car location data only while the iPhone requests
+it. It requires a nonempty location component, advertised support for both
+StartLocationInformation and StopLocationInformation, authentication, and completed
+power negotiation. If negotiation never completes, GPS stays disabled and the log
+explains the pending gate; there is no timeout that bypasses it.
+
+The extra **AirPlay iAP2 endpoint is disabled by default**, preserving the upstream
+AirPlay path. To opt in, create `gps.toml` in the configured `persist_dir`:
+
+```toml
+airplay_iap2 = true
+```
+
+This optional file is read once when the production gadget starts. Restart CatPlay
+after changing it. Removing the file or setting the value to `false` disables the
+endpoint. Missing persistence configuration and unreadable or invalid files also
+leave it disabled.
+
+The opted-in endpoint uses the gadget's Bluetooth identity, including its name,
+display name and transport components. Its iAP2 session/command errors are logged
+and drop that endpoint without failing audio/video. Failures of shared AirPlay
+sockets still follow the normal CarPlay error handling. GPS requests survive USB
+iAP2 recreation and fall back to an earlier live subscriber after transport handover.
+This path still needs device testing; Now Playing synchronization is unchanged.
+
 ## Firmware
 The main CatPlay firmware port is the Carlinkit Mini Ultra (Ingenic X1600EN/AIC8800D80) port.  
 As a result of heavy R&D, from the first public release it already offers unmatched levels of performance, stability and boot time.  

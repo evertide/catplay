@@ -1,6 +1,11 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    future::poll_fn,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Poll,
 };
 
 use catplay_csm::{
@@ -11,8 +16,8 @@ use catplay_csm::{
     },
 };
 use catplay_iap2_client::{CsmClientHandleRef, CsmSessionResult};
-use catplay_util::mpsc;
-use futures::{FutureExt, StreamExt};
+use catplay_util::{event_select, mpsc, sleeper};
+use futures::{FutureExt, Stream, StreamExt};
 use log::info;
 
 pub enum LocationRequest {
@@ -36,11 +41,16 @@ impl CarPlayLocationControl {
     }
 }
 
-/// One iPhone's location subscription. Closing the request channel stops updates.
-/// A replacement owns new channels, so an old iPhone cannot stop its successor.
+/// One iPhone transport's location subscription. Closing either channel detaches it.
+/// The newest subscribed transport is preferred; older live subscriptions are retained
+/// so they can resume if that transport stops or disconnects during handover.
 pub struct CarPlayLocationSession {
     requests: mpsc::UnboundedReceiver<LocationRequest>,
     updates: mpsc::UnboundedSender<LocationInformation>,
+    requested: Option<StartLocationInformation>,
+    // The inner None is EOF, distinct from having no pending request.
+    pending_request: Option<Option<LocationRequest>>,
+    closed: bool,
 }
 
 impl CarPlayLocationSession {
@@ -51,34 +61,45 @@ impl CarPlayLocationSession {
     ) {
         let (requests_tx, requests) = mpsc::unbounded();
         let (updates, updates_rx) = mpsc::unbounded();
-        (Self { requests, updates }, requests_tx, updates_rx)
+        (
+            Self {
+                requests,
+                updates,
+                requested: None,
+                pending_request: None,
+                closed: false,
+            },
+            requests_tx,
+            updates_rx,
+        )
     }
 }
 
 #[derive(Default)]
 pub(crate) struct CarLocation {
     sessions: Option<mpsc::UnboundedReceiver<CarPlayLocationSession>>,
-    pending_session: Option<CarPlayLocationSession>,
-    peer: Option<CarPlayLocationSession>,
-    // The inner None is EOF, distinct from having no pending request.
-    pending_request: Option<Option<LocationRequest>>,
-    requested: Option<StartLocationInformation>,
+    peers: Vec<CarPlayLocationSession>,
     active: Option<StartLocationInformation>,
+    active_peer: Option<usize>,
     component: Option<LocationInformationComponent>,
+    accepts_location: bool,
     supported: Arc<AtomicBool>,
+    started: bool,
     pub authenticated: bool,
     needs_power_source: bool,
     needs_power_updates: bool,
     pub power_source_replied: bool,
     pub power_updates_replied: bool,
-    handle: Option<CsmClientHandleRef>,
+    last_blocked_reason: Option<&'static str>,
 }
 
 impl CarLocation {
     pub fn new() -> (Self, CarPlayLocationControl) {
         let (tx, rx) = mpsc::unbounded();
-        let mut location = Self::default();
-        location.sessions = Some(rx);
+        let location = Self {
+            sessions: Some(rx),
+            ..Self::default()
+        };
         let control = CarPlayLocationControl {
             sessions: tx,
             supported: location.supported.clone(),
@@ -87,105 +108,125 @@ impl CarLocation {
     }
 
     pub fn start(&mut self, handle: CsmClientHandleRef) {
-        if !handle.is_downgrade() {
-            self.handle = Some(handle);
-        }
+        self.started = !handle.is_downgrade();
     }
 
-    pub fn identify(&mut self, id: &IdentificationInformation) {
+    pub fn identify(&mut self, id: &IdentificationInformation, handle: &CsmClientHandleRef) -> CsmSessionResult<()> {
+        // A new identification invalidates the old negotiation, including an active
+        // request. Stop under the old negotiated capabilities before resetting them.
+        self.stop(handle)?;
+        self.active_peer = None;
         self.component = id.location_information_component.clone();
-        self.supported
-            .store(self.component.is_some(), Ordering::Relaxed);
+        self.accepts_location = id.wants_rx(StartLocationInformation::PACKET_ID) && id.wants_rx(StopLocationInformation::PACKET_ID);
+        self.supported.store(
+            self.accepts_location && intersect(&StartLocationInformation::all(), self.component.as_ref()).is_some(),
+            Ordering::Relaxed,
+        );
         self.needs_power_source = id.wants_tx(PowerSourceUpdate::PACKET_ID);
         self.needs_power_updates = id.wants_tx(StartPowerUpdates::PACKET_ID);
         self.authenticated = false;
         self.power_source_replied = false;
         self.power_updates_replied = false;
+        self.last_blocked_reason = None;
+        Ok(())
     }
 
     pub async fn wait_event(&mut self) {
         // Buffer input only: the iAP2 client's reconcile loop serializes state changes
         // with authentication, power replies and received location packets.
-        loop {
-            tokio::select! {
-                session = async {
-                    match self.sessions.as_mut() {
-                        Some(sessions) => sessions.next().await,
-                        None => std::future::pending().await,
+        let peers = &mut self.peers;
+        event_select!(
+            self.sessions,
+            sleeper(poll_fn(|cx| {
+                for peer in peers.iter_mut() {
+                    if peer.pending_request.is_some() {
+                        return Poll::Ready(());
                     }
-                }, if self.pending_session.is_none() => {
-                    if let Some(session) = session {
-                        self.pending_session = Some(session);
-                        return;
+                    if let Poll::Ready(request) = Pin::new(&mut peer.requests).poll_next(cx) {
+                        peer.pending_request = Some(request);
+                        return Poll::Ready(());
                     }
-                    self.sessions = None;
                 }
-                request = async {
-                    match self.peer.as_mut() {
-                        Some(peer) => peer.requests.next().await,
-                        None => std::future::pending().await,
-                    }
-                }, if self.pending_request.is_none() => {
-                    self.pending_request = Some(request);
-                    return;
-                }
-                else => std::future::pending::<()>().await,
-            }
-        }
+                Poll::Pending
+            }))
+        );
     }
 
     pub fn process_event(&mut self, handle: &CsmClientHandleRef) -> CsmSessionResult<bool> {
-        let mut consumed = false;
-        if let Some(peer) = self.pending_session.take() {
-            self.stop(handle)?;
-            self.requested = None;
-            self.pending_request = None;
-            self.peer = Some(peer);
-            consumed = true;
+        self.reconcile(handle)
+    }
+
+    fn blocked_reason(&self) -> Option<&'static str> {
+        if !self.started {
+            Some("waiting for the car iAP2 session")
+        } else if self.component.is_none() {
+            Some("the car has not advertised a location component")
+        } else if !self.accepts_location {
+            Some("the car has not advertised support for both StartLocationInformation and StopLocationInformation")
+        } else if !self.authenticated {
+            Some("waiting for car iAP2 authentication")
+        } else if !self.power_source_replied && !self.power_updates_replied {
+            if !self.needs_power_source && !self.needs_power_updates {
+                Some("the car advertised neither power message; GPS remains disabled until a power exchange completes")
+            } else {
+                Some("waiting for the car's advertised power negotiation; GPS remains disabled if it never arrives")
+            }
+        } else if (self.needs_power_source && !self.power_source_replied) || (self.needs_power_updates && !self.power_updates_replied) {
+            Some("waiting for the remaining advertised power exchange before starting GPS")
+        } else {
+            None
         }
-        Ok(self.reconcile(handle)? || consumed)
     }
 
     pub fn reconcile(&mut self, handle: &CsmClientHandleRef) -> CsmSessionResult<bool> {
         let mut consumed = false;
-        // Coalesce queued requests before opening the feed, including a Stop/EOF
-        // that arrived while identification or power negotiation was in progress.
-        while let Some(request) = self.pending_request.take().or_else(|| {
-            self.peer
-                .as_mut()
-                .and_then(|peer| peer.requests.next().now_or_never())
-        }) {
-            match request {
-                Some(LocationRequest::Start(request)) => self.requested = Some(request),
-                Some(LocationRequest::Stop) => self.requested = None,
-                None => {
-                    self.requested = None;
-                    self.peer = None;
-                }
+        if let Some(sessions) = self.sessions.as_mut() {
+            while let Some(Some(peer)) = sessions.next().now_or_never() {
+                self.peers.push(peer);
+                consumed = true;
             }
-            consumed = true;
-        }
-        if self
-            .peer
-            .as_ref()
-            .is_some_and(|peer| peer.updates.is_closed())
-        {
-            self.requested = None;
-            self.peer = None;
         }
 
-        // Wait for the existing power replies, including the entire StartPowerUpdates
-        // burst. If both messages were advertised, both exchanges must have occurred.
-        // Do not infer readiness from authentication or the AirPlay connection alone.
-        let power_ready = (self.power_source_replied || self.power_updates_replied)
-            && (!self.needs_power_source || self.power_source_replied)
-            && (!self.needs_power_updates || self.power_updates_replied);
-        let wanted = if self.handle.is_some() && self.authenticated && power_ready {
-            self.requested
+        // Coalesce queued requests before opening the feed, including a Stop/EOF
+        // that arrived while identification or power negotiation was in progress.
+        for peer in &mut self.peers {
+            while let Some(request) = peer.pending_request.take().or_else(|| peer.requests.next().now_or_never()) {
+                consumed = true;
+                match request {
+                    Some(LocationRequest::Start(request)) => peer.requested = Some(request),
+                    Some(LocationRequest::Stop) => peer.requested = None,
+                    None => {
+                        peer.closed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        self.peers
+            .retain(|peer| !peer.closed && !peer.updates.is_closed());
+
+        let subscribed = self.peers.iter().any(|peer| peer.requested.is_some());
+        let candidate = self.peers.iter().enumerate().rev().find_map(|(index, peer)| {
+            peer.requested
                 .as_ref()
                 .and_then(|request| intersect(request, self.component.as_ref()))
-        } else {
-            None
+                .map(|request| (index, request))
+        });
+        // Never infer power readiness from authentication or AirPlay alone.
+        // If both power messages were advertised, both replies must have been sent.
+        let reason = self.blocked_reason().or_else(|| {
+            candidate.is_none().then_some("no requested location types are supported by the car")
+        });
+        if subscribed
+            && reason != self.last_blocked_reason
+            && let Some(reason) = reason
+        {
+            info!("Car GPS request deferred: {reason}");
+        }
+        self.last_blocked_reason = if subscribed { reason } else { None };
+        let (peer, wanted) = match candidate.filter(|_| reason.is_none()) {
+            Some((peer, request)) => (Some(peer), Some(request)),
+            None => (None, None),
         };
 
         if wanted != self.active {
@@ -196,17 +237,17 @@ impl CarLocation {
                 self.active = Some(request);
             }
         }
+        self.active_peer = peer;
         Ok(consumed)
     }
 
     pub fn forward(&mut self, packet: &LocationInformation, handle: &CsmClientHandleRef) -> CsmSessionResult<()> {
         if self.active.is_some()
-            && let Some(peer) = self.peer.as_mut()
-            && peer.updates.unbounded_send(packet.clone()).is_err()
+            && let Some(index) = self.active_peer
+            && self.peers[index].updates.unbounded_send(packet.clone()).is_err()
         {
-            self.requested = None;
-            self.peer = None;
-            self.stop(handle)?;
+            self.peers[index].closed = true;
+            self.reconcile(handle)?;
         }
         Ok(())
     }
@@ -217,15 +258,6 @@ impl CarLocation {
             info!("Requested car location stop");
         }
         Ok(())
-    }
-}
-
-impl Drop for CarLocation {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.clone() {
-            // Best effort: a physically disconnected USB link cannot deliver this.
-            let _ = self.stop(&handle);
-        }
     }
 }
 

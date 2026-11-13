@@ -269,6 +269,12 @@ pub trait AirPlayReceiverSink: AsyncShutdownDyn + EventReconcilerDyn<Error = Rts
         None
     }
 
+    /// Optional endpoints may fail without terminating the audio/video session.
+    /// On failure the receiver logs and drops only the extra iAP2 connection.
+    fn iap2_is_optional(&self) -> bool {
+        false
+    }
+
     async fn on_modes(&mut self, modes: &AirPlayModeState) {}
 }
 

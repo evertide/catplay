@@ -720,7 +720,7 @@ impl CsmSession for CarPlayClientSession {
 
         if let Some(_id) = IdentificationInformation::cast(&packet) {
             self.id = _id.clone();
-            self.location.identify(_id);
+            self.location.identify(_id, &_handle)?;
             let supports_modern_carplay =
                 IdentificationInformation::unpack_ids(&_id.messages_sent_by_accessory).contains(&CarPlayStartSession::PACKET_ID);
             debug!("Identification accepted! Modern CarPlay: {supports_modern_carplay}");

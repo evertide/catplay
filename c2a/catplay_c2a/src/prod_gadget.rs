@@ -8,11 +8,10 @@ use catplay_carplay::{
     carplay_rx::sink::AirPlayServerShared,
     carplay_tx::{AirPlayTransmitterImpl, AirPlayTransmitterSessionError, TeardownGuard},
 };
-use catplay_carplay_rx_gadget::{CarPlayServerSession, CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState};
+use catplay_carplay_rx_gadget::{CarPlaySessionIdentity, CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState};
 use catplay_carplay_tx_gadget::{
     carplay_client_session::CarPlayClientSession,
     client::{CarPlayUsbClientGadget, CarPlayUsbClientGadgetError, CarPlayUsbClientGadgetStatus},
-    location::CarPlayLocationControl,
 };
 use catplay_hap::HomekitStorageRef;
 use catplay_iap2_usb::GadgetError;
@@ -23,7 +22,7 @@ use catplay_util::{
 use log::{debug, error, info};
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::proxy_rpc::{CarManager, CarPlayRxSession, Iap2LocationBridge, TxAdapter, TxAdapterOp};
+use crate::proxy_rpc::{CarLocationSource, CarManager, CarPlayRxSession, GpsConfig, Iap2LocationBridge, TxAdapter, TxAdapterOp};
 
 pub struct ProdGadgetConfig {
     pub homekit_rx: HomekitStorageRef,
@@ -56,7 +55,8 @@ pub struct ProdGadget {
     pending_transmitter: Arc<TokioMutex<Option<TeardownGuard<AirPlayTransmitterImpl>>>>,
 
     last_tx: Arc<Mutex<Option<ProdGadgetSession>>>,
-    car_location: Arc<Mutex<Option<CarPlayLocationControl>>>,
+    car_location: CarLocationSource,
+    gps: GpsConfig,
     burst_wakeups: bool,
 }
 
@@ -108,9 +108,11 @@ impl ProdGadget {
     const RESTART_DELAY: Duration = Duration::from_millis(1000);
 
     pub fn new(cfg: ProdGadgetConfig) -> Reconciler<Self> {
+        let gps = GpsConfig::load(cfg.persist_dir.as_deref());
         Reconciler::new(
             Self {
                 cfg,
+                gps,
                 // rx_usb: None,
                 rx: None,
                 tx: None,
@@ -143,7 +145,6 @@ impl AsyncShutdown for ProdGadget {
 #[derive(Clone)]
 pub struct ProdGadgetSession {
     pub proxy_tx: mpsc::UnboundedSender<TxAdapterOp>,
-    pub car_location: Option<CarPlayLocationControl>,
 }
 
 impl EventSleeper for ProdGadget {
@@ -212,6 +213,7 @@ impl Reconcilable for ProdGadget {
         let shared = AirPlayServerShared::new();
 
         if self.rx.is_none() {
+            let identity: Arc<Mutex<Option<CarPlaySessionIdentity>>> = Default::default();
             self.rx.replace(CarPlayWirelessGadget::new(
                 self.cfg.homekit_rx.clone(),
                 self.cfg.mfi.clone(),
@@ -226,6 +228,9 @@ impl Reconcilable for ProdGadget {
                 Some(&self.cfg.bt_cache_file),
                 {
                     let car = self.last_tx.clone();
+                    let car_location = self.car_location.clone();
+                    let identity = identity.clone();
+                    let gps = self.gps;
                     let mfi = self.cfg.mfi.clone();
 
                     move || {
@@ -234,7 +239,7 @@ impl Reconcilable for ProdGadget {
                         };
 
                         let sess = TxAdapter::new(car.proxy_tx.clone());
-                        CarPlayRxSession::new(sess, car.car_location.clone(), mfi.clone())
+                        CarPlayRxSession::new(sess, car_location.clone(), identity.clone(), gps, mfi.clone())
                     }
                 },
             ));
@@ -244,22 +249,16 @@ impl Reconcilable for ProdGadget {
                 .as_mut()
                 .unwrap()
                 .child_mut()
-                .set_iap2_factory(move |identity| {
-                    let car = car_location.lock().unwrap().clone();
-                    match car {
-                        Some(car) => Iap2LocationBridge::new(mfi.clone(), identity, car),
-                        None => Box::new(CarPlayServerSession::new(mfi.clone(), identity).0),
-                    }
+                .set_iap2_factory(move |bt_identity| {
+                    identity.lock().unwrap().replace(bt_identity.clone());
+                    let car_location = car_location.clone();
+                    let mfi = mfi.clone();
+                    Arc::new(move || Iap2LocationBridge::new(mfi.clone(), bt_identity.clone(), car_location.clone()))
                 });
         }
 
         if self.tx.is_none() {
             let car_location = self.car_location.clone();
-            // Publish the first endpoint before Bluetooth starts accepting iAP2.
-            // A phone can subscribe while the USB link is still being established.
-            let (first_session, first_location) = CarPlayClientSession::new();
-            car_location.lock().unwrap().replace(first_location);
-            let first_session = Mutex::new(Some(first_session));
             let gadget = CarPlayUsbClientGadget::new_with_csm(
                 "default",
                 "aa:bb:cc:dd:ee:ff",
@@ -267,11 +266,8 @@ impl Reconcilable for ProdGadget {
                 self.cfg.homekit_tx.clone(),
                 false,
                 move || {
-                    if let Some(session) = first_session.lock().unwrap().take() {
-                        return session;
-                    }
                     let (session, location) = CarPlayClientSession::new();
-                    car_location.lock().unwrap().replace(location);
+                    car_location.set(location);
                     session
                 },
             )
@@ -296,7 +292,6 @@ impl Reconcilable for ProdGadget {
             let proxy_chan = mpsc::unbounded();
             let car_state = ProdGadgetSession {
                 proxy_tx: proxy_chan.0,
-                car_location: self.car_location.lock().unwrap().clone(),
             };
 
             let transmitter2 = CarManager::new(transmitter, proxy_chan.1, self.cfg.persist_dir.clone());
