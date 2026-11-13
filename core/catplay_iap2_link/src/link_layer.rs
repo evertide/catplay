@@ -667,20 +667,15 @@ impl LinkLayer {
     fn next_payload(&mut self) -> Option<(SessionType, Vec<u8>)> {
         let max_payload_len = (self.peer_lsp.max_len as usize).saturating_sub(Packet::PACKET_OVERHEAD);
 
-        // File/EA payloads stay queued (and are never sent) when the peer did not negotiate that session.
+        // Work submitted for a session the peer did not negotiate (also after negotiation,
+        // e.g. with an id reserved earlier) is dropped here instead of being kept or sent.
+        self.release_unsupported_sessions();
+
         if let Some(v) = self.csm.dequeue_tx(max_payload_len) {
             Some((SessionType::Control, v))
-        } else if let Some(v) = self
-            .has_session_of_type(SessionType::FileTransfer)
-            .then(|| self.files.dequeue_tx(max_payload_len))
-            .flatten()
-        {
+        } else if let Some(v) = self.files.dequeue_tx(max_payload_len) {
             Some((SessionType::FileTransfer, v))
-        } else if let Some(v) = self
-            .has_session_of_type(SessionType::ExternalAccessory)
-            .then(|| self.ea.dequeue_tx(max_payload_len))
-            .flatten()
-        {
+        } else if let Some(v) = self.ea.dequeue_tx(max_payload_len) {
             Some((SessionType::ExternalAccessory, v))
         } else {
             None

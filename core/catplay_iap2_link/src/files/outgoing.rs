@@ -183,8 +183,9 @@ impl FileTransferTransmitter {
         }
     }
 
-    pub(crate) fn has_reservations(&self) -> bool {
-        self.taken_ids.iter().any(|&taken| taken)
+    /// Whether any id is reserved or any outgoing transfer is still tracked.
+    pub(crate) fn has_state(&self) -> bool {
+        self.taken_ids.iter().any(|&taken| taken) || self.outgoing.iter().any(Option::is_some)
     }
 
     pub fn reserve(&mut self) -> Option<FileTransferReserved> {

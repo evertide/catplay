@@ -288,3 +288,37 @@ fn file_transfer_without_negotiated_file_session_does_not_panic() {
     assert_eq!(test.client_csm.pop_front(), Some(control));
     assert!(matches!(test.server.status(), &LinkStatus::Writable | &LinkStatus::Unwritable));
 }
+
+#[test]
+fn work_submitted_after_negotiation_for_unsupported_sessions_is_dropped() {
+    let mut control_only = LSPPayload::bluetooth();
+    control_only
+        .sessions
+        .retain(|s| s.session_type == SessionType::Control);
+    let mut test = LinkLayerFileTest::with_client_lsp(control_only);
+
+    // An id reserved before negotiation, but submitted only afterwards.
+    let early = test
+        .server
+        .reserve_file_tx()
+        .expect("file id before negotiation");
+    test.sync();
+    assert_eq!(test.server.status(), &LinkStatus::Writable);
+
+    test.server
+        .files()
+        .send_file(early, 0x1234, &[], FileTransferOutgoingSource::VecData(vec![1, 2, 3]));
+    test.server.ea().enqueue_tx(vec![0xea]);
+    let control = vec![0x40, 0x40, 0x00, 0x06, 0x00, 0x00];
+    test.server.csm().enqueue_tx(control.clone());
+    for _ in 0..5 {
+        test.sync();
+    }
+
+    assert_eq!(test.client_csm.pop_front(), Some(control));
+    assert!(test.client_files.is_empty());
+    assert!(!test.server.files().has_tx_pending());
+    assert!(!test.server.ea().has_tx_pending());
+    // The late submission's data was released, not left behind.
+    assert!(!test.server.files().has_tx_state(), "late submission was not released");
+}
