@@ -93,6 +93,7 @@ impl CarPlayUsbClientGadget {
             // Features that can be proxied to an iPhone (only enabled towards the iPhone if also enabled by the car).
             controller_features: vec![ControllerFeature::AltScreen, ControllerFeature::ViewAreas],
             remote_homekit_id: invite.data.pi,
+            pair_first: invite.data.wants_pair_first(),
         };
 
         self.pending_connect

@@ -137,6 +137,7 @@ async fn sends_pair_request() {
         peer_ip: bind,
         controller_features: vec![],
         remote_homekit_id: None,
+        pair_first: false,
     };
     let _transmitter = AirPlayTransmitterImpl::connect(bootstrap).await.unwrap();
     debug!("Paired!")
@@ -167,6 +168,7 @@ async fn setups_video_audio_streams() {
         peer_ip: bind,
         controller_features: vec![],
         remote_homekit_id: None,
+        pair_first: false,
     };
 
     let sps_pps: Vec<u8> = vec![
