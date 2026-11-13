@@ -18,9 +18,9 @@ const TEXT_COLOR: u32 = 0xFFFFFFFF;
 const SUBTITLE_COLOR: u32 = 0xFFAAA096;
 /// `SetBackground` takes 0xRRGGBBAA.
 const PHOTO_BACKDROP: u32 = 0x000000FF;
-/// A 1x1 white image, stretched into the "OK" button of the pairing screen.
+/// A 1x1 dark grey image, stretched into the "OK" button of the pairing screen (subtle on a dark photo).
 const BUTTON_IMAGE: &[u8] = include_bytes!("../../assets/button.png");
-const BUTTON_TEXT_COLOR: u32 = 0xFF202020;
+const BUTTON_TEXT_COLOR: u32 = 0xFFFFFFFF;
 
 /// Optional, user-provided look of the built-in screens, read from `<persist_dir>/ui.toml`.
 ///
@@ -268,7 +268,7 @@ impl UiTheme {
         const LINE: f32 = 1.25;
         const SUBTITLE_SCALE: f32 = 0.6;
         // Button height and the gap below it, in main-text lines.
-        const BUTTON_LINES: f32 = 1.6;
+        const BUTTON_LINES: f32 = 1.4;
         const BUTTON_GAP: f32 = 0.5;
         let height = screen.height.max(1) as f32;
         let px_per_pt = screen.dpi.max(1.0) / 72.0;
@@ -313,7 +313,7 @@ impl UiTheme {
                     rect: UiRect {
                         x: Unit::Percent(0.5),
                         y: Unit::Px(y),
-                        w: Unit::Px(button_h * 2.5),
+                        w: Unit::Px(button_h * 2.2),
                         h: Unit::Px(button_h),
                         anchor: Anchor::TopCenter,
                     },
