@@ -403,8 +403,8 @@ impl LinkLayer {
     }
 
     /// Drops queued File/EA work for sessions that are not in the local LSP, releasing reserved
-    /// file ids and data instead of keeping them forever. Runs when the LSP is finalised and before
-    /// every payload dequeue. Dropped transfers emit no cancel event.
+    /// file ids and data instead of keeping them forever. Runs before every payload dequeue.
+    /// Dropped transfers emit no cancel event.
     fn release_unsupported_sessions(&mut self) {
         if !self.has_session_of_type(SessionType::FileTransfer) && self.files.reset_tx() {
             warn!(target: self.logger, "Peer negotiated no FileTransfer session; dropped queued file transfers");
@@ -734,7 +734,6 @@ impl LinkLayer {
                 self.negotiation.note_lsp_accepted_by_us(lsp.clone());
                 self.peer_lsp = lsp.clone();
                 self.local_lsp = self.negotiation.local_lsp().clone();
-                self.release_unsupported_sessions();
                 debug!(
                     target: self.logger,
                     "Accessory accepted peer LSP {:?}; local LSP {:?}; waiting to transmit final ACK",
@@ -775,7 +774,6 @@ impl LinkLayer {
                 .accepted_peer_lsp()
                 .cloned()
                 .unwrap_or_else(|| self.local_lsp.clone());
-            self.release_unsupported_sessions();
             self.negotiation.transition_accepted();
             self.change_state(LinkStatus::Writable);
             debug!(target: self.logger, "Host has successfully negotiated link");
