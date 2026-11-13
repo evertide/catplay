@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use ab_glyph::{FontArc, InvalidFont, PxScale};
-use image::{ImageError, RgbaImage};
+use image::{ImageError, RgbaImage, imageops::FilterType};
 use log::debug;
 use turbojpeg::PixelFormat;
 
@@ -13,6 +13,7 @@ pub struct AssetCache {
     img_originals: HashMap<String, Surface>,
 
     img_scaled: HashMap<(String, u32, u32), Surface>,
+    img_cover: HashMap<(String, u32, u32), Surface>,
 
     fonts: HashMap<String, FontArc>,
     fonts_cache: HashMap<(String, u32), FontRenderer>,
@@ -37,6 +38,7 @@ impl AssetCache {
         Self {
             img_originals: HashMap::new(),
             img_scaled: HashMap::new(),
+            img_cover: HashMap::new(),
             fonts: HashMap::new(),
             fonts_cache: HashMap::new(),
         }
@@ -81,6 +83,7 @@ impl AssetCache {
     pub fn release_img(&mut self, id: &str) {
         self.img_originals.retain(|k, _v| k != id);
         self.img_scaled.retain(|k, _v| k.0 != id);
+        self.img_cover.retain(|k, _v| k.0 != id);
         debug!("Releasing asset {id}");
     }
 
@@ -90,13 +93,53 @@ impl AssetCache {
         debug!("Releasing font {id}");
     }
 
-    /// Size of a loaded image before any scaling.
-    pub fn original_size(&self, id: &str) -> Result<(u32, u32), AssetCacheError> {
-        let orig = self
-            .img_originals
-            .get(id)
-            .ok_or_else(|| AssetCacheError::AssetNotFound(id.into()))?;
-        Ok((orig.width.max(0) as u32, orig.height.max(0) as u32))
+    /// Reads an image's dimensions from its header, without decoding the pixels.
+    pub fn image_dimensions(buf: &[u8]) -> Result<(u32, u32), AssetCacheError> {
+        if buf.starts_with(JPEG_MAGIC) {
+            let header = turbojpeg::read_header(buf)?;
+            return Ok((header.width as u32, header.height as u32));
+        }
+        let reader = image::ImageReader::new(std::io::Cursor::new(buf))
+            .with_guessed_format()
+            .map_err(ImageError::IoError)?;
+        Ok(reader.into_dimensions()?)
+    }
+
+    /// Fully decodes an image to check that it can be loaded later.
+    pub fn validate_image(buf: &[u8]) -> Result<(), AssetCacheError> {
+        Self::decode_surface(buf).map(drop)
+    }
+
+    /// The image scaled to cover `w`x`h` (aspect kept, overflow cropped evenly).
+    ///
+    /// Only the visible part of the original is resized, so memory stays at the output size.
+    pub fn get_cover(&mut self, id: String, w: u32, h: u32) -> Result<&Surface, AssetCacheError> {
+        let key = (id.clone(), w, h);
+
+        if !self.img_cover.contains_key(&key) {
+            let orig = self
+                .img_originals
+                .get_mut(&id)
+                .ok_or_else(|| AssetCacheError::AssetNotFound(id.clone()))?;
+            let (iw, ih) = (orig.width.max(1) as u64, orig.height.max(1) as u64);
+            let (fw, fh) = (w.max(1) as u64, h.max(1) as u64);
+            // Largest centred source region with the frame's aspect ratio.
+            let (cw, ch) = if iw * fh > ih * fw {
+                (ih * fw / fh, ih)
+            } else {
+                (iw, iw * fh / fw)
+            };
+            let (cw, ch) = (cw.max(1) as u32, ch.max(1) as u32);
+            let (x, y) = ((iw as u32 - cw) / 2, (ih as u32 - ch) / 2);
+
+            let image = orig.as_image();
+            let visible = image::imageops::crop_imm(&image, x, y, cw, ch);
+            let scaled = image::imageops::resize(&*visible, w, h, FilterType::Nearest);
+            self.img_cover
+                .insert(key.clone(), Surface::from_image(scaled));
+        }
+
+        Ok(self.img_cover.get(&key).unwrap())
     }
 
     pub fn get_scaled(&mut self, id: String, w: u32, h: u32) -> Result<&Surface, AssetCacheError> {
