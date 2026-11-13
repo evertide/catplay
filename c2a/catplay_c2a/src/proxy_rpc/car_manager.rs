@@ -134,6 +134,8 @@ impl CarManager {
             CommandType::ForceKeyFrame
             | CommandType::RequestSiri
             | CommandType::RequestUI
+            | CommandType::ShowUI
+            | CommandType::StopUI
             | CommandType::SetNightMode
             | CommandType::SetLimitedUI
             | CommandType::HidSendReport => {
@@ -530,7 +532,11 @@ impl CarManager {
         let car = self.car_state.clone();
 
         let proxy = match command.get_type() {
-            CommandType::DuckAudio | CommandType::UnduckAudio | CommandType::HidSetInputMode | CommandType::RequestUI => true,
+            CommandType::DuckAudio
+            | CommandType::UnduckAudio
+            | CommandType::HidSetInputMode
+            | CommandType::RequestUI
+            | CommandType::SuggestUI => true,
             CommandType::DisableBluetooth => {
                 let command = command.clone();
                 let task = spawn(async move {
@@ -638,6 +644,9 @@ impl CarManager {
                 | CommandType::ForceKeyFrame // TODO
                 | CommandType::RequestSiri
                 | CommandType::RequestUI
+                // showUI/stopUI: the car switches a display (e.g. the instrument cluster) to or from CarPlay.
+                | CommandType::ShowUI
+                | CommandType::StopUI
                 | CommandType::SetNightMode
                 | CommandType::SetLimitedUI
                 | CommandType::ChangeMapZoomLevel => ProxyType::Proxy,
