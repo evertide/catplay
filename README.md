@@ -75,8 +75,34 @@ Note that CarPlay Ultra mode is currently not supported.
 If you have a spare Aston Martin 2025 with CarPlay Ultra collecting dust, please consider donating it towards the project to help development!  
 (DM me for shipping instructions)
 
+## Car GPS forwarding
+
+Carplay2Air forwards car location updates over the AirPlay iAP2 channel for the
+lifetime of wireless CarPlay. Bluetooth still handles pairing and Wi-Fi setup;
+its expected disconnect after `DisableBluetooth` does not end the GPS feed.
+There is no GPS configuration switch.
+
+The local endpoint is opened only when the current USB car session advertises a
+location component with a supported data type, accepts both `StartLocationInformation`
+and `StopLocationInformation`, and lists `LocationInformation` among the messages
+it sends. Cars without these capabilities keep the existing command proxy path.
+The bridge waits for an iPhone location request and car identification/authentication,
+but does not wait for power messages: some cars advertise them without sending them.
+Existing power replies are unchanged. Requested data types are intersected with the
+car's capabilities, and only the latest unconsumed location packet is retained.
+
+The endpoint starts without waiting for GPS, power, or an extra handshake during
+connection setup. Its errors stop GPS without tearing down audio/video. An iPhone
+Stop request or AirPlay teardown cancels the feed; a replacement USB session repeats
+identification/authentication for the live AirPlay request. No lock is held across
+an await in the bridge.
+
+Build-server and vehicle validation should check that location packets continue
+in AirPlay after `DisableBluetooth`, that Stop is sent on AirPlay teardown, and
+that connection timing and command routing remain unchanged on a car without GPS.
+
 ## Known limitations
-- incomplete GPS sync
+- car GPS compatibility depends on the head unit exposing iAP2 location data
 - incomplete "now playing" sync
 - aggresive reconnects (pulling the dongle in and out several times) after few random times, trigger an iOS bug that makes it such that _all_ CarPlay invites will be ignored, until you pull out the phone and _manually_ disconnect the Wi-Fi network. there is however one way to detect this and unglitch the phone remotely, which may be implemented in the future.
 - remembering the dongle's network as "auto connect" is a trigger for the exact same iOS bug. please never do this

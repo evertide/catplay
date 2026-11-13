@@ -47,7 +47,7 @@ pub struct CarPlayWirelessGadget<T: AirPlayReceiverSink> {
 
     // AirPlay sink
     sink: Arc<dyn Fn() -> T + Send + Sync + 'static>,
-    iap2_factory: Option<Arc<dyn Fn(CarPlaySessionIdentity) -> CsmSessionBox + Send + Sync>>,
+    identity_callback: Option<Arc<dyn Fn(CarPlaySessionIdentity) + Send + Sync>>,
 
     invites_blocked: bool,
     last_mac: Option<MacAddr6>,
@@ -95,7 +95,7 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
                 mfi,
                 shared,
                 sink: Arc::new(sink),
-                iap2_factory: None,
+                identity_callback: None,
                 invites_blocked: false,
                 last_mac: None,
                 bt_last_connect_cache_file: bt_last_connect_cache_file.map(|p| p.into()),
@@ -232,9 +232,10 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
         self.invites_blocked = blocked;
     }
 
-    /// Wrap Bluetooth sessions while preserving the gadget's identity and pairing behavior.
-    pub fn set_iap2_factory(&mut self, factory: impl Fn(CarPlaySessionIdentity) -> CsmSessionBox + Send + Sync + 'static) {
-        self.iap2_factory = Some(Arc::new(factory));
+    /// Publish the real wireless identity before accepting Bluetooth or AirPlay
+    /// connections, including Wi-Fi reconnects without a new Bluetooth session.
+    pub fn set_identity_callback(&mut self, callback: impl Fn(CarPlaySessionIdentity) + Send + Sync + 'static) {
+        self.identity_callback = Some(Arc::new(callback));
     }
 }
 
@@ -352,13 +353,10 @@ impl<T: AirPlayReceiverSink> Reconcilable for CarPlayWirelessGadget<T> {
                     ..CarPlaySessionIdentity::default()
                 };
 
-                let factory = self.iap2_factory.clone();
-                let cb = move || -> CsmSessionBox {
-                    match &factory {
-                        Some(factory) => factory(identity.clone()),
-                        None => Box::new(CarPlayServerSession::new(mfi.clone(), identity.clone()).0),
-                    }
-                };
+                if let Some(callback) = &self.identity_callback {
+                    callback(identity.clone());
+                }
+                let cb = move || -> CsmSessionBox { Box::new(CarPlayServerSession::new(mfi.clone(), identity.clone()).0) };
                 let mut mgr = BluetoothManager::new(false, true, true, hci, cb);
                 mgr.start()
                     .await

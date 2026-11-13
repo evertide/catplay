@@ -37,7 +37,7 @@ use crate::{
     },
     pairing::PairingHelperRx,
     rtp::RtpReceiver,
-    rtsp_frame::{HttpHeader, HttpStatus, RtspError, RtspMethod::*, RtspQueue, RtspRequest, RtspResponse, RtspResult},
+    rtsp_frame::{HttpHeader, HttpStatus, RtspError, RtspFuture, RtspMethod::*, RtspQueue, RtspRequest, RtspResponse, RtspResult},
     rtsp_session::{RtspReceiverCallback, RtspReceiverEvent, RtspReceiverEventResult},
     screen::rx::ScreenReceiverSession,
 };
@@ -110,6 +110,7 @@ pub struct AirPlayReceiver {
 
 #[derive(Default, AsyncShutdown, EventSleeper, EventReconciler)]
 #[reconcile_error(AirPlayReceiverSessionError)]
+#[reconcile_func(reconcile_iap2)]
 struct Streams {
     #[sleep]
     #[reconcile(AirPlayReceiverSessionError::KeepAlive)]
@@ -142,12 +143,49 @@ struct Streams {
 
     #[sleep]
     #[shutdown(take)]
-    #[reconcile]
     iap2: Option<AsyncClient>,
     #[sleep]
     iap2_drain: Option<AsyncClientDrain>,
+    #[sleep]
+    iap2_commands: FuturesUnordered<RtspFuture>,
+    iap2_optional: bool,
 
     handle: Option<AirPlayReceiverHandleRef>,
+}
+
+impl Streams {
+    fn iap2_result(&mut self, result: Result<(), AirPlayReceiverSessionError>) -> Result<(), AirPlayReceiverSessionError> {
+        match result {
+            Err(err) if self.iap2_optional => {
+                warn!("Dropping optional AirPlay iAP2 endpoint: {err}");
+                self.iap2 = None;
+                self.iap2_drain = None;
+                self.iap2_commands = Default::default();
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    async fn reconcile_iap2(&mut self) -> Result<(), AirPlayReceiverSessionError> {
+        let result = self
+            .iap2
+            .reconcile()
+            .await
+            .map_err(AirPlayReceiverSessionError::IAp2);
+        self.iap2_result(result)?;
+        if let Some(response) = self.iap2_commands.take() {
+            let result = response.and_then(|response| {
+                if response.status == HttpStatus::Ok {
+                    Ok(())
+                } else {
+                    Err(RtspError::Code(response.status))
+                }
+            });
+            self.iap2_result(result.map_err(AirPlayReceiverSessionError::IAp2Sanity))?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -588,20 +626,34 @@ impl AirPlayReceiver {
             return;
         }
 
+        self.streams.iap2_optional = self.sink.iap2_is_optional();
         let (client, drain) = AsyncClient::new(false, CsmRemote::airplay(), _sink);
         self.streams.iap2_drain.replace(drain);
         self.streams.iap2.replace(client);
     }
 
     async fn flush_iap2(&mut self) -> RtspResult<()> {
-        if let Some(handle) = self.streams.handle.as_mut()
+        // Optional endpoints keep at most one command awaiting an RTSP response.
+        // Never await it here: media and connection setup must keep progressing.
+        if self.streams.iap2_commands.is_empty()
+            && self.streams.iap2_commands.peek().is_none()
+            && let Some(handle) = self.streams.handle.as_mut()
             && let Some(drain) = self.streams.iap2_drain.as_mut()
             && let Some(packet) = drain.take()
         {
             debug!("Forwarding iAP2 packet");
-            let fut = handle.send_command(Command::IApSendMessage(CommandIApSendMessage {
+            match handle.send_command(Command::IApSendMessage(CommandIApSendMessage {
                 data: packet.into_inner().into(),
-            }))?;
+            })) {
+                Ok(future) if self.streams.iap2_optional => self.streams.iap2_commands.push(future),
+                Ok(_) => {}
+                Err(err) if self.streams.iap2_optional => {
+                    self.streams
+                        .iap2_result(Err(AirPlayReceiverSessionError::IAp2Sanity(err)))
+                        .map_err(RtspError::foreign)?;
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         Ok(())
@@ -1010,5 +1062,132 @@ impl AirPlayReceiver {
     fn is_idle(&self) -> bool {
         let s = &self.streams;
         s.main_audio.is_none() && s.alt_audio.is_none() && s.screen.is_none() && s.alt_screen.is_none()
+    }
+}
+
+#[cfg(test)]
+mod iap2_tests {
+    use super::*;
+    use catplay_csm::decoder::CsmPacketBox;
+    use catplay_iap2_client::{CsmClientHandleRef, CsmSession, CsmSessionError, CsmSessionResult};
+    use futures::{FutureExt, executor::block_on};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct TestSession {
+        fail: bool,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for TestSession {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait]
+    impl CsmSession for TestSession {
+        async fn start(&mut self, _: CsmClientHandleRef) -> CsmSessionResult<()> {
+            Ok(())
+        }
+
+        async fn respond(&mut self, _: CsmPacketBox, _: CsmClientHandleRef) -> CsmSessionResult<()> {
+            Ok(())
+        }
+
+        fn process_event(&mut self, _: CsmClientHandleRef) -> CsmSessionResult<bool> {
+            if self.fail {
+                Err(CsmSessionError::SessionTerminated)
+            } else {
+                Ok(false)
+            }
+        }
+    }
+
+    fn endpoint(optional: bool, fail: bool) -> (Streams, Arc<AtomicBool>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let session = Box::new(TestSession {
+            fail,
+            dropped: dropped.clone(),
+        });
+        let (client, drain) = AsyncClient::new(false, CsmRemote::airplay(), session);
+        (
+            Streams {
+                iap2: Some(client),
+                iap2_drain: Some(drain),
+                iap2_optional: optional,
+                event_rtsp: Some(RtspQueue::new().0),
+                ..Streams::default()
+            },
+            dropped,
+        )
+    }
+
+    #[test]
+    fn optional_iap2_failure_drops_only_the_endpoint() {
+        let (mut streams, dropped) = endpoint(true, true);
+        block_on(streams.reconcile()).unwrap();
+        assert!(streams.iap2.is_none());
+        assert!(streams.iap2_drain.is_none());
+        assert!(dropped.load(Ordering::Relaxed));
+        assert!(streams.event_rtsp.is_some());
+        block_on(streams.reconcile()).unwrap();
+    }
+
+    #[test]
+    fn mandatory_iap2_failure_preserves_existing_error_behavior() {
+        let (mut streams, _) = endpoint(false, true);
+        assert!(matches!(
+            block_on(streams.reconcile()),
+            Err(AirPlayReceiverSessionError::IAp2(CsmSessionError::SessionTerminated))
+        ));
+        assert!(streams.iap2.is_some());
+    }
+
+    #[test]
+    fn rejected_or_failed_iap2_command_drops_only_optional_endpoint() {
+        for closed in [false, true] {
+            let (mut streams, dropped) = endpoint(true, false);
+            let (queue, mut drain) = RtspQueue::fifo();
+            streams
+                .iap2_commands
+                .push(queue.request(RtspRequest::new(Post, "/command")));
+            if closed {
+                drain.close();
+            } else {
+                drain.feed(RtspResponse::new(None, HttpStatus::BadRequest));
+            }
+            assert!(streams.iap2_commands.sleep().now_or_never().flatten().is_some());
+            block_on(streams.reconcile()).unwrap();
+            assert!(streams.iap2.is_none());
+            assert!(streams.iap2_drain.is_none());
+            assert!(dropped.load(Ordering::Relaxed));
+            assert!(streams.event_rtsp.is_some());
+        }
+    }
+
+    #[test]
+    fn pending_iap2_response_does_not_block_reconciliation() {
+        let (mut streams, dropped) = endpoint(true, false);
+        let (queue, drain) = RtspQueue::fifo();
+        streams
+            .iap2_commands
+            .push(queue.request(RtspRequest::new(Post, "/command")));
+        assert!(streams.iap2_commands.sleep().now_or_never().is_none());
+        streams
+            .reconcile()
+            .now_or_never()
+            .expect("must not wait for iAP2")
+            .unwrap();
+        assert!(streams.event_rtsp.is_some());
+        assert!(!dropped.load(Ordering::Relaxed));
+
+        drain.feed(RtspResponse::new(None, HttpStatus::Ok));
+        assert!(streams.iap2_commands.sleep().now_or_never().flatten().is_some());
+        block_on(streams.reconcile()).unwrap();
+        assert!(streams.iap2.is_some());
+        assert!(streams.iap2_drain.is_some());
+        assert!(streams.iap2_commands.is_empty());
+        assert!(streams.iap2_commands.peek().is_none());
+        assert!(!dropped.load(Ordering::Relaxed));
     }
 }

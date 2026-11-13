@@ -7,7 +7,8 @@ use catplay_mfi::MfiDeficeRef;
 use catplay_util::{event_select, mpsc};
 use futures::{FutureExt, StreamExt};
 
-/// Adds GPS forwarding to the existing Bluetooth iAP2 session.
+/// Forwards GPS over the AirPlay iAP2 session that lasts for the whole drive.
+/// Bluetooth is used only for the existing pairing/Wi-Fi setup.
 pub struct Iap2LocationBridge {
     session: CarPlayServerSession,
     events: mpsc::UnboundedReceiver<CarPlayServerSessionEventTx>,

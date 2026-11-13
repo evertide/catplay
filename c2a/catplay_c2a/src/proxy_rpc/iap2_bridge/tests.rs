@@ -1,5 +1,10 @@
 use std::sync::{Arc, Mutex};
 
+use catplay_carplay::{
+    carplay_rx::AirPlayReceiverSink,
+    msg::{Command, CommandIApSendMessage},
+    rtsp_frame::{HttpStatus, RtspResponse},
+};
 use catplay_carplay_tx_gadget::carplay_client_session::CarPlayClientSession;
 use catplay_csm::{
     decoder::{AsCsmPacket, CsmFlag, CsmPacketId, CsmPacketRegistry},
@@ -9,6 +14,7 @@ use catplay_iap2_client::{CsmClientHandle, CsmRemote, CsmSessionStatus};
 use futures::executor::block_on;
 
 use super::*;
+use crate::proxy_rpc::{CarPlayRxSession, TxAdapter, TxAdapterOp};
 
 #[derive(Default)]
 struct Capture(Mutex<Vec<CsmPacketBox>>);
@@ -450,6 +456,152 @@ fn replacing_a_request_discards_old_fixes_without_cancelling_the_new_subscriptio
     respond(&mut car, &car_out, sample());
     assert_eq!(second.take(), Some(sample()));
     drop(second);
+    pump(&mut car, &car_out);
+    let commands = car_out.location_commands();
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].cast::<StopLocationInformation>().is_some());
+}
+
+fn wireless_identity() -> CarPlaySessionIdentity {
+    CarPlaySessionIdentity {
+        name: "CatPlay GPS test".into(),
+        display_name: "Volvo".into(),
+        bt_mac: Some("12:34:56:78:9a:bc".parse().unwrap()),
+        wifi_ssid: Some("CatPlay-Volvo".into()),
+        wifi_passphrase: Some("test-passphrase".into()),
+        wifi_is_wpa: true,
+        wifi_channel: Some(36),
+        is_usb_transport: false,
+        has_gps: true,
+        ..CarPlaySessionIdentity::default()
+    }
+}
+
+fn airplay_sink(
+    location: LocationBridge,
+    identity: Option<CarPlaySessionIdentity>,
+) -> (CarPlayRxSession, mpsc::UnboundedReceiver<TxAdapterOp>) {
+    let (tx, rx) = mpsc::unbounded();
+    (
+        CarPlayRxSession::new(TxAdapter::new(tx), location, Arc::new(Mutex::new(identity)), None),
+        rx,
+    )
+}
+
+fn iap2_command() -> Command {
+    Command::IApSendMessage(CommandIApSendMessage {
+        data: vec![1, 2, 3].into(),
+    })
+}
+
+fn assert_proxied(sink: &mut CarPlayRxSession, proxy: &mut mpsc::UnboundedReceiver<TxAdapterOp>) {
+    let command = iap2_command();
+    let mut future = sink.on_command_raw(&command);
+    assert!(future.as_mut().now_or_never().is_none());
+    let Some(Some(TxAdapterOp::Command { response, .. })) = proxy.next().now_or_never() else {
+        panic!("iAP2 commands must still reach the car proxy");
+    };
+    response.send(RtspResponse::new(None, HttpStatus::Ok)).unwrap();
+    assert_eq!(block_on(future).unwrap().status, HttpStatus::Ok);
+}
+
+#[test]
+fn cars_without_location_keep_the_existing_airplay_command_proxy() {
+    for id in unsupported_cars() {
+        let location = LocationBridge::default();
+        let mut car = CarPlayClientSession::with_location(location.clone());
+        let car_out = Arc::new(Capture::default());
+        block_on(car.start(car_out.clone())).unwrap();
+        respond(&mut car, &car_out, id);
+        respond(&mut car, &car_out, AuthenticationResponse::default());
+        let (mut sink, mut proxy) = airplay_sink(location, Some(wireless_identity()));
+        assert!(block_on(sink.open_iap2()).is_none());
+        assert_proxied(&mut sink, &mut proxy);
+        assert!(car_out.location_commands().is_empty());
+        assert!(car.wait_event().now_or_never().is_none());
+    }
+}
+
+#[test]
+fn airplay_without_a_car_or_wireless_identity_does_not_wait_or_claim_iap2() {
+    let location = LocationBridge::default();
+    let (mut no_car, mut proxy) = airplay_sink(location.clone(), Some(wireless_identity()));
+    assert!(no_car.open_iap2().now_or_never().unwrap().is_none());
+    assert_proxied(&mut no_car, &mut proxy);
+
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    ready(&mut car, &Arc::new(Capture::default()));
+    let (mut no_identity, mut proxy) = airplay_sink(location, None);
+    assert!(no_identity.open_iap2().now_or_never().unwrap().is_none());
+    assert_proxied(&mut no_identity, &mut proxy);
+    assert!(CarPlayRxSession::reject().open_iap2().now_or_never().unwrap().is_none());
+}
+
+#[test]
+fn airplay_uses_the_wireless_identity_and_keeps_ownership_after_endpoint_failure() {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    ready(&mut car, &Arc::new(Capture::default()));
+    let identity = wireless_identity();
+    let expected = CarPlayServerSession::id(&identity);
+    let (mut sink, mut proxy) = airplay_sink(location, Some(identity));
+    assert!(sink.iap2_is_optional());
+    // Creating the endpoint is immediate; authentication runs in the event loop.
+    let mut endpoint = sink.open_iap2().now_or_never().unwrap().unwrap();
+    let out = Arc::new(Capture::default());
+    respond(&mut endpoint, &out, StartIdentification::default());
+    let packets = out.take();
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].cast::<IdentificationInformation>(), Some(&expected));
+    assert_eq!(block_on(sink.on_command_raw(&iap2_command())).unwrap().status, HttpStatus::Ok);
+    assert!(proxy.next().now_or_never().is_none());
+    // Optional endpoint failure must not reroute its remaining frames to USB.
+    drop(endpoint);
+    assert_eq!(block_on(sink.on_command_raw(&iap2_command())).unwrap().status, HttpStatus::Ok);
+    assert!(proxy.next().now_or_never().is_none());
+}
+
+#[test]
+fn bluetooth_disconnect_leaves_gps_flowing_until_airplay_teardown() {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    let phone_out = Arc::new(Capture::default());
+    ready(&mut car, &car_out);
+
+    // Use the same unwrapped Bluetooth session as CarPlayWirelessGadget.
+    let identity = wireless_identity();
+    let mut bluetooth = CarPlayServerSession::new(None, identity.clone()).0;
+    respond(&mut bluetooth, &phone_out, StartLocationInformation::all());
+    assert!(!car.process_event(car_out.clone()).unwrap());
+    assert!(car_out.location_commands().is_empty());
+
+    let (mut sink, _proxy) = airplay_sink(location, Some(identity));
+    let mut airplay = block_on(sink.open_iap2()).unwrap();
+    respond(&mut airplay, &phone_out, StartLocationInformation::all());
+    pump(&mut airplay, &phone_out);
+    pump(&mut car, &car_out);
+    assert_eq!(car_out.location_commands().len(), 1);
+    respond(&mut car, &car_out, sample());
+    pump(&mut airplay, &phone_out);
+    assert_eq!(phone_out.take()[0].cast::<LocationInformation>(), Some(&sample()));
+
+    // DisableBluetooth closes this session while AirPlay stays alive.
+    respond(&mut bluetooth, &phone_out, StopLocationInformation::default());
+    drop(bluetooth);
+    assert!(!car.process_event(car_out.clone()).unwrap());
+    assert!(car_out.take().is_empty());
+    assert!(car.wait_event().now_or_never().is_none());
+    let next = LocationInformation {
+        nmea_sentence: vec!["$PASCD,42*00\r\n".into()],
+    };
+    respond(&mut car, &car_out, next.clone());
+    pump(&mut airplay, &phone_out);
+    let packets = phone_out.take();
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].cast::<LocationInformation>(), Some(&next));
+
+    drop(airplay);
     pump(&mut car, &car_out);
     let commands = car_out.location_commands();
     assert_eq!(commands.len(), 1);

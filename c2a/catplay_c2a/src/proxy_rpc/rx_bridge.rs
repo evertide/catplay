@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use catplay_carplay::{
@@ -6,26 +9,42 @@ use catplay_carplay::{
     carplay_rx::{AirPlayReceiverHandleRef, AirPlayReceiverSink},
     modes::AirPlayModeState,
     msg::{AudioFormat, AudioType, Command, ControllerFeature, InfoMessageResponse, StreamType},
-    rtsp_frame::{RtspError, RtspResponse, RtspResult},
+    rtsp_frame::{HttpStatus, RtspError, RtspResponse, RtspResult},
     screen::rx::ScreenReceiverSinkBox,
 };
+use catplay_carplay_rx_gadget::CarPlaySessionIdentity;
+use catplay_carplay_tx_gadget::location::LocationBridge;
 use catplay_iap2_client::CsmSessionBox;
+use catplay_mfi::MfiDeficeRef;
 use catplay_util::{AsyncShutdown, EventReconciler, EventSleeper};
 
-use crate::proxy_rpc::tx_adapter::TxAdapter;
+use crate::proxy_rpc::{Iap2LocationBridge, tx_adapter::TxAdapter};
 
 pub struct CarPlayRxSession {
     tx: Option<TxAdapter>,
     handle: Option<AirPlayReceiverHandleRef>,
     reject: bool,
+    location: LocationBridge,
+    identity: Arc<Mutex<Option<CarPlaySessionIdentity>>>,
+    mfi: Option<MfiDeficeRef>,
+    local_iap2: bool,
 }
 
 impl CarPlayRxSession {
-    pub fn new(tx: TxAdapter) -> Self {
+    pub fn new(
+        tx: TxAdapter,
+        location: LocationBridge,
+        identity: Arc<Mutex<Option<CarPlaySessionIdentity>>>,
+        mfi: Option<MfiDeficeRef>,
+    ) -> Self {
         Self {
             tx: Some(tx),
             handle: None,
             reject: false,
+            location,
+            identity,
+            mfi,
+            local_iap2: false,
         }
     }
 
@@ -34,6 +53,10 @@ impl CarPlayRxSession {
             tx: None,
             handle: None,
             reject: true,
+            location: Default::default(),
+            identity: Default::default(),
+            mfi: None,
+            local_iap2: false,
         }
     }
 
@@ -91,7 +114,16 @@ impl AirPlayReceiverSink for CarPlayRxSession {
     }
 
     async fn open_iap2(&mut self) -> Option<CsmSessionBox> {
-        None
+        if self.reject || !self.location.is_available() {
+            return None;
+        }
+        let identity = self.identity.lock().unwrap().clone()?;
+        self.local_iap2 = true;
+        Some(Iap2LocationBridge::new(self.mfi.clone(), identity, self.location.clone()))
+    }
+
+    fn iap2_is_optional(&self) -> bool {
+        true
     }
 
     async fn on_info(&mut self, info: &mut InfoMessageResponse) {
@@ -128,6 +160,11 @@ impl AirPlayReceiverSink for CarPlayRxSession {
 
     async fn on_command_raw(&mut self, command: &Command) -> RtspResult<RtspResponse> {
         self.reject_if_needed()?;
+        if self.local_iap2 && matches!(command, Command::IApSendMessage(_)) {
+            // Keep ownership even if the optional endpoint fails: its frames must
+            // never enter the car's independent USB iAP2 session.
+            return Ok(RtspResponse::new(None, HttpStatus::Ok));
+        }
         self.tx().proxy_cmd_and_spy(command).await
     }
 
