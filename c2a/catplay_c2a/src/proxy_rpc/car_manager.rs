@@ -27,7 +27,8 @@ use std::{
 use crate::{
     audiov2::AudioProxyUtil,
     proxy_rpc::{
-        AltScreenManager, ModesArbiter, TxAdapterOp, car_to_iphone_command_task::CarToIphoneCommandTask, overlay_manager::OverlayManager,
+        AltScreenManager, ModesArbiter, NightModes, TxAdapterOp, car_to_iphone_command_task::CarToIphoneCommandTask,
+        overlay_manager::OverlayManager,
     },
 };
 
@@ -51,7 +52,7 @@ pub struct CarManager {
 
     modes: ModesArbiter,
     initial_screen_steal_attempted: bool,
-    night_mode: bool,
+    night_modes: NightModes,
 
     tx_current: Option<LazyAsync<RtspResult<()>>>,
     tx_queue: VecDeque<BoxFuture<'static, RtspResult<()>>>,
@@ -111,7 +112,7 @@ impl CarManager {
             tx_closed: None,
 
             tx_queue: Default::default(),
-            night_mode: *info.night_mode.clone().unwrap_or_default(),
+            night_modes: NightModes::new(*info.night_mode.clone().unwrap_or_default()),
             modes: ModesArbiter::new(&info.modes),
             initial_screen_steal_attempted: false,
             error: None,
@@ -494,11 +495,14 @@ impl CarManager {
             let mut hid_devices = other.hid_devices;
             // Per-display night mode (Volvo cluster) is a snapshot from when the car was probed; keep it in sync with the
             // live value like the top-level one, preserving the car's value type.
-            for night_mode in displays.iter_mut().filter_map(|display| display.night_mode.as_mut()) {
-                *night_mode = match night_mode {
-                    Value::Boolean(_) => Value::Boolean(self.night_mode),
-                    _ => Value::Integer((self.night_mode as u64).into()),
-                };
+            for display in &mut displays {
+                let live = self.night_modes.for_display(&display.uuid);
+                if let Some(night_mode) = display.night_mode.as_mut() {
+                    *night_mode = match night_mode {
+                        Value::Boolean(_) => Value::Boolean(live),
+                        _ => Value::Integer((live as u64).into()),
+                    };
+                }
             }
             if !self.iphone_features.contains(&ControllerFeature::AltScreen) {
                 // Without altScreen only the main display can be driven. Advertising additional displays (e.g. an instrument cluster)
@@ -511,7 +515,7 @@ impl CarManager {
                 hid_languages: other.hid_languages,
                 right_hand_drive: other.right_hand_drive,
 
-                night_mode: Some(self.night_mode.into()),
+                night_mode: Some(self.night_modes.global().into()),
                 modes: self.modes.modes_mut().serialize_to_info_request(),
 
                 oem_icon: other.oem_icon,
@@ -631,9 +635,9 @@ impl CarManager {
         }
 
         if let Command::SetNightMode(mode) = cmd.command() {
-            if is_main_display(&self.car_state.info_cached().displays, mode.uuid.as_deref()) {
-                self.night_mode = mode.night_mode;
-            }
+            let main_uuid = self.car_state.info_cached().displays.first().map(|main| main.uuid.clone());
+            self.night_modes
+                .apply(mode.night_mode, mode.uuid.as_deref(), main_uuid.as_deref());
         }
 
         // Display switches only make sense for displays the iPhone was told about (see restrict_to_main_display).
@@ -726,9 +730,9 @@ impl CarManager {
                 cmd.respond_ok();
             }
             Command::SetNightMode(v) => {
-                if is_main_display(&self.car_state.info_cached().displays, v.uuid.as_deref()) {
-                    self.night_mode = v.night_mode;
-                }
+                let main_uuid = self.car_state.info_cached().displays.first().map(|main| main.uuid.clone());
+                self.night_modes
+                    .apply(v.night_mode, v.uuid.as_deref(), main_uuid.as_deref());
                 cmd.respond_ok();
             }
             // Without an iPhone there is nothing to show; answer as before instead of pretending it worked.
@@ -762,11 +766,6 @@ fn negotiate_proxied_features(offered: &[ControllerFeature], car_enabled: &[Cont
 /// Keeps only the main display, and the HID devices that belong to it.
 ///
 /// This assumes that the car lists its main display first, which holds for all head units observed so far.
-/// The global night mode tracks the main display; a setNightMode scoped to another display (e.g. the cluster) is not global.
-fn is_main_display(displays: &[Display], uuid: Option<&str>) -> bool {
-    uuid.is_none_or(|uuid| displays.first().is_none_or(|main| main.uuid == uuid))
-}
-
 fn restrict_to_main_display(displays: &mut Vec<Display>, hid_devices: &mut Vec<HidDevice>) {
     displays.truncate(1);
     hid_devices.retain(|hid| {
@@ -793,17 +792,6 @@ mod tests {
 
     const MAIN_UUID: &str = "e5f7a68d-7b0f-4305-984b-974f677a150b";
     const CLUSTER_UUID: &str = "b7e6c5a0-2222-4000-8000-000000000002";
-
-    #[test]
-    fn night_mode_follows_main_display_only() {
-        let displays = [MAIN_UUID, CLUSTER_UUID].map(|uuid| Display {
-            uuid: uuid.into(),
-            ..Default::default()
-        });
-        assert!(is_main_display(&displays, None));
-        assert!(is_main_display(&displays, Some(MAIN_UUID)));
-        assert!(!is_main_display(&displays, Some(CLUSTER_UUID)));
-    }
 
     /// Subset of the features offered by the iPhone in the logs of issue #40.
     const IPHONE_OFFERED: [ControllerFeature; 5] = [
