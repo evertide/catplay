@@ -8,8 +8,12 @@ use catplay_carplay::{
     carplay_rx::sink::AirPlayServerShared,
     carplay_tx::{AirPlayTransmitterImpl, AirPlayTransmitterSessionError, TeardownGuard},
 };
-use catplay_carplay_rx_gadget::{CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState};
-use catplay_carplay_tx_gadget::client::{CarPlayUsbClientGadget, CarPlayUsbClientGadgetError, CarPlayUsbClientGadgetStatus};
+use catplay_carplay_rx_gadget::{CarPlayServerSession, CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState};
+use catplay_carplay_tx_gadget::{
+    carplay_client_session::CarPlayClientSession,
+    client::{CarPlayUsbClientGadget, CarPlayUsbClientGadgetError, CarPlayUsbClientGadgetStatus},
+    location::CarPlayLocationControl,
+};
 use catplay_hap::HomekitStorageRef;
 use catplay_iap2_usb::GadgetError;
 use catplay_mfi::MfiDeficeRef;
@@ -19,7 +23,7 @@ use catplay_util::{
 use log::{debug, error, info};
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::proxy_rpc::{CarManager, CarPlayRxSession, TxAdapter, TxAdapterOp};
+use crate::proxy_rpc::{CarManager, CarPlayRxSession, Iap2LocationBridge, TxAdapter, TxAdapterOp};
 
 pub struct ProdGadgetConfig {
     pub homekit_rx: HomekitStorageRef,
@@ -52,6 +56,7 @@ pub struct ProdGadget {
     pending_transmitter: Arc<TokioMutex<Option<TeardownGuard<AirPlayTransmitterImpl>>>>,
 
     last_tx: Arc<Mutex<Option<ProdGadgetSession>>>,
+    car_location: Arc<Mutex<Option<CarPlayLocationControl>>>,
     burst_wakeups: bool,
 }
 
@@ -111,6 +116,7 @@ impl ProdGadget {
                 tx: None,
                 pending_transmitter: Default::default(),
                 last_tx: Default::default(),
+                car_location: Default::default(),
                 burst_wakeups: false,
             },
             Ok(ProdGadgetState::Initial),
@@ -137,6 +143,7 @@ impl AsyncShutdown for ProdGadget {
 #[derive(Clone)]
 pub struct ProdGadgetSession {
     pub proxy_tx: mpsc::UnboundedSender<TxAdapterOp>,
+    pub car_location: Option<CarPlayLocationControl>,
 }
 
 impl EventSleeper for ProdGadget {
@@ -219,6 +226,7 @@ impl Reconcilable for ProdGadget {
                 Some(&self.cfg.bt_cache_file),
                 {
                     let car = self.last_tx.clone();
+                    let mfi = self.cfg.mfi.clone();
 
                     move || {
                         let Some(car) = car.lock().unwrap().clone() else {
@@ -226,19 +234,42 @@ impl Reconcilable for ProdGadget {
                         };
 
                         let sess = TxAdapter::new(car.proxy_tx.clone());
-                        CarPlayRxSession::new(sess)
+                        CarPlayRxSession::new(sess, car.car_location.clone(), mfi.clone())
                     }
                 },
             ));
+            let car_location = self.car_location.clone();
+            let mfi = self.cfg.mfi.clone();
+            self.rx.as_mut().unwrap().child_mut().set_iap2_factory(move |identity| {
+                let car = car_location.lock().unwrap().clone();
+                match car {
+                    Some(car) => Iap2LocationBridge::new(mfi.clone(), identity, car),
+                    None => Box::new(CarPlayServerSession::new(mfi.clone(), identity).0),
+                }
+            });
         }
 
         if self.tx.is_none() {
-            let gadget = CarPlayUsbClientGadget::new(
+            let car_location = self.car_location.clone();
+            // Publish the first endpoint before Bluetooth starts accepting iAP2.
+            // A phone can subscribe while the USB link is still being established.
+            let (first_session, first_location) = CarPlayClientSession::new();
+            car_location.lock().unwrap().replace(first_location);
+            let first_session = Mutex::new(Some(first_session));
+            let gadget = CarPlayUsbClientGadget::new_with_csm(
                 "default",
                 "aa:bb:cc:dd:ee:ff",
                 self.cfg.udc_tx.as_deref(),
                 self.cfg.homekit_tx.clone(),
                 false,
+                move || {
+                    if let Some(session) = first_session.lock().unwrap().take() {
+                        return session;
+                    }
+                    let (session, location) = CarPlayClientSession::new();
+                    car_location.lock().unwrap().replace(location);
+                    session
+                },
             )
             .map_err(|err| LocalError::FailedToSetupUsbClient(err))?;
             self.tx.replace(gadget);
@@ -259,7 +290,10 @@ impl Reconcilable for ProdGadget {
             // pending_transmitter.replace(transmitter);
 
             let proxy_chan = mpsc::unbounded();
-            let car_state = ProdGadgetSession { proxy_tx: proxy_chan.0 };
+            let car_state = ProdGadgetSession {
+                proxy_tx: proxy_chan.0,
+                car_location: self.car_location.lock().unwrap().clone(),
+            };
 
             let transmitter2 = CarManager::new(transmitter, proxy_chan.1, self.cfg.persist_dir.clone());
             transmitter2.await.expect("TODO").background();

@@ -9,23 +9,30 @@ use catplay_carplay::{
     rtsp_frame::{RtspError, RtspResponse, RtspResult},
     screen::rx::ScreenReceiverSinkBox,
 };
+use catplay_carplay_rx_gadget::CarPlaySessionIdentity;
+use catplay_carplay_tx_gadget::location::CarPlayLocationControl;
 use catplay_iap2_client::CsmSessionBox;
+use catplay_mfi::MfiDeficeRef;
 use catplay_util::{AsyncShutdown, EventReconciler, EventSleeper};
 
-use crate::proxy_rpc::tx_adapter::TxAdapter;
+use crate::proxy_rpc::{Iap2LocationBridge, tx_adapter::TxAdapter};
 
 pub struct CarPlayRxSession {
     tx: Option<TxAdapter>,
     handle: Option<AirPlayReceiverHandleRef>,
     reject: bool,
+    car_location: Option<CarPlayLocationControl>,
+    mfi: Option<MfiDeficeRef>,
 }
 
 impl CarPlayRxSession {
-    pub fn new(tx: TxAdapter) -> Self {
+    pub fn new(tx: TxAdapter, car_location: Option<CarPlayLocationControl>, mfi: Option<MfiDeficeRef>) -> Self {
         Self {
             tx: Some(tx),
             handle: None,
             reject: false,
+            car_location,
+            mfi,
         }
     }
 
@@ -34,6 +41,8 @@ impl CarPlayRxSession {
             tx: None,
             handle: None,
             reject: true,
+            car_location: None,
+            mfi: None,
         }
     }
 
@@ -91,7 +100,18 @@ impl AirPlayReceiverSink for CarPlayRxSession {
     }
 
     async fn open_iap2(&mut self) -> Option<CsmSessionBox> {
-        None
+        if self.reject {
+            return None;
+        }
+        let car = self.car_location.as_ref().filter(|car| car.is_available())?;
+        Some(Iap2LocationBridge::new(
+            self.mfi.clone(),
+            CarPlaySessionIdentity {
+                has_gps: true,
+                ..CarPlaySessionIdentity::default()
+            },
+            car.clone(),
+        ))
     }
 
     async fn on_info(&mut self, info: &mut InfoMessageResponse) {

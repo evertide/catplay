@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use catplay_csm::{
-    decoder::{AsCsmPacket, CsmFlag, CsmPacketBox, CsmPacketId, CsmPacketUtil},
+    decoder::{AsCsmPacket, CsmPacketBox, CsmPacketId, CsmPacketUtil},
     files::FileTransferSetupMetaType,
     msg::*,
 };
@@ -14,14 +14,24 @@ use catplay_lingo::{
 };
 use log::{debug, warn};
 
+use crate::location::{CarLocation, CarPlayLocationControl};
+
 #[derive(Default)]
 pub struct CarPlayClientSession {
     id: IdentificationInformation,
     start: Option<Instant>,
     artwork_tx: Option<u8>,
+    location: CarLocation,
 }
 
 impl CarPlayClientSession {
+    pub fn new() -> (Self, CarPlayLocationControl) {
+        let (location, control) = CarLocation::new();
+        let mut session = Self::default();
+        session.location = location;
+        (session, control)
+    }
+
     pub fn send(&mut self, packet: &dyn AsCsmPacket, handle: &CsmClientHandleRef) -> CsmSessionResult<()> {
         warn!(
             "<- Outgoing packet @ {:?}: {:?}",
@@ -690,7 +700,16 @@ impl CsmSession for CarPlayClientSession {
         if !_handle.is_downgrade() {
             self.send(&StartIdentification::default(), &_handle)?;
         }
+        self.location.start(_handle);
         Ok(())
+    }
+
+    async fn wait_event(&mut self) {
+        self.location.wait_event().await
+    }
+
+    fn process_event(&mut self, handle: CsmClientHandleRef) -> CsmSessionResult<bool> {
+        self.location.process_event(&handle)
     }
 
     async fn respond(&mut self, packet: CsmPacketBox, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
@@ -701,6 +720,7 @@ impl CsmSession for CarPlayClientSession {
 
         if let Some(_id) = IdentificationInformation::cast(&packet) {
             self.id = _id.clone();
+            self.location.identify(_id);
             let supports_modern_carplay =
                 IdentificationInformation::unpack_ids(&_id.messages_sent_by_accessory).contains(&CarPlayStartSession::PACKET_ID);
             debug!("Identification accepted! Modern CarPlay: {supports_modern_carplay}");
@@ -730,6 +750,7 @@ impl CsmSession for CarPlayClientSession {
         if let Some(_response) = packet.cast::<AuthenticationResponse>() {
             debug!("Authentication accepted!");
             self.send(&AuthenticationSucceeded::default(), &_handle)?;
+            self.location.authenticated = true;
             if self.id.wants_rx(DeviceUUIDUpdate::PACKET_ID) {
                 self.send(
                     &DeviceUUIDUpdate {
@@ -780,27 +801,6 @@ impl CsmSession for CarPlayClientSession {
                 //     &_handle,
                 // )?;
             }
-            
-            // iPhone does this GPS probe, but:
-            // - it's probably irrelevant for compatibility
-            // - by placing it here we don't properly gate it to be after power negotiations
-            if false {
-                self.send(
-                    &StartLocationInformation {
-                        global_positioning_system_fix_data: CsmFlag::Yes,
-                        recommended_minimum_specific_gps_transit_data: CsmFlag::Yes,
-                        gps_satellites_in_view: CsmFlag::No,
-                        vehicle_speed_data: CsmFlag::Yes,
-                        vehicle_gyro_data: CsmFlag::No,
-                        vehicle_accelerometer_data: CsmFlag::No,
-                        vehicle_heading_data: CsmFlag::No,
-                        ..StartLocationInformation::default()
-                    },
-                    &_handle,
-                )?;
-                self.send(&StopLocationInformation {}, &_handle)?;
-
-            }
             /*
                        NowPlayingUpdate { media_item: Some(MediaItem { persistent_id: None, title: None, media_type: [], rating: None, playback_duration_in_ms: None, album_persistent_id: None, album_title: None, album_track_number: None, album_track_count: None, album_disc_number: None, album_disc_count: None, artist_persistent_id: None, artist: None, album_artist_persistent_id: None, album_artist: None, genre_persistent_id: None, genre: None, composer_persistent_id: None, composer: None, is_part_of_compilation: None, is_like_supported: None, is_ban_supported: None, is_liked: None, is_banned: None, is_resident_on_device: None, artwork_file_transfer_id: Some(129), chapter_count: None }), playback_attributes: None }
             */
@@ -829,6 +829,7 @@ impl CsmSession for CarPlayClientSession {
                 },
                 &_handle,
             )?;
+            self.location.power_source_replied = true;
         }
 
         if packet.cast::<StartPowerUpdates>().is_some() {
@@ -857,6 +858,7 @@ impl CsmSession for CarPlayClientSession {
             ] {
                 self.send(&update, &_handle)?;
             }
+            self.location.power_updates_replied = true;
         }
 
         if packet.cast::<StartCommunicationsUpdates>().is_some() {
@@ -904,6 +906,11 @@ impl CsmSession for CarPlayClientSession {
         if let Some(cpss) = CarPlayStartSession::cast(&packet) {
             // TODO: trigger connection to CarPlay server now
             debug!("Got modern CarPlay handshake: {cpss:?}");
+        }
+
+        self.location.reconcile(&_handle)?;
+        if let Some(location) = packet.cast::<LocationInformation>() {
+            self.location.forward(location, &_handle)?;
         }
 
         Ok(())

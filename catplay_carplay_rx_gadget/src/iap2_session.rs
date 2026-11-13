@@ -3,7 +3,7 @@ use std::{fmt, time::Instant};
 use async_trait::async_trait;
 use catplay_iap2_client::{CsmClientHandleRef, CsmFileTransferEvent, CsmSession, CsmSessionResult, tokio::ClientSessionHelper};
 use catplay_mfi::MfiDeficeRef;
-use catplay_util::mpsc;
+use catplay_util::{EventSleeper, mpsc};
 use log::{debug, info, warn};
 use macaddr::MacAddr6;
 
@@ -158,23 +158,24 @@ impl CarPlayServerSession {
         let _ = self.events_tx.unbounded_send(event);
     }
 
-    pub fn on_event(&mut self, ev: CarPlayServerSessionEventRx, _handle: CsmClientHandleRef) {
+    pub fn on_event(&mut self, ev: CarPlayServerSessionEventRx, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
         match ev {
             CarPlayServerSessionEventRx::FeedGpsGprmc(packet) => {
                 if self.gps_sub {
-                    _handle.send(&packet);
+                    _handle.send(&packet)?;
                 } else {
                     warn!("Ignoring GPRMC because GPS sub is inactive");
                 }
             }
             CarPlayServerSessionEventRx::FeedGpsNmea(packet) => {
                 if self.gps_sub {
-                    _handle.send(&packet);
+                    _handle.send(&packet)?;
                 } else {
                     warn!("Ignoring NMEA because GPS sub is inactive");
                 }
             }
         }
+        Ok(())
     }
 
     pub fn on_now_playing(&mut self, np: NowPlayingUpdate) {
@@ -413,6 +414,20 @@ impl CarPlayServerSession {
 impl CsmSession for CarPlayServerSession {
     async fn start(&mut self, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
         Ok(())
+    }
+
+    async fn wait_event(&mut self) {
+        if self.events_rx.sleep().await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    fn process_event(&mut self, handle: CsmClientHandleRef) -> CsmSessionResult<bool> {
+        let Some(event) = self.events_rx.take() else {
+            return Ok(false);
+        };
+        self.on_event(event, handle)?;
+        Ok(true)
     }
 
     async fn on_file_event(&mut self, id: u8, ev: CsmFileTransferEvent, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {

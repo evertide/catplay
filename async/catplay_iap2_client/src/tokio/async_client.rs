@@ -27,6 +27,7 @@ use crate::{
 #[reconcile_error(CsmSessionError)]
 #[reconcile_func(reconcile)]
 #[sleep(deadline_maybe(self.deadline))]
+#[sleep_fut(self.session.wait_event())]
 #[allow(unused)]
 pub struct AsyncClient {
     files: BTreeMap<u8, InflightFileTransfer>,
@@ -482,6 +483,8 @@ impl AsyncClient {
                 }
             }
         }
+
+        produced_events |= self.session.process_event(self.handle.clone())?;
 
         let allows_tx = self.is_tx_allowed();
 
