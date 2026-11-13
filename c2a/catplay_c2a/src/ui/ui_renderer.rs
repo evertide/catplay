@@ -7,12 +7,12 @@ use bytes::BytesMut;
 use catplay_carplay::video::{AvccConfig, AvccConfigExtended, EncodedVideoFrame, NalChunk, Pts};
 use catplay_fb::{
     Canvas, H264FrameBuffer, H264FrameBufferError, KeyframeCacheEntry, KeyframeCacheFile, KeyframeCacheFileError, KeyframeCacheKey,
-    RenderError, Renderer,
+    RenderError, RenderOp, Renderer,
 };
 use catplay_tracing_macro::trace_time;
 use log::{info, warn};
 
-use crate::ui::{Screen, UiState, UiTheme};
+use crate::ui::{UiScreen, UiState, UiTheme};
 
 pub struct UiRenderer {
     width: i32,
@@ -24,7 +24,8 @@ pub struct UiRenderer {
     headers: BytesMut,
     last_state: UiState,
     persist_dir: Option<PathBuf>,
-    theme: UiTheme,
+    /// Loaded on first use, inside the blocking render path rather than at construction.
+    theme: Option<UiTheme>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -52,7 +53,7 @@ impl UiRenderer {
             h264: None,
             last_state: UiState::Hidden,
             headers: BytesMut::new(),
-            theme: UiTheme::load(persist_dir.as_deref()),
+            theme: None,
             persist_dir,
         })
     }
@@ -63,11 +64,21 @@ impl UiRenderer {
         }
     }
 
-    fn screen(&self) -> Screen {
-        Screen {
-            width: self.width,
+    fn theme(&mut self) -> &UiTheme {
+        let persist_dir = self.persist_dir.as_deref();
+        self.theme.get_or_insert_with(|| UiTheme::load(persist_dir))
+    }
+
+    fn ops(&mut self, state: &UiState) -> Vec<RenderOp> {
+        let screen = UiScreen {
             height: self.height,
             dpi: self.dpi,
+        };
+        let theme = self.theme();
+        if theme.is_default() {
+            state.as_ops()
+        } else {
+            theme.ops(state, screen)
         }
     }
 
@@ -79,15 +90,21 @@ impl UiRenderer {
         if reset {
             self.fb.reset(self.width, self.height, self.dpi);
         }
-        if let Err(err) = self.fb.execute(&state.as_ops(&self.theme, self.screen())) {
-            if self.theme.background_bytes.is_none() {
+        let ops = self.ops(&state);
+        if let Err(err) = self.fb.execute(&ops) {
+            let Some(theme) = self
+                .theme
+                .as_ref()
+                .filter(|theme| theme.background_bytes.is_some())
+            else {
                 return Err(err.into());
-            }
-            // The background was validated at load time, but the file may have changed since.
-            warn!("Rendering the UI theme background failed ({err}); falling back to the default background");
-            self.theme = self.theme.without_background();
+            };
+            // The background passed the header check at load but failed to decode or draw.
+            warn!("Rendering the UI theme background failed ({err}); continuing without it");
+            self.theme = Some(theme.without_background());
             self.fb.reset(self.width, self.height, self.dpi);
-            self.fb.execute(&state.as_ops(&self.theme, self.screen()))?;
+            let ops = self.ops(&state);
+            self.fb.execute(&ops)?;
         }
         self.last_state = state;
         Ok(())
@@ -126,9 +143,15 @@ impl UiRenderer {
         Some(KeyframeCacheFile::new(self.persist_dir.as_ref()?.join(state.cache_file_name()?)))
     }
 
-    fn keyframe_cache_key(&self, state: &UiState) -> KeyframeCacheKey {
+    fn keyframe_cache_key(&mut self, state: &UiState) -> KeyframeCacheKey {
+        let theme = self.theme();
+        let hash = if theme.is_default() {
+            state.cache_hash()
+        } else {
+            theme.cache_hash(state)
+        };
         KeyframeCacheKey {
-            hash: state.cache_hash(&self.theme),
+            hash,
             width: self.width as u32,
             height: self.height as u32,
             dpi: self.dpi.round() as u32,
@@ -164,7 +187,7 @@ impl UiRenderer {
         }
     }
 
-    fn try_load_keyframe_cache(&self, state: &UiState, latency: Duration) -> Option<EncodedVideoFrame> {
+    fn try_load_keyframe_cache(&mut self, state: &UiState, latency: Duration) -> Option<EncodedVideoFrame> {
         let Some(_cache_file_name) = state.cache_file_name() else {
             return None;
         };
@@ -193,7 +216,7 @@ impl UiRenderer {
         }
     }
 
-    fn store_keyframe_cache(&self, state: &UiState, frame: &BytesMut) {
+    fn store_keyframe_cache(&mut self, state: &UiState, frame: &BytesMut) {
         let Some(_cache_file_name) = state.cache_file_name() else {
             return;
         };
@@ -345,24 +368,63 @@ fn test_waiting_for_connection_keyframe_cache_cycle() {
 }
 
 #[test]
+fn test_theme_background_is_rendered() {
+    use catplay_tracing::logger::setup_test_logger;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    setup_test_logger(true);
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let persist_dir = std::env::temp_dir().join(format!("catplay-ui-theme-render-{}-{unique}", std::process::id()));
+    std::fs::create_dir(&persist_dir).unwrap();
+    std::fs::write(persist_dir.join("bg.jpg"), include_bytes!("testdata/small.jpg")).unwrap();
+    std::fs::write(
+        persist_dir.join(UiTheme::FILE_NAME),
+        "background = \"bg.jpg\"\nwaiting_text = \"Wachten\"\n",
+    )
+    .unwrap();
+
+    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, Some(persist_dir.clone())).unwrap();
+    assert!(renderer.theme.is_none(), "the theme is loaded lazily");
+    renderer
+        .render_and_encode_frame(UiState::WaitingForConnection, Duration::ZERO, false)
+        .unwrap();
+    let theme = renderer.theme.as_ref().unwrap();
+    assert!(theme.background_bytes.is_some(), "the background rendered without falling back");
+    // The test image is a single colour (RGB 40, 80, 120); the centre must show it.
+    let fb = renderer.fb.framebuffer();
+    let px = fb.rgba_u32()[(240 * fb.width + 400) as usize];
+    let (r, g, b) = (px & 0xff, (px >> 8) & 0xff, (px >> 16) & 0xff);
+    assert!(
+        r.abs_diff(40) < 12 && g.abs_diff(80) < 12 && b.abs_diff(120) < 12,
+        "centre pixel {px:08x}"
+    );
+
+    let _ = std::fs::remove_dir_all(persist_dir);
+}
+
+#[test]
 fn test_broken_theme_background_falls_back_to_default() {
     use catplay_tracing::logger::setup_test_logger;
     use std::time::Duration;
 
     setup_test_logger(true);
 
-    // Normally impossible (the bytes are validated when the theme loads), but a decode failure
-    // while rendering must still leave a usable screen instead of no screen at all.
+    // The header check at load passes, but decoding fails while rendering: the screen must
+    // still be drawn, without the background.
     let mut renderer = UiRenderer::new(800, 480, 30, 160.0, None).unwrap();
-    renderer.theme = UiTheme {
-        background: Some("/persist/ui/background.jpg".into()),
-        background_bytes: Some((*b"\xFF\xD8\xFF not really a jpeg").into()),
+    let truncated = &include_bytes!("testdata/small.jpg")[..200];
+    renderer.theme = Some(UiTheme {
+        background_bytes: Some(truncated.into()),
         waiting_text: Some("Wachten".into()),
         ..Default::default()
-    };
+    });
     renderer
         .render_and_encode_frame(UiState::WaitingForConnection, Duration::ZERO, false)
         .expect("a broken background must not suppress the screen");
-    assert!(renderer.theme.background_bytes.is_none());
-    assert_eq!(renderer.theme.waiting_text.as_deref(), Some("Wachten"));
+    let theme = renderer.theme.as_ref().unwrap();
+    assert!(theme.background_bytes.is_none());
+    assert_eq!(theme.waiting_text.as_deref(), Some("Wachten"));
 }

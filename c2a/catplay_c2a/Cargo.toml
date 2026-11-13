@@ -12,6 +12,7 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
+crc32fast = { version = "1.5.0", default-features = false }
 
 libc = "=1.0.0-alpha.4"
 log = { version = "0.4.27", default-features = false, features = [

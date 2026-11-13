@@ -5,7 +5,7 @@ use image::{ImageError, RgbaImage};
 use log::debug;
 use turbojpeg::PixelFormat;
 
-use crate::{FontRenderer, Surface};
+use crate::{Canvas, FontRenderer, Surface};
 
 const JPEG_MAGIC: &[u8; 3] = &[0xFF, 0xD8, 0xFF];
 
@@ -104,11 +104,6 @@ impl AssetCache {
         Ok((header.width as u32, header.height as u32))
     }
 
-    /// Fully decodes an image to check that it can be loaded later.
-    pub fn validate_image(buf: &[u8]) -> Result<(), AssetCacheError> {
-        Self::decode_surface(buf).map(drop)
-    }
-
     /// The image scaled to cover `w`x`h` (aspect kept, overflow cropped evenly).
     ///
     /// Only the visible part of the original is sampled, so memory stays at the output size.
@@ -118,7 +113,7 @@ impl AssetCache {
         if !self.img_cover.contains_key(&key) {
             let orig = self
                 .img_originals
-                .get_mut(&id)
+                .get(&id)
                 .ok_or_else(|| AssetCacheError::AssetNotFound(id.clone()))?;
             let (iw, ih) = (orig.width.max(1) as u64, orig.height.max(1) as u64);
             let (fw, fh) = (w.max(1) as u64, h.max(1) as u64);
@@ -132,15 +127,19 @@ impl AssetCache {
             let (cw, ch) = (cw.max(1) as u32, ch.max(1) as u32);
             let (x, y) = ((iw as u32 - cw) / 2, (ih as u32 - ch) / 2);
 
-            // Nearest-neighbour sampling straight into the output: no intermediate buffers.
-            let image = orig.as_image();
-            let scaled = RgbaImage::from_fn(w, h, |ox, oy| {
-                let sx = x + (ox as u64 * cw as u64 / w as u64) as u32;
-                let sy = y + (oy as u64 * ch as u64 / h as u64) as u32;
-                *image.get_pixel(sx, sy)
-            });
-            self.img_cover
-                .insert(key.clone(), Surface::from_image(scaled));
+            // Nearest-neighbour sampling straight into the output surface.
+            let src = orig.rgba_u32();
+            let src_stride = orig.width as usize;
+            let mut out = Surface::new(w as i32, h as i32);
+            let dst = out.as_rgba_u32();
+            for oy in 0..h as usize {
+                let sy = y as usize + oy * ch as usize / h as usize;
+                for ox in 0..w as usize {
+                    let sx = x as usize + ox * cw as usize / w as usize;
+                    dst[oy * w as usize + ox] = src[sy * src_stride + sx];
+                }
+            }
+            self.img_cover.insert(key.clone(), out);
         }
 
         Ok(self.img_cover.get(&key).unwrap())
