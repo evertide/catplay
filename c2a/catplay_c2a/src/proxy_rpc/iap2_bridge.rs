@@ -9,11 +9,11 @@ use catplay_iap2_client::{CsmClientHandleRef, CsmFileTransferEvent, CsmSession, 
 use catplay_mfi::MfiDeficeRef;
 use catplay_util::event_select;
 use log::info;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// XC90 diagnostics (`xc90_bt_fast_close`): bumped on the iPhone's disableBluetooth; Bluetooth bridges created before end their
 /// iAP2 link right away instead of waiting for BlueZ to drop it (~2 s, overlapping the AirPlay iAP2 identification).
-static BT_CLOSE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static BT_CLOSE_GENERATION: AtomicU32 = AtomicU32::new(0);
 static BT_CLOSE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// Ask every current Bluetooth iAP2 bridge to end its link (XC90 diagnostics).
@@ -38,7 +38,7 @@ pub struct Iap2LocationBridge {
     own_request_only: bool,
     requested_here: bool,
     /// Bluetooth only: [BT_CLOSE_GENERATION] at creation.
-    bt_close_generation: Option<u64>,
+    bt_close_generation: Option<u32>,
 }
 
 impl Iap2LocationBridge {
