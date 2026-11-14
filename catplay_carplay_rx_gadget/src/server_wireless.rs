@@ -46,6 +46,7 @@ pub struct CarPlayWirelessGadget<T: AirPlayReceiverSink> {
 
     // AirPlay sink
     sink: Arc<dyn Fn() -> T + Send + Sync + 'static>,
+    identity_callback: Option<Arc<dyn Fn(CarPlaySessionIdentity) + Send + Sync>>,
 
     invites_blocked: bool,
     last_mac: Option<MacAddr6>,
@@ -93,6 +94,7 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
                 mfi,
                 shared,
                 sink: Arc::new(sink),
+                identity_callback: None,
                 invites_blocked: false,
                 last_mac: None,
                 bt_last_connect_cache_file: bt_last_connect_cache_file.map(|p| p.into()),
@@ -228,6 +230,37 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
     pub fn set_invites_blocked(&mut self, blocked: bool) {
         self.invites_blocked = blocked;
     }
+
+    /// Publish the wireless identity before Bluetooth or AirPlay connections are accepted, for a sink that opens its own
+    /// iAP2 session on the AirPlay link (see [AirPlayReceiverSink::open_iap2]).
+    pub fn set_identity_callback(&mut self, callback: impl Fn(CarPlaySessionIdentity) + Send + Sync + 'static) {
+        self.identity_callback = Some(Arc::new(callback));
+    }
+
+    /// The session factory used by the Bluetooth listener.
+    pub fn bluetooth_session_factory(&self, mac: MacAddr6) -> impl Fn() -> CarPlayServerSession + Send + Sync + 'static + use<T> {
+        let mfi = self.mfi.clone();
+        let identity = CarPlaySessionIdentity {
+            display_name: self.name.clone(),
+            ncm_iface: None,
+            bt_mac: Some(mac),
+            wifi_ssid: Some(self.ssid.clone()),
+            wifi_passphrase: self.pass.clone(),
+            wifi_is_wpa: self.wpa,
+            wifi_channel: self.channel,
+            is_usb_transport: false,
+            // Never offer Location over Bluetooth: iOS binds Location to the first iAP2 endpoint that offers it, and this one
+            // is gone after disableBluetooth. A sink that has GPS offers it on its AirPlay iAP2 session instead.
+            has_gps: false,
+            wants_now_playing: false,
+            ..CarPlaySessionIdentity::default()
+        };
+
+        if let Some(callback) = &self.identity_callback {
+            callback(identity.clone());
+        }
+        move || CarPlayServerSession::new(mfi.clone(), identity.clone()).0
+    }
 }
 
 impl<T: AirPlayReceiverSink> AsyncShutdown for CarPlayWirelessGadget<T> {
@@ -329,22 +362,7 @@ impl<T: AirPlayReceiverSink> Reconcilable for CarPlayWirelessGadget<T> {
                 LocalState::StartingBluetooth { hci: hci.clone(), mac }.into()
             }
             LocalState::StartingBluetooth { hci, mac } => {
-                let mfi = self.mfi.clone();
-                let identity = CarPlaySessionIdentity {
-                    display_name: self.name.clone(),
-                    ncm_iface: None,
-                    bt_mac: Some(*mac),
-                    wifi_ssid: Some(self.ssid.clone()),
-                    wifi_passphrase: self.pass.clone(),
-                    wifi_is_wpa: self.wpa,
-                    wifi_channel: self.channel,
-                    is_usb_transport: false,
-                    has_gps: true,
-                    wants_now_playing: false,
-                    ..CarPlaySessionIdentity::default()
-                };
-
-                let cb = move || CarPlayServerSession::new(mfi.clone(), identity.clone()).0;
+                let cb = self.bluetooth_session_factory(*mac);
                 let mut mgr = BluetoothManager::new(false, true, true, hci, cb);
                 mgr.start()
                     .await

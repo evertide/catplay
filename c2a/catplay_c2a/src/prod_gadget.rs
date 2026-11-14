@@ -8,8 +8,12 @@ use catplay_carplay::{
     carplay_rx::sink::AirPlayServerShared,
     carplay_tx::{AirPlayTransmitterImpl, AirPlayTransmitterSessionError, TeardownGuard},
 };
-use catplay_carplay_rx_gadget::{CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState};
-use catplay_carplay_tx_gadget::client::{CarPlayUsbClientGadget, CarPlayUsbClientGadgetError, CarPlayUsbClientGadgetStatus};
+use catplay_carplay_rx_gadget::{CarPlaySessionIdentity, CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState};
+use catplay_carplay_tx_gadget::{
+    carplay_client_session::CarPlayClientSession,
+    client::{CarPlayUsbClientGadget, CarPlayUsbClientGadgetError, CarPlayUsbClientGadgetStatus},
+    location::LocationBridge,
+};
 use catplay_hap::HomekitStorageRef;
 use catplay_iap2_usb::GadgetError;
 use catplay_mfi::MfiDeficeRef;
@@ -52,6 +56,8 @@ pub struct ProdGadget {
     pending_transmitter: Arc<TokioMutex<Option<TeardownGuard<AirPlayTransmitterImpl>>>>,
 
     last_tx: Arc<Mutex<Option<ProdGadgetSession>>>,
+    /// Passes the car's GPS (USB iAP2 session) on to the iPhone (AirPlay iAP2 session).
+    location: LocationBridge,
     burst_wakeups: bool,
 }
 
@@ -111,10 +117,48 @@ impl ProdGadget {
                 tx: None,
                 pending_transmitter: Default::default(),
                 last_tx: Default::default(),
+                location: Default::default(),
                 burst_wakeups: false,
             },
             Ok(ProdGadgetState::Initial),
         )
+    }
+
+    fn wireless_gadget(&self) -> Reconciler<CarPlayWirelessGadget<CarPlayRxSession>> {
+        let identity: Arc<Mutex<Option<CarPlaySessionIdentity>>> = Default::default();
+        let mut rx = CarPlayWirelessGadget::new(
+            self.cfg.homekit_rx.clone(),
+            self.cfg.mfi.clone(),
+            AirPlayServerShared::new(),
+            &self.cfg.bt_name,
+            &self.cfg.hci,
+            &self.cfg.iface,
+            &self.cfg.ssid,
+            Some(&self.cfg.passphrase),
+            self.cfg.wpa,
+            self.cfg.channel,
+            Some(&self.cfg.bt_cache_file),
+            {
+                let car = self.last_tx.clone();
+                let location = self.location.clone();
+                let identity = identity.clone();
+                let mfi = self.cfg.mfi.clone();
+
+                move || {
+                    let Some(car) = car.lock().unwrap().clone() else {
+                        return CarPlayRxSession::reject();
+                    };
+
+                    let sess = TxAdapter::new(car.proxy_tx.clone());
+                    CarPlayRxSession::new(sess, location.clone(), identity.clone(), mfi.clone())
+                }
+            },
+        );
+        rx.child_mut()
+            .set_identity_callback(move |wireless_identity| {
+                identity.lock().unwrap().replace(wireless_identity);
+            });
+        rx
     }
 }
 
@@ -202,43 +246,19 @@ impl Reconcilable for ProdGadget {
             return err.into();
         };
 
-        let shared = AirPlayServerShared::new();
-
         if self.rx.is_none() {
-            self.rx.replace(CarPlayWirelessGadget::new(
-                self.cfg.homekit_rx.clone(),
-                self.cfg.mfi.clone(),
-                shared.clone(),
-                &self.cfg.bt_name,
-                &self.cfg.hci,
-                &self.cfg.iface,
-                &self.cfg.ssid,
-                Some(&self.cfg.passphrase),
-                self.cfg.wpa,
-                self.cfg.channel,
-                Some(&self.cfg.bt_cache_file),
-                {
-                    let car = self.last_tx.clone();
-
-                    move || {
-                        let Some(car) = car.lock().unwrap().clone() else {
-                            return CarPlayRxSession::reject();
-                        };
-
-                        let sess = TxAdapter::new(car.proxy_tx.clone());
-                        CarPlayRxSession::new(sess)
-                    }
-                },
-            ));
+            self.rx = Some(self.wireless_gadget());
         }
 
         if self.tx.is_none() {
-            let gadget = CarPlayUsbClientGadget::new(
+            let location = self.location.clone();
+            let gadget = CarPlayUsbClientGadget::new_with_csm(
                 "default",
                 "aa:bb:cc:dd:ee:ff",
                 self.cfg.udc_tx.as_deref(),
                 self.cfg.homekit_tx.clone(),
                 false,
+                move || CarPlayClientSession::with_location(location.clone()),
             )
             .map_err(|err| LocalError::FailedToSetupUsbClient(err))?;
             self.tx.replace(gadget);
@@ -297,5 +317,45 @@ impl Reconcilable for ProdGadget {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use catplay_hap::HomekitStorageFile;
+
+    /// The wireless gadget as production builds it (constructing it opens no hardware), with a car session attached.
+    pub(crate) fn wireless(
+        location: LocationBridge,
+    ) -> (
+        Reconciler<CarPlayWirelessGadget<CarPlayRxSession>>,
+        mpsc::UnboundedReceiver<TxAdapterOp>,
+    ) {
+        let mut gadget = ProdGadget::new(ProdGadgetConfig {
+            homekit_rx: HomekitStorageFile::memory(),
+            homekit_tx: HomekitStorageFile::memory(),
+            mfi: None,
+            udc_tx: None,
+            udc_rx: None,
+            bt_name: "GPS test".into(),
+            hci: "unused".into(),
+            iface: "unused".into(),
+            wpa: true,
+            ssid: "CatPlay-test".into(),
+            channel: Some(36),
+            passphrase: "test-passphrase".into(),
+            bt_cache_file: String::new(),
+            persist_dir: None,
+        });
+        let (proxy_tx, proxy_rx) = mpsc::unbounded();
+        let gadget = gadget.child_mut();
+        gadget.location = location;
+        gadget
+            .last_tx
+            .lock()
+            .unwrap()
+            .replace(ProdGadgetSession { proxy_tx });
+        (gadget.wireless_gadget(), proxy_rx)
     }
 }

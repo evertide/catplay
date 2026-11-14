@@ -28,6 +28,17 @@ pub trait CsmSession: Send + Sync + 'static {
     /// An error from this method will be treated as a signal to terminate the session.
     async fn respond(&mut self, packet: CsmPacketBox, handle: CsmClientHandleRef) -> CsmSessionResult<()>;
 
+    /// Wait for and buffer application input, without applying it. Must be cancel-safe.
+    /// `process_event` is called by the client after waking, alongside incoming link messages.
+    async fn wait_event(&mut self) {
+        std::future::pending::<()>().await;
+    }
+
+    /// Process buffered application input. Return true if an event was consumed.
+    fn process_event(&mut self, _handle: CsmClientHandleRef) -> CsmSessionResult<bool> {
+        Ok(false)
+    }
+
     /// Called with a decoded iAP1 message in downgrade mode.
     async fn on_legacy_message(
         &mut self,
@@ -53,6 +64,14 @@ impl CsmSession for Box<dyn CsmSession> {
 
     async fn respond(&mut self, packet: CsmPacketBox, handle: CsmClientHandleRef) -> CsmSessionResult<()> {
         self.as_mut().respond(packet, handle).await
+    }
+
+    async fn wait_event(&mut self) {
+        self.as_mut().wait_event().await
+    }
+
+    fn process_event(&mut self, handle: CsmClientHandleRef) -> CsmSessionResult<bool> {
+        self.as_mut().process_event(handle)
     }
 
     async fn on_legacy_message(
