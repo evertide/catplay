@@ -21,45 +21,56 @@ pub struct AltScreenManager {
     pending_setup: Option<oneshot::Receiver<TeardownGuard<ScreenTransmitProxy>>>,
     /// Last iPhone keyframe received while the car SETUP was pending, so the car stream does not start with delta frames only.
     pending_keyframe: Option<EncodedVideoFrame>,
-    /// Diagnostics: frames submitted to the car since the last iPhone stream started.
-    submitted: u64,
+    /// Diagnostics: frame capture after the last showUI (see [Capture]).
+    capture: Option<Capture>,
+    captures: u32,
 }
 
-/// Diagnostics (XC90 build only): where the first submitted alt screen keyframe is written, as Annex-B H.264 with SPS/PPS.
-const DUMP_PATH: &str = "/tmp/altscreen.h264";
-/// Only one dump attempt per process, whatever its outcome.
-static DUMP_TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Diagnostics (XC90 build only): after each showUI, the alt screen frames of the next few seconds are logged and written to
+/// `/tmp/altscreen-<n>.h264` (Annex-B with SPS/PPS), so a car log shows whether the iPhone draws anything at all.
+const CAPTURE_WINDOW: Duration = Duration::from_secs(5);
+const CAPTURE_MAX_BYTES: usize = 2 << 20;
 
-/// Diagnostics: log the first frames and every keyframe submitted to the car's alt screen (a submission is not proof of delivery),
-/// and dump the first keyframe of the process on a background thread so the frame path never waits on I/O.
-fn trace_submitted(count: u64, frame: &EncodedVideoFrame) {
-    let keyframe = frame.is_known_keyframe();
-    if count < 5 || keyframe {
-        let head: Vec<String> = frame
-            .data
-            .iter()
-            .take(6)
-            .map(|b| format!("{b:02x}"))
-            .collect();
+struct Capture {
+    n: u32,
+    until: Instant,
+    frames: u32,
+    buf: Vec<u8>,
+}
+
+impl Capture {
+    /// Log and record one submitted frame; returns false once the capture is complete.
+    fn add(&mut self, frame: &EncodedVideoFrame) -> bool {
+        let keyframe = frame.is_known_keyframe();
         info!(
-            "Submitting alt screen frame #{count} to car: {} bytes, {}x{}, keyframe={keyframe}, config={}, head={}",
-            frame.data.len(),
-            frame.width,
-            frame.height,
-            frame.config.is_some(),
-            head.join(" ")
+            "Alt screen capture {}: frame {} {} bytes keyframe={keyframe}",
+            self.n,
+            self.frames,
+            frame.data.len()
         );
+        if (keyframe || self.buf.is_empty())
+            && let Some(config) = frame.config.as_ref()
+        {
+            self.buf.extend_from_slice(&config.avcc.sps_pps);
+        }
+        self.buf.extend_from_slice(&frame.data);
+        self.frames += 1;
+        Instant::now() < self.until && self.buf.len() < CAPTURE_MAX_BYTES
     }
-    if keyframe && !DUMP_TRIED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let mut out = frame
-            .config
-            .as_ref()
-            .map(|c| c.avcc.sps_pps.clone())
-            .unwrap_or_default();
-        out.extend_from_slice(&frame.data);
-        std::thread::spawn(move || match std::fs::write(DUMP_PATH, &out) {
-            Ok(()) => info!("Dumped alt screen keyframe ({} bytes) to {DUMP_PATH}", out.len()),
-            Err(err) => warn!("Could not dump alt screen keyframe: {err}"),
+
+    /// Write the capture on a background thread so the frame path never waits on I/O.
+    fn finish(self) {
+        let path = format!("/tmp/altscreen-{}.h264", self.n);
+        info!(
+            "Alt screen capture {} complete: {} frames, {} bytes",
+            self.n,
+            self.frames,
+            self.buf.len()
+        );
+        std::thread::spawn(move || {
+            if let Err(err) = std::fs::write(&path, &self.buf) {
+                warn!("Could not write {path}: {err}");
+            }
         });
     }
 }
@@ -76,7 +87,6 @@ impl AltScreenManager {
         self.iphone_screen_rx.replace(channel);
         self.uuid = uuid;
         self.pending_keyframe.take();
-        self.submitted = 0;
         self.car_screen.take()
     }
 
@@ -95,6 +105,30 @@ impl AltScreenManager {
         self.car_screen.take()
     }
 
+    /// Diagnostics: capture the frames of the next few seconds, called when the car sends showUI.
+    pub fn capture_after_show_ui(&mut self) {
+        if let Some(previous) = self.capture.take() {
+            previous.finish();
+        }
+        self.captures += 1;
+        info!("Alt screen capture {} started (showUI)", self.captures);
+        self.capture = Some(Capture {
+            n: self.captures,
+            until: Instant::now() + CAPTURE_WINDOW,
+            frames: 0,
+            buf: Vec::new(),
+        });
+    }
+
+    fn trace(capture: &mut Option<Capture>, frame: &EncodedVideoFrame) {
+        if let Some(active) = capture.as_mut()
+            && !active.add(frame)
+            && let Some(done) = capture.take()
+        {
+            done.finish();
+        }
+    }
+
     /// Returns a car stream that is no longer needed, if any, which should be torn down.
     pub async fn reconcile(&mut self) -> Option<TeardownGuard<ScreenTransmitProxy>> {
         if let Some(os) = self.pending_setup.as_mut()
@@ -109,8 +143,7 @@ impl AltScreenManager {
                     if let Some(mut keyframe) = self.pending_keyframe.take() {
                         warn!("Repeating iPhone alt screen keyframe received during SETUP");
                         keyframe.pts = (Instant::now() + Duration::from_millis(75)).into();
-                        trace_submitted(self.submitted, &keyframe);
-                        self.submitted += 1;
+                        Self::trace(&mut self.capture, &keyframe);
 
                         if let Err((err, _frame)) = screen.push_frame(keyframe).await {
                             warn!("Sink rejected iPhone alt screen keyframe?: {err}");
@@ -138,8 +171,7 @@ impl AltScreenManager {
                     }
                     None => debug!("Dropping iPhone alt screen frame, no car alt screen (yet)"),
                     Some(car_screen) => {
-                        trace_submitted(self.submitted, &frame);
-                        self.submitted += 1;
+                        Self::trace(&mut self.capture, &frame);
                         match car_screen.push_frame(frame).await {
                             Err((ScreenTransmitError::NeedsKeyframe, _frame)) => {
                                 warn!("Dropping iPhone alt screen delta frame, requesting a keyframe ASAP");
