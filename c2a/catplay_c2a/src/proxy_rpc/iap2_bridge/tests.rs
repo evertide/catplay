@@ -317,7 +317,7 @@ fn replacement_usb_session_repeats_negotiation_for_the_live_iphone_request() {
 }
 
 #[test]
-fn slow_phone_receives_only_the_latest_fix_even_after_a_cancelled_wait() {
+fn slow_phone_keeps_each_sentence_type_after_a_cancelled_wait() {
     let location = LocationBridge::default();
     let mut car = CarPlayClientSession::with_location(location.clone());
     let mut phone = phone(location);
@@ -332,8 +332,21 @@ fn slow_phone_receives_only_the_latest_fix_even_after_a_cancelled_wait() {
     phone.wait_event().now_or_never().unwrap();
     let mut latest = sample();
     for counter in 0..1000 {
-        latest.nmea_sentence = vec![format!("$PASCD,{counter}*00\r\n").into()];
-        respond(&mut car, &car_out, latest.clone());
+        latest.nmea_sentence = vec![
+            format!("$GPGGA,{counter}*00\r\n"),
+            format!("$GPRMC,{counter}*00\r\n"),
+            format!("$PASCD,{counter}*00\r\n"),
+        ];
+        // Cars can send each sentence type in a separate LocationInformation.
+        for sentence in &latest.nmea_sentence {
+            respond(
+                &mut car,
+                &car_out,
+                LocationInformation {
+                    nmea_sentence: vec![sentence.clone()],
+                },
+            );
+        }
     }
     pump(&mut phone, &phone_out);
     let packets = phone_out.take();

@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Mutex, Weak,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use catplay_csm::{
@@ -14,7 +17,42 @@ use catplay_util::{EventSleeper, EventToken};
 use log::info;
 use tokio::sync::watch;
 
-type LocationRequest = (StartLocationInformation, watch::Sender<Option<LocationInformation>>);
+type LocationRequest = (StartLocationInformation, LocationUpdates);
+type PendingLocation = BTreeMap<String, Vec<String>>;
+
+// Covers the seven advertised types and alternate talker IDs without an unbounded backlog.
+const MAX_PENDING_SENTENCE_TYPES: usize = 16;
+
+#[derive(Clone)]
+struct LocationUpdates {
+    changed: watch::Sender<()>,
+    buffer: Arc<Mutex<PendingLocation>>,
+}
+
+impl LocationUpdates {
+    fn push(&self, packet: &LocationInformation) {
+        let mut incoming = BTreeMap::<&str, Vec<String>>::new();
+        for sentence in &packet.nmea_sentence {
+            let kind = sentence.split_once(',').map_or("", |(kind, _)| kind);
+            incoming.entry(kind).or_default().push(sentence.clone());
+        }
+        if incoming.is_empty() {
+            return;
+        }
+
+        let mut buffer = self.buffer.lock().unwrap();
+        for (kind, sentences) in incoming {
+            // Keep same-type sentences from one message together (e.g. multipart GSV).
+            if let Some(pending) = buffer.get_mut(kind) {
+                *pending = sentences;
+            } else if buffer.len() < MAX_PENDING_SENTENCE_TYPES {
+                buffer.insert(kind.into(), sentences);
+            }
+        }
+        // Publish under the buffer lock so take() cannot mark unseen data as read.
+        self.changed.send_replace(());
+    }
+}
 
 /// The current iPhone request, shared with each successive USB iAP2 session.
 /// Negotiation and the active car request remain local to the USB session.
@@ -44,20 +82,29 @@ impl LocationBridge {
     }
 
     pub fn subscribe(&self, request: StartLocationInformation) -> LocationSubscription {
-        let (tx, updates) = watch::channel(None);
-        self.request.send_replace(Some((request, tx)));
+        let (changed, updates) = watch::channel(());
+        let buffer = Arc::new(Mutex::new(PendingLocation::new()));
+        self.request.send_replace(Some((
+            request,
+            LocationUpdates {
+                changed,
+                buffer: buffer.clone(),
+            },
+        )));
         LocationSubscription {
             updates: Some(updates),
+            buffer,
             pending: false,
             request: self.request.clone(),
         }
     }
 }
 
-/// Keeps only the latest fix. Closing the receiver cancels its request and wakes
-/// every USB session, including briefly overlapping sessions during reconnects.
+/// Keeps the latest unconsumed message per sentence type. Closing the receiver
+/// cancels its request and wakes every USB session, including overlapping reconnects.
 pub struct LocationSubscription {
-    updates: Option<watch::Receiver<Option<LocationInformation>>>,
+    updates: Option<watch::Receiver<()>>,
+    buffer: Arc<Mutex<PendingLocation>>,
     pending: bool,
     request: watch::Sender<Option<LocationRequest>>,
 }
@@ -76,11 +123,17 @@ impl EventSleeper for LocationSubscription {
 impl LocationSubscription {
     pub fn take(&mut self) -> Option<LocationInformation> {
         let updates = self.updates.as_mut()?;
+        let mut buffer = self.buffer.lock().unwrap();
         if !self.pending && !updates.has_changed().unwrap_or(false) {
             return None;
         }
         self.pending = false;
-        updates.borrow_and_update().clone()
+        updates.borrow_and_update();
+        let nmea_sentence: Vec<_> = std::mem::take(&mut *buffer)
+            .into_values()
+            .flatten()
+            .collect();
+        (!nmea_sentence.is_empty()).then_some(LocationInformation { nmea_sentence })
     }
 }
 
@@ -92,7 +145,7 @@ impl Drop for LocationSubscription {
         self.request.send_if_modified(|request| {
             if request
                 .as_ref()
-                .is_some_and(|(_, updates)| updates.is_closed())
+                .is_some_and(|(_, updates)| updates.changed.is_closed())
             {
                 *request = None;
                 true
@@ -172,7 +225,7 @@ impl CarLocation {
         // Authentication and explicit location capabilities are sufficient. Power
         // messages are independent and some cars advertise them without sending any.
         let wanted = request
-            .filter(|(_, updates)| !updates.is_closed() && self.authenticated && self.supported.load(Ordering::Relaxed))
+            .filter(|(_, updates)| !updates.changed.is_closed() && self.authenticated && self.supported.load(Ordering::Relaxed))
             .and_then(|(request, _)| intersect(&request, id.location_information_component.as_ref()));
         if wanted == self.active {
             return Ok(false);
@@ -198,7 +251,7 @@ impl CarLocation {
         if self.active.is_some()
             && let Some((_, updates)) = self.bridge.request.borrow().as_ref()
         {
-            updates.send_replace(Some(packet.clone()));
+            updates.push(packet);
         }
     }
 
@@ -255,6 +308,68 @@ fn intersect(request: &StartLocationInformation, component: Option<&LocationInfo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
+
+    fn subscription() -> (LocationSubscription, LocationUpdates) {
+        let bridge = LocationBridge::default();
+        let subscription = bridge.subscribe(StartLocationInformation::all());
+        let updates = bridge.request.borrow().as_ref().unwrap().1.clone();
+        (subscription, updates)
+    }
+
+    fn sentences(sentences: &[&str]) -> LocationInformation {
+        LocationInformation {
+            nmea_sentence: sentences.iter().map(|sentence| (*sentence).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn consumed_types_are_not_replayed_but_identical_updates_are_delivered() {
+        let (mut subscription, updates) = subscription();
+        let first = sentences(&["$GPGGA,1*00\r\n", "$GPRMC,1*00\r\n"]);
+        updates.push(&first);
+        assert_eq!(subscription.take(), Some(first));
+        assert!(subscription.sleep().now_or_never().is_none());
+
+        let rmc = sentences(&["$GPRMC,1*00\r\n"]);
+        for _ in 0..2 {
+            updates.push(&rmc);
+            assert!(subscription.sleep().now_or_never().flatten().is_some());
+            assert_eq!(subscription.take(), Some(rmc.clone()));
+            assert!(subscription.take().is_none());
+            assert!(subscription.sleep().now_or_never().is_none());
+        }
+    }
+
+    #[test]
+    fn pending_sentence_types_are_bounded_and_existing_types_still_update() {
+        let (mut subscription, updates) = subscription();
+        updates.push(&sentences(&["$GPGGA,1*00\r\n"]));
+        for kind in 0..1000 {
+            updates.push(&sentences(&[&format!("$P{kind:04},1*00\r\n")]));
+        }
+        updates.push(&sentences(&["$GPGGA,2*00\r\n"]));
+        let buffered = subscription.take().unwrap();
+        assert_eq!(buffered.nmea_sentence.len(), MAX_PENDING_SENTENCE_TYPES);
+        assert_eq!(buffered.nmea_sentence[0], "$GPGGA,2*00\r\n");
+
+        // Taking an update frees all slots, including for previously unseen types.
+        let rmc = sentences(&["$GPRMC,1*00\r\n"]);
+        updates.push(&rmc);
+        assert_eq!(subscription.take(), Some(rmc));
+    }
+
+    #[test]
+    fn same_type_sentences_in_one_message_are_replaced_together() {
+        let (mut subscription, updates) = subscription();
+        updates.push(&sentences(&["$GPGSV,2,1,old*00\r\n", "$GPGSV,2,2,old*00\r\n", "$GPRMC,1*00\r\n"]));
+        updates.push(&sentences(&["$GPGSV,2,1,new*00\r\n", "$GPGSV,2,2,new*00\r\n"]));
+        assert_eq!(
+            subscription.take(),
+            Some(sentences(&["$GPGSV,2,1,new*00\r\n", "$GPGSV,2,2,new*00\r\n", "$GPRMC,1*00\r\n"])),
+        );
+        assert!(subscription.take().is_none());
+    }
 
     #[test]
     fn each_type_requires_both_flags_and_preserves_only_its_interval() {
