@@ -1,6 +1,9 @@
 use std::{
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -27,8 +30,33 @@ pub struct UiRenderer {
     persist_dir: Option<PathBuf>,
     /// Loaded on first use, inside the blocking render path rather than at construction.
     theme: Option<UiTheme>,
-    /// Set to whether a theme is configured when the theme is loaded.
-    themed: Arc<OnceLock<bool>>,
+    /// Whether this renderer's current theme is set; renderer-owned, so it always matches it.
+    themed: ThemeFlag,
+}
+
+/// Whether a renderer draws a (non-default) UI theme: unknown until the renderer loaded the theme
+/// for its first screen, then updated whenever that theme changes (e.g. a background fallback).
+/// Each renderer has its own flag, so a released renderer cannot affect its replacement.
+#[derive(Clone, Default, Debug)]
+pub struct ThemeFlag(Arc<AtomicU8>);
+
+impl ThemeFlag {
+    const UNKNOWN: u8 = 0;
+    const DEFAULT: u8 = 1;
+    const THEMED: u8 = 2;
+
+    fn set(&self, theme: &UiTheme) {
+        let value = if theme.is_default() { Self::DEFAULT } else { Self::THEMED };
+        self.0.store(value, Ordering::Relaxed);
+    }
+
+    /// `None` until the theme is loaded.
+    pub fn get(&self) -> Option<bool> {
+        match self.0.load(Ordering::Relaxed) {
+            Self::UNKNOWN => None,
+            value => Some(value == Self::THEMED),
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -73,19 +101,14 @@ impl UiRenderer {
         let themed = &self.themed;
         self.theme.get_or_insert_with(|| {
             let theme = UiTheme::load(persist_dir);
-            let _ = themed.set(!theme.is_default());
+            themed.set(&theme);
             theme
         })
     }
 
-    /// Publishes whether a theme is configured into `themed` once the theme is loaded (at the
-    /// first render), so callers can decide without loading it themselves.
-    pub fn with_themed_flag(mut self, themed: Arc<OnceLock<bool>>) -> Self {
-        if let Some(theme) = &self.theme {
-            let _ = themed.set(!theme.is_default());
-        }
-        self.themed = themed;
-        self
+    /// Whether this renderer draws a UI theme; see [`ThemeFlag`].
+    pub fn theme_flag(&self) -> ThemeFlag {
+        self.themed.clone()
     }
 
     fn ops(&mut self, state: &UiState) -> Vec<RenderOp> {
@@ -120,7 +143,9 @@ impl UiRenderer {
             };
             // The background passed the header check at load but failed to decode or draw.
             warn!("Rendering the UI theme background failed ({err}); continuing without it");
-            self.theme = Some(theme.without_background());
+            let theme = theme.without_background();
+            self.themed.set(&theme);
+            self.theme = Some(theme);
             self.fb.reset(self.width, self.height, self.dpi);
             let ops = self.ops(&state);
             self.fb.execute(&ops)?;
@@ -405,16 +430,14 @@ fn test_theme_background_is_rendered() {
     )
     .unwrap();
 
-    let themed = Arc::new(OnceLock::new());
-    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, Some(persist_dir.clone()))
-        .unwrap()
-        .with_themed_flag(themed.clone());
+    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, Some(persist_dir.clone())).unwrap();
+    let themed = renderer.theme_flag();
     assert!(renderer.theme.is_none(), "the theme is loaded lazily");
     assert_eq!(themed.get(), None);
     renderer
         .render_and_encode_frame(UiState::WaitingForConnection, Duration::ZERO, false)
         .unwrap();
-    assert_eq!(themed.get(), Some(&true), "the first screen publishes that a theme is set");
+    assert_eq!(themed.get(), Some(true), "the first screen publishes that a theme is set");
     let theme = renderer.theme.as_ref().unwrap();
     assert!(theme.background_bytes.is_some(), "the background rendered without falling back");
     // The test image is a single colour (RGB 40, 80, 120); the centre must show it.
@@ -457,12 +480,30 @@ fn test_broken_theme_background_falls_back_to_default() {
 fn test_no_theme_is_published_after_the_first_screen() {
     use std::time::Duration;
 
-    let themed = Arc::new(OnceLock::new());
-    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, None)
-        .unwrap()
-        .with_themed_flag(themed.clone());
+    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, None).unwrap();
     renderer
         .render_and_encode_frame(UiState::WaitingForConnection, Duration::ZERO, false)
         .unwrap();
-    assert_eq!(themed.get(), Some(&false));
+    assert_eq!(renderer.theme_flag().get(), Some(false));
+}
+
+#[test]
+fn test_background_only_theme_that_falls_back_publishes_no_theme() {
+    use std::time::Duration;
+
+    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, None).unwrap();
+    renderer.theme = Some(UiTheme {
+        background_bytes: Some(include_bytes!("testdata/small.jpg")[..200].into()),
+        ..Default::default()
+    });
+    renderer.themed.set(renderer.theme.as_ref().unwrap());
+    assert_eq!(renderer.theme_flag().get(), Some(true));
+    renderer
+        .render_and_encode_frame(UiState::WaitingForConnection, Duration::ZERO, false)
+        .unwrap();
+    assert_eq!(
+        renderer.theme_flag().get(),
+        Some(false),
+        "without its broken background the theme is the default look"
+    );
 }

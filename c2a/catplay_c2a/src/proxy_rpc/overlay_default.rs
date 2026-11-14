@@ -7,7 +7,7 @@ use catplay_util::{EventReconciler, EventSleeper, EventToken, LazyAsync};
 use log::{debug, warn};
 use std::{
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -18,7 +18,7 @@ pub struct OverlayPolicyDefault {
     peer: OverlayPeerState,
     overlay: Option<UiState>,
     iphone_bt_links: Arc<AtomicUsize>,
-    themed: Arc<OnceLock<bool>>,
+    themed: bool,
 }
 
 /// The waiting screen while no iPhone session runs: a pairing request wins, then a found iPhone
@@ -38,13 +38,13 @@ fn waiting_screen(pairing: Option<UiState>, iphone_found: bool, themed: bool) ->
 }
 
 impl OverlayPolicyDefault {
-    pub fn new(iphone_bt_links: Arc<AtomicUsize>, themed: Arc<OnceLock<bool>>) -> Self {
+    pub fn new(iphone_bt_links: Arc<AtomicUsize>) -> Self {
         Self {
             bluez: LazyAsync::new(Self::start_pin_agent),
             peer: OverlayPeerState::Unconnected,
             overlay: None,
             iphone_bt_links,
-            themed,
+            themed: false,
         }
     }
     async fn start_pin_agent() -> BluezManager {
@@ -89,10 +89,8 @@ impl OverlayPolicy for OverlayPolicyDefault {
                 pin: format!("{}", req.passkey),
             });
         let iphone_found = self.iphone_bt_links.load(Ordering::Relaxed) > 0;
-        // Until the first screen loaded the theme, treat it as absent.
-        let themed = self.themed.get().copied().unwrap_or(false);
 
-        Some(waiting_screen(pairing, iphone_found, themed))
+        Some(waiting_screen(pairing, iphone_found, self.themed))
     }
 
     fn on_hid_interact(&mut self) -> bool {
@@ -111,6 +109,10 @@ impl OverlayPolicy for OverlayPolicyDefault {
 
     fn set_peer_state(&mut self, state: OverlayPeerState) {
         self.peer = state;
+    }
+
+    fn set_themed(&mut self, themed: bool) {
+        self.themed = themed;
     }
 }
 
@@ -157,16 +159,15 @@ mod tests {
     #[test]
     fn found_iphone_switches_to_connecting_until_the_link_drops() {
         let links = Arc::new(AtomicUsize::new(0));
-        let themed = Arc::new(OnceLock::new());
-        let mut policy = OverlayPolicyDefault::new(links.clone(), themed.clone());
+        let mut policy = OverlayPolicyDefault::new(links.clone());
         assert_eq!(policy.overlay(), Some(UiState::WaitingForConnection));
         links.store(1, Ordering::Relaxed);
         assert_eq!(
             policy.overlay(),
             Some(UiState::WaitingForConnection),
-            "the theme is not known before the first screen"
+            "no connecting phase without a theme"
         );
-        themed.set(true).unwrap();
+        policy.set_themed(true);
         assert!(matches!(policy.overlay(), Some(UiState::Connecting { .. })));
         policy.set_peer_state(OverlayPeerState::ConnectedWithoutScreen);
         assert_eq!(policy.overlay(), None, "the session hides the waiting screen");

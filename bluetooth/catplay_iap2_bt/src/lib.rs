@@ -45,8 +45,9 @@ pub struct BluetoothManager {
     links: Arc<LinkTasks>,
 }
 
-/// The iAP2 session tasks of a manager: counts the live ones in a shareable counter, and aborts
-/// them when the manager is dropped, so no session (and no count) outlives a Bluetooth restart.
+/// The iAP2 session tasks of a manager: counts the live ones in a shareable counter, and requests
+/// their cancellation when the manager is dropped. Cancelled sessions end (and leave the count) at
+/// their next await point, so they can briefly overlap a restarted manager, but do not linger.
 struct LinkTasks {
     live: Arc<AtomicUsize>,
     tasks: Mutex<Vec<AbortHandle>>,

@@ -1,7 +1,7 @@
 use super::proxy_screen::ScreenProxyOp;
 use crate::{
     proxy_rpc::OverlayPolicyDefault,
-    ui::{UiRenderer, UiResult, UiState},
+    ui::{ThemeFlag, UiRenderer, UiResult, UiState},
 };
 use catplay_carplay::{
     carplay_rx::AirPlayReceiverHandleRef,
@@ -15,7 +15,7 @@ use log::{debug, error, info, warn};
 use std::{
     mem,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, atomic::AtomicUsize},
+    sync::{Arc, Mutex, atomic::AtomicUsize},
     time::{Duration, Instant},
 };
 use tokio::task::spawn_blocking;
@@ -38,8 +38,8 @@ pub struct OverlayManager {
     iphone_screen_active: bool,
 
     renderer: Option<Arc<Mutex<UiRenderer>>>,
-    // Whether a UI theme is configured; known after the renderer loaded it for the first screen
-    themed: Arc<OnceLock<bool>>,
+    // Whether the current renderer draws a UI theme (read without locking the renderer)
+    renderer_theme: Option<ThemeFlag>,
 
     policy: OverlayPolicyDefault,
     // stream_state: ResourceTransferType,
@@ -47,7 +47,6 @@ pub struct OverlayManager {
 
 impl OverlayManager {
     pub fn new(width: u32, height: u32, fps: u32, dpi: f32, persist_dir: Option<PathBuf>, iphone_bt_links: Arc<AtomicUsize>) -> Self {
-        let themed = Arc::new(OnceLock::new());
         Self {
             width,
             height,
@@ -65,9 +64,9 @@ impl OverlayManager {
             iphone_screen_active: false,
 
             renderer: None,
-            themed: themed.clone(),
+            renderer_theme: None,
 
-            policy: OverlayPolicyDefault::new(iphone_bt_links, themed),
+            policy: OverlayPolicyDefault::new(iphone_bt_links),
             lazy_screen: None,
         }
     }
@@ -197,6 +196,9 @@ impl OverlayManager {
 
     async fn reconcile_overlay_next(&mut self) {
         self.policy.set_peer_state(self.peer_state());
+        // Unknown until the renderer drew its first screen: show the plain waiting screen till then.
+        let themed = self.renderer_theme.as_ref().and_then(ThemeFlag::get);
+        self.policy.set_themed(themed.unwrap_or(false));
         let _ = self.policy.reconcile().await;
 
         let overlay_next = self.policy.overlay();
@@ -257,8 +259,8 @@ impl OverlayManager {
     pub fn init_renderer(&mut self) -> Arc<Mutex<UiRenderer>> {
         if self.renderer.is_none() {
             let renderer = UiRenderer::new(self.width as _, self.height as _, self.fps, self.dpi, self.persist_dir.clone())
-                .expect("failed to init renderer")
-                .with_themed_flag(self.themed.clone());
+                .expect("failed to init renderer");
+            self.renderer_theme.replace(renderer.theme_flag());
             self.renderer.replace(Arc::new(Mutex::new(renderer)));
             info!("Initialized UI renderer");
         }
@@ -267,6 +269,7 @@ impl OverlayManager {
     }
 
     pub fn release_renderer(&mut self) {
+        self.renderer_theme.take();
         if self.renderer.take().is_some() {
             info!("Released UI renderer");
         }
@@ -312,7 +315,82 @@ pub enum OverlayPeerState {
 pub trait OverlayPolicy: EventReconciler<Error = ()> + EventSleeper {
     fn set_peer_state(&mut self, state: OverlayPeerState);
 
+    /// Whether the waiting screens are drawn with a UI theme (the connecting phase needs one).
+    fn set_themed(&mut self, themed: bool);
+
     fn overlay(&mut self) -> Option<UiState>;
 
     fn on_hid_interact(&mut self) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::UiTheme;
+    use std::sync::atomic::Ordering;
+
+    fn render_first_screen(renderer: &Arc<Mutex<UiRenderer>>) {
+        renderer
+            .lock()
+            .unwrap()
+            .render_and_encode_frame(UiState::WaitingForConnection, Duration::ZERO, false)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connecting_phase_follows_the_current_renderers_theme() {
+        let dir = std::env::temp_dir().join(format!("catplay-overlay-theme-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let theme_file = dir.join(UiTheme::FILE_NAME);
+        let links = Arc::new(AtomicUsize::new(0));
+        let mut manager = OverlayManager::new(800, 480, 30, 160.0, Some(dir.clone()), links.clone());
+
+        // No theme: a found iPhone changes nothing and queues no extra render.
+        render_first_screen(&manager.init_renderer());
+        manager.reconcile_overlay_next().await;
+        assert_eq!(manager.overlay_current, Some(UiState::WaitingForConnection));
+        let queued = manager.overlay_render_queue.len();
+        links.store(1, Ordering::Relaxed);
+        manager.reconcile_overlay_next().await;
+        assert_eq!(manager.overlay_current, Some(UiState::WaitingForConnection));
+        assert_eq!(manager.overlay_render_queue.len(), queued, "no extra render without a theme");
+
+        // A theme added while the renderer was released is used by the next one, with the phase.
+        manager.release_renderer();
+        std::fs::write(&theme_file, "connecting_text = \"Verbinden met {device}\"\n").unwrap();
+        let themed = manager.init_renderer();
+        manager.reconcile_overlay_next().await;
+        assert_eq!(
+            manager.overlay_current,
+            Some(UiState::WaitingForConnection),
+            "unknown until the renderer drew its first screen"
+        );
+        render_first_screen(&themed);
+        manager.reconcile_overlay_next().await;
+        assert!(matches!(manager.overlay_current, Some(UiState::Connecting { .. })));
+
+        // Removed again: the next renderer has no theme, so neither does the phase.
+        manager.release_renderer();
+        std::fs::remove_file(&theme_file).unwrap();
+        manager.reconcile_overlay_next().await;
+        assert_eq!(
+            manager.overlay_current,
+            Some(UiState::WaitingForConnection),
+            "a released renderer's theme no longer counts"
+        );
+        let stale = manager.init_renderer();
+        manager.release_renderer();
+        render_first_screen(&manager.init_renderer());
+        manager.reconcile_overlay_next().await;
+        assert_eq!(manager.overlay_current, Some(UiState::WaitingForConnection));
+
+        // A job of a released renderer that still loads a theme cannot flip the current one.
+        std::fs::write(&theme_file, "connecting_text = \"Verbinden met {device}\"\n").unwrap();
+        render_first_screen(&stale);
+        assert_eq!(stale.lock().unwrap().theme_flag().get(), Some(true));
+        manager.reconcile_overlay_next().await;
+        assert_eq!(manager.overlay_current, Some(UiState::WaitingForConnection));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
