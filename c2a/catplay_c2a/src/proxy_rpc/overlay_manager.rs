@@ -92,6 +92,10 @@ impl OverlayManager {
         }
     }
 
+    pub fn set_inviting_iphone(&mut self, inviting: bool) {
+        self.policy.set_inviting_iphone(inviting);
+    }
+
     pub fn on_hid_interact(&mut self) -> bool {
         self.policy.on_hid_interact()
     }

@@ -236,6 +236,12 @@ impl UiRenderer {
 
     #[trace_time(warn)]
     pub fn render_and_encode_frame(&mut self, state: UiState, latency: Duration, reset: bool) -> UiResult<EncodedVideoFrame> {
+        // The connecting phase belongs to the UI theme; without one the upstream waiting screen stays
+        // (served from its keyframe cache).
+        let state = match state {
+            UiState::Connecting { .. } if self.theme().is_default() => UiState::WaitingForConnection,
+            state => state,
+        };
         if state.cache_file_name().is_some() {
             info!("UI renderer requested cacheable state {state}");
         }
@@ -427,4 +433,28 @@ fn test_broken_theme_background_falls_back_to_default() {
     let theme = renderer.theme.as_ref().unwrap();
     assert!(theme.background_bytes.is_none());
     assert_eq!(theme.waiting_text.as_deref(), Some("Wachten"));
+}
+
+#[test]
+fn test_connecting_phase_needs_a_theme() {
+    use std::time::Duration;
+
+    let connecting = UiState::Connecting {
+        device: "iPhone".into(),
+        ticks: 2,
+    };
+    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, None).unwrap();
+    renderer
+        .render_and_encode_frame(connecting.clone(), Duration::ZERO, false)
+        .unwrap();
+    assert_eq!(renderer.last_state, UiState::WaitingForConnection, "no theme: upstream waiting screen");
+
+    renderer.theme = Some(UiTheme {
+        connecting_text: Some("Verbinden met {device}".into()),
+        ..Default::default()
+    });
+    renderer
+        .render_and_encode_frame(connecting.clone(), Duration::ZERO, false)
+        .unwrap();
+    assert_eq!(renderer.last_state, connecting);
 }

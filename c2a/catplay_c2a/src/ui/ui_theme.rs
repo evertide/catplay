@@ -45,11 +45,12 @@ pub struct UiTheme {
     /// Full-screen background image (JPEG), scaled to cover the screen.
     pub background: Option<PathBuf>,
     pub waiting_text: Option<String>,
-    /// Smaller second line under the waiting text.
+    /// Smaller second line under the waiting and connecting text.
     pub subtitle: Option<String>,
     /// Main text size in points (default 30).
     pub text_size: Option<f32>,
-    /// `{device}` is replaced by the phone name.
+    /// Shown once the dongle invites the iPhone, until the session starts; `{device}` is replaced
+    /// by the phone name ("iPhone" there).
     pub connecting_text: Option<String>,
     /// `{device}` and `{pin}` are replaced.
     pub pairing_text: Option<String>,
@@ -208,7 +209,7 @@ impl UiTheme {
         let Some(text) = self.text(state, &upstream) else {
             return upstream;
         };
-        let subtitle = matches!(state, UiState::WaitingForConnection)
+        let subtitle = matches!(state, UiState::WaitingForConnection | UiState::Connecting { .. })
             .then(|| self.subtitle.clone())
             .flatten();
 
@@ -449,7 +450,7 @@ mod tests {
             device: "iPhone".into(),
             ticks: 0,
         };
-        assert_eq!(texts(&theme.ops(&connecting, SCREEN)), ["Verbinden met iPhone."]);
+        assert_eq!(texts(&theme.ops(&connecting, SCREEN)), ["Verbinden met iPhone.", "Volvo XC90"]);
         let pairing = UiState::Pairing {
             device: "Phone {pin}".into(),
             pin: "1234".into(),
