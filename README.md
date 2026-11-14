@@ -80,15 +80,16 @@ If you have a spare Aston Martin 2025 with CarPlay Ultra collecting dust, please
 Carplay2Air forwards car NMEA location data to the iPhone over AirPlay iAP2.
 The car must advertise a location component, send `LocationInformation`, and accept
 `StartLocationInformation` and `StopLocationInformation`. Forwarding starts when
-the iPhone requests it and car identification and authentication are complete.
+the iPhone requests it over Bluetooth or AirPlay and car identification and
+authentication are complete. Delivery waits for AirPlay identification and authentication.
 Only data types supported by both sides are requested; power messages are independent.
 
 The accumulator merges pending updates by sentence type and holds at most 16 types.
-GPS waits for transport completion before taking the next update. Merged payloads
-are split at sentence group boundaries to fit the peer's iAP2 packet limit minus
-16 bytes of iAP2/CSM framing, capped at 60 KiB per message; a single group exceeding
-that budget is dropped.
-Bluetooth disconnects do not interrupt forwarding. An iPhone Stop request or AirPlay
+GPS waits for transport completion before sending the next sentence. Each message
+carries one requested sentence, within the peer's iAP2 packet limit minus 16 bytes
+of iAP2/CSM framing, capped at 60 KiB; an oversized sentence is dropped.
+Requested PASCD speed data is forwarded from the car, without synthesizing it.
+Bluetooth disconnects do not interrupt forwarding. A Stop on either transport or AirPlay
 teardown cancels it, and a replacement USB session repeats car negotiation.
 AirPlay GPS endpoint errors leave audio and video running. INFO logs report identification,
 negotiation gates, subscription changes and rejections, and the first received and

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, net::TcpStream, time::Duration};
+use std::{net::TcpStream, time::Duration};
 
 use async_trait::async_trait;
 use catplay_plist::CachingSerializer;
@@ -20,7 +20,6 @@ pub struct EventsClient {
     rtsp: RtspQueue,
     #[sleep]
     rtsp_drain: RtspDrain,
-    response_log_levels: VecDeque<Level>,
 }
 
 impl EventsClient {
@@ -30,7 +29,6 @@ impl EventsClient {
             rtsp,
             rtsp_drain,
             shared_secret: Some(shared_secret),
-            response_log_levels: VecDeque::new(),
         }
     }
 
@@ -40,7 +38,6 @@ impl EventsClient {
             rtsp,
             rtsp_drain,
             shared_secret: None,
-            response_log_levels: VecDeque::new(),
         }
     }
 
@@ -48,7 +45,7 @@ impl EventsClient {
         self.rtsp.clone()
     }
 
-    fn request_log_level(&mut self, request: &RtspRequest) -> Level {
+    fn request_log_level(request: &RtspRequest) -> Level {
         #[derive(Deserialize)]
         struct CommandType {
             #[serde(rename = "type")]
@@ -58,15 +55,11 @@ impl EventsClient {
         // Read only the command type; do not decode or copy the iAP2 data for logging.
         let iap2 = request.url.as_str() == "/command"
             && catplay_plist::from_bytes::<CommandType>(&request.payload).is_ok_and(|command| command.name == "iAPSendMessage");
-        let level = if iap2 { Level::Debug } else { Level::Warn };
-        self.response_log_levels.push_back(level);
-        level
+        if iap2 { Level::Debug } else { Level::Warn }
     }
 
-    fn response_log_level(&mut self, status: HttpStatus) -> Level {
-        // Event responses have no CSeq. Keep FIFO slots even if the caller drops its future.
-        let level = self.response_log_levels.pop_front().unwrap_or(Level::Warn);
-        if status == HttpStatus::Ok { level } else { Level::Warn }
+    fn response_log_level(status: HttpStatus) -> Level {
+        if status == HttpStatus::Ok { Level::Debug } else { Level::Warn }
     }
 }
 
@@ -115,7 +108,7 @@ impl TcpSession for EventsClient {
     async fn on_msg(&mut self, _sink: &mut dyn TcpSink<Self>, msgs: CItem<Self::Codec>) -> RtspResult<()> {
         for msg in msgs {
             if let RtspFrame::Response(resp) = msg {
-                let level = self.response_log_level(resp.status);
+                let level = Self::response_log_level(resp.status);
                 log!(level, "Event socket: <- {resp}");
                 self.rtsp_drain.feed(resp);
             }
@@ -125,7 +118,7 @@ impl TcpSession for EventsClient {
 
     async fn reconcile(&mut self, _sink: &mut dyn TcpSink<Self>) -> RtspResult<()> {
         for req in self.rtsp_drain.drain() {
-            let level = self.request_log_level(&req);
+            let level = Self::request_log_level(&req);
             log!(level, "Event socket: -> {}", &req);
             _sink.write(vec![req.into()])?;
         }
@@ -146,7 +139,7 @@ mod tests {
     use crate::msg::{CommandForceKeyFrame, CommandIApSendMessage};
 
     #[test]
-    fn only_iap2_commands_and_their_successful_fifo_responses_use_debug() {
+    fn iap2_requests_and_all_successful_responses_use_debug() {
         let mut client = EventsClient::unencrypted();
         let queue = client.rtsp_client();
         let iap2 = Command::IApSendMessage(CommandIApSendMessage {
@@ -166,23 +159,17 @@ mod tests {
             .iter()
             .zip([Level::Debug, Level::Warn, Level::Debug])
         {
-            assert_eq!(client.request_log_level(request), expected);
+            assert_eq!(EventsClient::request_log_level(request), expected);
         }
-        for (status, expected) in [
-            (HttpStatus::BadRequest, Level::Warn),
-            (HttpStatus::Ok, Level::Warn),
-            (HttpStatus::Ok, Level::Debug),
-            (HttpStatus::Ok, Level::Warn),
-        ] {
-            assert_eq!(client.response_log_level(status), expected);
+        for (status, expected) in [(HttpStatus::BadRequest, Level::Warn), (HttpStatus::Ok, Level::Debug)] {
+            assert_eq!(EventsClient::response_log_level(status), expected);
         }
     }
 
     #[test]
     fn malformed_event_requests_keep_warn_logging() {
-        let mut client = EventsClient::unencrypted();
         let request = RtspRequest::with_payload(RtspMethod::Post, "/command", &b"invalid plist"[..]);
-        assert_eq!(client.request_log_level(&request), Level::Warn);
-        assert_eq!(client.response_log_level(HttpStatus::Ok), Level::Warn);
+        assert_eq!(EventsClient::request_log_level(&request), Level::Warn);
+        assert_eq!(EventsClient::response_log_level(HttpStatus::Ok), Level::Debug);
     }
 }
