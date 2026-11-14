@@ -175,6 +175,7 @@ impl UiRenderer {
                 width: self.width as _,
                 height: self.height as _,
                 respect_timestamps: true,
+                view: Default::default(),
             }),
             nal_offsets: Some(vec![NalChunk {
                 prefix_start: 0,
@@ -273,6 +274,7 @@ impl UiRenderer {
                 width: self.width as _,
                 height: self.height as _,
                 respect_timestamps: true,
+                view: Default::default(),
             }),
             nal_offsets: Some(vec![NalChunk {
                 prefix_start: 0,

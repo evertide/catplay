@@ -1203,6 +1203,8 @@ mod tests {
             width: 800,
             height: 480,
             respect_timestamps: false,
+            // View origin and size, which a proxied stream must pass on unchanged.
+            view: [Value64::from_f32(12.5, 7.0).u8, Value64::from_f32(800.0, 480.0).u8],
         };
 
         let mut encoded = BytesMut::new();

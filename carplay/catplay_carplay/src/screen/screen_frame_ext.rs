@@ -151,6 +151,8 @@ impl ScreenFrame {
         let header = &mut frame.header;
         header.opcode = ScreenOpCode::VideoConfig;
         header.params[1] = Value64::from_f32_floor(avcc.width, avcc.height);
+        header.params[3] = Value64::new(avcc.view[0]);
+        header.params[4] = Value64::new(avcc.view[1]);
         header.small_param[1] |= ScreenFlag::Encrypted.bits();
 
         if avcc.respect_timestamps {
@@ -181,10 +183,6 @@ impl ScreenFrame {
         }
 
         let (width, height) = self.header.params[1].as_f32_floor();
-        /*let (view_origin_x, view_origin_y) = self.header.params[3].as_f32();
-        let (view_origin_x, view_origin_y) = (view_origin_x.floor() as u32, view_origin_y.floor() as u32);
-        let (view_width, view_height) = self.header.params[4].as_f32();
-        let (view_width, view_height) = (view_width.floor() as u32, view_height.floor() as u32);*/
 
         let flags = self.flags();
         let (avcc, hevc) = if flags.contains(ScreenFlag::UseFormatDescription) {
@@ -214,6 +212,7 @@ impl ScreenFrame {
             width,
             height,
             respect_timestamps: flags.contains(ScreenFlag::RespectTimestamps),
+            view: [self.header.params[3].u8, self.header.params[4].u8],
         })
     }
 
