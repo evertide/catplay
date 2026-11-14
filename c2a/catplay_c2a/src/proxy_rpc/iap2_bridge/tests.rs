@@ -1224,7 +1224,7 @@ fn bluetooth_constructed_before_airplay_cannot_stop_another_connections_request(
 
 #[test]
 fn old_transports_cannot_control_or_cancel_a_new_bluetooth_handoff() {
-    for replace_before_drop in [false, true] {
+    for (stop_before_start, replace_before_drop) in [(false, false), (false, true), (true, false), (true, true)] {
         let location = LocationBridge::default();
         let mut car = CarPlayClientSession::with_location(location.clone());
         let car_out = Arc::new(Capture::default());
@@ -1238,6 +1238,10 @@ fn old_transports_cannot_control_or_cancel_a_new_bluetooth_handoff() {
         respond(&mut car, &car_out, sample());
         old_airplay.wait_event().now_or_never().unwrap();
 
+        if stop_before_start {
+            respond(&mut old_bt, &phone_out, StopLocationInformation::default());
+            assert!(!location.is_requested());
+        }
         let mut new_bt = bluetooth(location.clone());
         // Identical contents still belong to a new owner.
         respond(&mut new_bt, &phone_out, build_12_request());

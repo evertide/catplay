@@ -126,8 +126,7 @@ impl LocationBridge {
         if let Some(updates) = state.updates.as_ref() {
             updates.buffer.lock().unwrap().clear();
         }
-        // Keep an idle endpoint that opened before Bluetooth Start.
-        if owner != state.owner && self.is_requested() {
+        if owner != state.owner {
             state.updates = None;
         }
         state.owner = owner;
@@ -138,9 +137,13 @@ impl LocationBridge {
         self.request.borrow().is_some()
     }
 
-    /// AirPlay owns delivery without changing the request owner.
+    /// AirPlay owns delivery without changing an active request's owner.
     pub fn subscribe(&self) -> LocationSubscription {
         let mut state = self.state.lock().unwrap();
+        // A fresh idle endpoint belongs to the connection whose Start is pending.
+        if !self.is_requested() {
+            state.owner = state.next_owner;
+        }
         let (changed, updates) = watch::channel(());
         let buffer = Arc::new(Mutex::new(PendingLocation::new()));
         if let Some(previous) = state.updates.take() {
