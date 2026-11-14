@@ -183,6 +183,11 @@ impl FileTransferTransmitter {
         }
     }
 
+    /// Whether any id is reserved or any outgoing transfer is still tracked.
+    pub(crate) fn has_state(&self) -> bool {
+        self.taken_ids.iter().any(|&taken| taken) || self.outgoing.iter().any(Option::is_some)
+    }
+
     pub fn reserve(&mut self) -> Option<FileTransferReserved> {
         let valid_range = if self.server { 128u8..255 } else { 0u8..127 };
 
@@ -214,12 +219,12 @@ impl FileTransferTransmitter {
     }
 
     pub fn feed(&mut self, ev: FileTransferPayload) -> (Option<FileTransferPayload>, Option<FileTransferEvent>) {
-        let session_ref = self.outgoing.get_mut(ev.file_id as usize).unwrap();
-
+        // Check the range before indexing: the peer chooses file_id, and 255 is past the end of `outgoing`.
         let valid_range = if self.server { 128u8..255 } else { 0u8..127 };
         if !valid_range.contains(&ev.file_id) {
             return (None, None);
         }
+        let session_ref = self.outgoing.get_mut(ev.file_id as usize).unwrap();
 
         debug!("Feeding TX event: {ev:?}");
         let file_id = ev.file_id;

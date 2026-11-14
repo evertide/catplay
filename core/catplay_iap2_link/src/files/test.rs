@@ -9,10 +9,14 @@ use std::{
 };
 
 use crate::{
-    FileTransferOp, FileTransferPayload, LinkEvent, LinkLayer, LinkStatus, Packet,
+    FileTransferOp, FileTransferPayload, LSPPayload, LinkEvent, LinkLayer, LinkSession, LinkStatus, Packet, SessionType,
+    SimpleLSPNegotiator,
     clock::MockClock,
     files::{FileTransferEvent, FileTransferOutgoingSource, FileTransferReserved},
 };
+
+/// A minimal Control session payload (CSM header only).
+const CONTROL_MSG: [u8; 6] = [0x40, 0x40, 0x00, 0x06, 0x00, 0x00];
 
 struct LinkLayerFileTest {
     client_queue: Arc<Mutex<VecDeque<LinkEvent>>>,
@@ -21,18 +25,25 @@ struct LinkLayerFileTest {
     server: LinkLayer,
     client_files: VecDeque<(u8, FileTransferEvent)>,
     server_files: VecDeque<(u8, FileTransferEvent)>,
+    client_csm: VecDeque<Vec<u8>>,
 }
 
 impl LinkLayerFileTest {
     fn new() -> Self {
+        Self::with_client_lsp(LSPPayload::bluetooth())
+    }
+
+    /// The client (accessory) proposes `client_lsp`; the server (host) accepts it as-is.
+    fn with_client_lsp(client_lsp: LSPPayload) -> Self {
         let client_queue = Arc::new(Mutex::new(VecDeque::new()));
         let server_queue = Arc::new(Mutex::new(VecDeque::new()));
         let clock = MockClock::new(Instant::now());
 
-        let client = LinkLayer::with_clock(false, Box::new(clock.clone()), {
-            let client_queue = client_queue.clone();
-            move |ev| client_queue.lock().unwrap().push_back(ev)
-        });
+        let client =
+            LinkLayer::with_clock_and_lsp_negotiator(false, Box::new(clock.clone()), Box::new(SimpleLSPNegotiator::new(client_lsp)), {
+                let client_queue = client_queue.clone();
+                move |ev| client_queue.lock().unwrap().push_back(ev)
+            });
         let server = LinkLayer::with_clock(true, Box::new(clock), {
             let server_queue = server_queue.clone();
             move |ev| server_queue.lock().unwrap().push_back(ev)
@@ -45,6 +56,7 @@ impl LinkLayerFileTest {
             server,
             client_files: VecDeque::new(),
             server_files: VecDeque::new(),
+            client_csm: VecDeque::new(),
         }
     }
 
@@ -64,6 +76,7 @@ impl LinkLayerFileTest {
             match ev {
                 LinkEvent::Write(packet) => self.server.read(packet),
                 LinkEvent::FileTransfer(id, event) => self.client_files.push_back((id, event)),
+                LinkEvent::ReadCsm(data) => self.client_csm.push_back(data),
                 _ => {}
             }
         }
@@ -151,7 +164,7 @@ fn two_link_layers_transfer_file_end_to_end() {
     assert_eq!(received, file);
     assert!(sender_success);
     assert!(matches!(test.client.status(), &LinkStatus::Writable | &LinkStatus::Unwritable));
-    assert!(matches!(test.server.status(), &LinkStatus::Writable | &LinkStatus::Unwritable));
+    assert_eq!(test.server.status(), &LinkStatus::Writable);
 }
 
 #[test]
@@ -212,4 +225,144 @@ fn setup_for_unknown_transfer_id_is_cancelled_and_reclaimed_end_to_end() {
         .reserve_file_tx()
         .expect("reclaimed server file id");
     assert_eq!(reclaimed.0, file_id);
+}
+
+#[test]
+fn reserve_file_tx_succeeds_when_file_session_negotiated() {
+    let mut test = LinkLayerFileTest::new();
+    test.sync();
+
+    assert!(test.server.has_session_of_type(SessionType::FileTransfer));
+    assert!(test.server.reserve_file_tx().is_some());
+    assert!(test.client.reserve_file_tx().is_some());
+}
+
+#[test]
+fn file_transfer_without_negotiated_file_session_does_not_panic() {
+    // Some head units (seen on a Volvo XC90 / Sensus) negotiate only a Control session.
+    let mut control_only = LSPPayload::bluetooth();
+    control_only
+        .sessions
+        .retain(|s| s.session_type == SessionType::Control);
+    let mut test = LinkLayerFileTest::with_client_lsp(control_only);
+
+    // Work queued before negotiation finished (our default LSP still offers File/EA)...
+    let early = test
+        .server
+        .reserve_file_tx()
+        .expect("file id before negotiation");
+    let early_id = early.0;
+    test.server
+        .files()
+        .send_file(early, 0x1234, &[], FileTransferOutgoingSource::VecData(vec![1, 2, 3]));
+    test.server.ea().enqueue_tx(vec![0xea]);
+
+    test.sync();
+
+    assert_eq!(test.client.status(), &LinkStatus::Writable);
+    assert_eq!(test.server.status(), &LinkStatus::Writable);
+    assert!(!test.server.has_session_of_type(SessionType::FileTransfer));
+
+    // ...is released once the peer turns out not to support it.
+    assert!(!test.server.files().has_tx_pending());
+    assert!(!test.server.ea().has_tx_pending());
+
+    // Callers asking the link for a file id learn that no transfer is possible.
+    assert!(test.server.reserve_file_tx().is_none());
+
+    // A transfer queued anyway (bypassing the link-level check) must not take the link down.
+    let reserved = test.server.files().reserve_file_tx().expect("file id");
+    assert_eq!(reserved.0, early_id, "early reservation was not released");
+    test.server
+        .files()
+        .send_file(reserved, 0x1234, &[], FileTransferOutgoingSource::VecData(vec![1, 2, 3]));
+    for _ in 0..5 {
+        test.sync();
+    }
+
+    // Control traffic queued after the blocked transfer still gets through.
+    let control = CONTROL_MSG.to_vec();
+    test.server.csm().enqueue_tx(control.clone());
+    for _ in 0..5 {
+        test.sync();
+    }
+
+    assert!(test.client_files.is_empty());
+    assert_eq!(test.client_csm.pop_front(), Some(control));
+    assert_eq!(test.server.status(), &LinkStatus::Writable);
+}
+
+#[test]
+fn work_submitted_after_negotiation_for_unsupported_sessions_is_dropped() {
+    let mut control_only = LSPPayload::bluetooth();
+    control_only
+        .sessions
+        .retain(|s| s.session_type == SessionType::Control);
+    let mut test = LinkLayerFileTest::with_client_lsp(control_only);
+
+    // An id reserved before negotiation, but submitted only afterwards.
+    let early = test
+        .server
+        .reserve_file_tx()
+        .expect("file id before negotiation");
+    test.sync();
+    assert_eq!(test.server.status(), &LinkStatus::Writable);
+
+    test.server
+        .files()
+        .send_file(early, 0x1234, &[], FileTransferOutgoingSource::VecData(vec![1, 2, 3]));
+    test.server.ea().enqueue_tx(vec![0xea]);
+    let control = CONTROL_MSG.to_vec();
+    test.server.csm().enqueue_tx(control.clone());
+    for _ in 0..5 {
+        test.sync();
+    }
+
+    assert_eq!(test.client_csm.pop_front(), Some(control));
+    assert!(test.client_files.is_empty());
+    assert!(!test.server.files().has_tx_pending());
+    assert!(!test.server.ea().has_tx_pending());
+    // The late submission's data was released, not left behind.
+    assert!(!test.server.files().has_tx_state(), "late submission was not released");
+}
+
+/// A file id the client may allocate.
+const PEER_FILE_ID_IN_RANGE: u8 = 1;
+
+/// Sends a file Setup with `file_id` from the client and returns the file events the server reported.
+fn peer_file_setup(file_id: u8) -> (LinkLayerFileTest, Vec<(u8, FileTransferEvent)>) {
+    let mut test = LinkLayerFileTest::new();
+    test.sync();
+
+    let mut setup = Vec::new();
+    setup.extend_from_slice(&4u64.to_be_bytes());
+    setup.extend_from_slice(&0x4321u16.to_be_bytes());
+    test.client
+        .files()
+        .enqueue_test_payload(FileTransferPayload {
+            file_id,
+            op: FileTransferOp::Setup,
+            payload: setup,
+        });
+
+    for _ in 0..5 {
+        test.sync();
+    }
+
+    let events = test.server_files.drain(..).collect();
+    (test, events)
+}
+
+#[test]
+fn file_id_255_from_the_peer_does_not_panic() {
+    // Positive control: the same Setup with a valid id does reach the server.
+    let (_, events) = peer_file_setup(PEER_FILE_ID_IN_RANGE);
+    assert!(
+        matches!(events.as_slice(), [(id, FileTransferEvent::Setup { .. })] if *id == PEER_FILE_ID_IN_RANGE),
+        "valid id must produce a Setup event: {events:?}"
+    );
+
+    let (test, events) = peer_file_setup(255);
+    assert!(events.is_empty(), "id 255 is outside every valid range: {events:?}");
+    assert_eq!(test.server.status(), &LinkStatus::Writable);
 }
