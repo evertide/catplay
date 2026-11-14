@@ -120,7 +120,15 @@ impl OverlayManager {
         };
 
         match op {
-            ScreenProxyOp::IphoneFrame { frame, handle, consumed } => {
+            ScreenProxyOp::IphoneFrame {
+                mut frame,
+                handle,
+                consumed,
+            } => {
+                if let Some(config) = frame.config.as_mut() {
+                    let diag = super::xc90_diag::Xc90Diag::get();
+                    super::xc90_diag::Xc90Diag::apply_config(diag.main_config, config);
+                }
                 if self.overlay_current.is_some() {
                     debug!("Dropping iPhone frame because overlay is active");
                     let _ = consumed.send(());

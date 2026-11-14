@@ -89,7 +89,7 @@ impl CarManager {
         proxy_rx: mpsc::UnboundedReceiver<TxAdapterOp>,
         persist_dir: Option<PathBuf>,
     ) -> RtspResult<Self> {
-        super::xc90_diag::Xc90Diag::get(); // logs the XC90 diagnostic switches at the start of the car session
+        info!("XC90 diagnostic switches: {:?}", super::xc90_diag::Xc90Diag::get());
         let info = car.info_cached();
         let car_media_clock = car.media_clock();
         let screen = info.displays.first().ok_or(RtspError::Unknown)?;
@@ -572,8 +572,28 @@ impl CarManager {
                 task.detach();
                 true
             }
-            // suggestUI is only parsed so the iPhone gets 200 instead of 501; it is not forwarded, because a car that never
-            // answers it would hit the proxy timeout and tear the session down (Volvo advertises no suggestion URLs anyway).
+            // XC90 diagnostics (xc90_suggest_ui): pass the iPhone's suggestUI on to the car, like the stock firmware does. The
+            // iPhone gets its 200 right away and a car that rejects or never answers it is only logged, never fatal.
+            CommandType::SuggestUI if super::xc90_diag::Xc90Diag::get().suggest_ui => {
+                info!("XC90: forwarding iPhone command {command:?} to the car");
+                let command = command.clone();
+                self.tx_queue.push_back(
+                    async move {
+                        match car.send_command_noresp(&command, Duration::from_secs(2)) {
+                            Ok(pending) => match pending.await {
+                                Ok(resp) => info!("XC90: car answered suggestUI with {resp:?}"),
+                                Err(err) => warn!("XC90: car did not answer suggestUI: {err}"),
+                            },
+                            Err(err) => warn!("XC90: could not send suggestUI to the car: {err}"),
+                        }
+                        Ok(())
+                    }
+                    .boxed(),
+                );
+                let _ = response.send(RtspResponse::new(None, HttpStatus::Ok));
+                return;
+            }
+            // Otherwise suggestUI is only parsed so the iPhone gets 200 instead of 501.
             _ => false,
         };
 

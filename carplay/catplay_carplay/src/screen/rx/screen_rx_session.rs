@@ -207,7 +207,7 @@ mod tests {
             width: 1920,
             height: 720,
             respect_timestamps: true,
-            view: [[0; 8], view],
+            view: [[0; 8], view, [0; 8]],
         }
     }
 

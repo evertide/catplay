@@ -10,9 +10,9 @@ pub struct AvccConfigExtended {
     pub width: u32,
     pub height: u32,
     pub respect_timestamps: bool,
-    /// View origin and size from the sender's VideoConfig header (params 3 and 4), passed on unchanged by a proxied stream.
-    /// Zero for streams we encode ourselves.
-    pub view: [[u8; 8]; 2],
+    /// View origin and size from the sender's VideoConfig header (params 3 and 4), passed on unchanged by a proxied stream,
+    /// plus param 6 (a third copy of the size the iPhone sends; XC90 diagnostics). Zero for streams we encode ourselves.
+    pub view: [[u8; 8]; 3],
 }
 
 impl AvccConfigExtended {

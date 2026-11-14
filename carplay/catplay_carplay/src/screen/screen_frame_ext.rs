@@ -153,6 +153,7 @@ impl ScreenFrame {
         header.params[1] = Value64::from_f32_floor(avcc.width, avcc.height);
         header.params[3] = Value64::new(avcc.view[0]);
         header.params[4] = Value64::new(avcc.view[1]);
+        header.params[6] = Value64::new(avcc.view[2]);
         header.small_param[1] |= ScreenFlag::Encrypted.bits();
 
         if avcc.respect_timestamps {
@@ -212,7 +213,7 @@ impl ScreenFrame {
             width,
             height,
             respect_timestamps: flags.contains(ScreenFlag::RespectTimestamps),
-            view: [self.header.params[3].u8, self.header.params[4].u8],
+            view: [self.header.params[3].u8, self.header.params[4].u8, self.header.params[6].u8],
         })
     }
 

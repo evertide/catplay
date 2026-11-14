@@ -166,11 +166,9 @@ impl AltScreenManager {
         std::mem::take(&mut self.resetup).then(|| self.uuid.clone())
     }
 
-    /// XC90 diagnostics: apply [Xc90Diag::alt_passthrough_config], and decide whether `config` needs a new car stream.
+    /// XC90 diagnostics: apply [Xc90Diag::alt_config], and decide whether `config` needs a new car stream.
     fn diag_config(&mut self, diag: Xc90Diag, config: &mut AvccConfigExtended) -> bool {
-        if !diag.alt_passthrough_config {
-            config.view = Default::default();
-        }
+        Xc90Diag::apply_config(diag.alt_config, config);
         let changed = self.sent_config.as_ref().is_some_and(|sent| sent != config);
         if changed && diag.alt_resetup && self.car_screen.is_some() {
             info!("XC90: alt screen config changed, re-SETUP of the car stream: {config:?}");
@@ -512,7 +510,7 @@ mod tests {
             width: 1920,
             height: 720,
             respect_timestamps: true,
-            view: [[0; 8], [view; 8]],
+            view: [[0; 8], [view; 8], [0; 8]],
         };
         let mut manager = AltScreenManager::default();
         let (iphone_tx, iphone_rx) = mpsc::unbounded();
@@ -556,7 +554,7 @@ mod tests {
             width: 1920,
             height: 720,
             respect_timestamps: true,
-            view: [[0; 8], [view; 8]],
+            view: [[0; 8], [view; 8], [0; 8]],
         };
         let torn_down = Arc::new(AtomicBool::new(false));
         let mut manager = AltScreenManager::default();
@@ -580,12 +578,15 @@ mod tests {
         let mut stripped = config(5);
         manager.diag_config(
             Xc90Diag {
-                alt_passthrough_config: false,
+                alt_config: 0,
                 ..Default::default()
             },
             &mut stripped,
         );
-        assert_eq!(stripped.view, [[0; 8]; 2], "without pass-through the view is not sent");
+        assert_eq!(stripped.view, [[0; 8]; 3], "mode 0 (build 13) sends no view");
+        let mut build14 = config(5);
+        manager.diag_config(Default::default(), &mut build14);
+        assert_eq!(build14.view, [[0; 8], [5; 8], [0; 8]], "mode 1 (build 14) sends params 3 and 4 only");
         assert!(manager.take_resetup().is_none());
     }
 }
