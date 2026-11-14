@@ -116,6 +116,14 @@ impl AltScreenManager {
                     }
                 }
                 None => {
+                    // A view change keeps the held keyframe decodable; any other change needs a new keyframe from the iPhone.
+                    let held = self.pending_keyframe.take();
+                    self.pending_keyframe = held.filter(|keyframe| {
+                        keyframe
+                            .config
+                            .as_ref()
+                            .is_some_and(|c| c.same_except_view(&config))
+                    });
                     if let Some(keyframe) = self.pending_keyframe.as_mut() {
                         keyframe.config = Some(config);
                     }
@@ -307,5 +315,10 @@ mod tests {
         assert!(step(&mut manager).is_none());
         let held = manager.pending_keyframe.as_ref().unwrap();
         assert_eq!(held.config, Some(config(2)), "the car stream must start with the latest view");
+
+        let new_codec = AvccConfigExtended { width: 1280, ..config(2) };
+        let _ = iphone_tx.unbounded_send(ScreenProxyOp::IphoneConfig { config: new_codec });
+        assert!(step(&mut manager).is_none());
+        assert!(manager.pending_keyframe.is_none(), "a keyframe for another codec config is dropped");
     }
 }

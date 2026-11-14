@@ -180,11 +180,7 @@ impl TcpSession for ScreenReceiverSession {
 /// through a regular VideoConfig.
 fn clear_screen_update(config: Option<AvccConfigExtended>, current: Option<&AvccConfigExtended>) -> Option<AvccConfigExtended> {
     let (config, current) = (config?, current?);
-    let view_only = AvccConfigExtended {
-        view: current.view,
-        ..config.clone()
-    } == *current;
-    (view_only && config.view != current.view).then_some(config)
+    (current.same_except_view(&config) && config.view != current.view).then_some(config)
 }
 
 impl EventSleeper for ScreenReceiverSession {}

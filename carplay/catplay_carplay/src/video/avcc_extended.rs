@@ -14,3 +14,14 @@ pub struct AvccConfigExtended {
     /// Zero for streams we encode ourselves.
     pub view: [[u8; 8]; 2],
 }
+
+impl AvccConfigExtended {
+    /// Whether `other` only differs in the view origin and size, so frames encoded for one still decode with the other.
+    pub fn same_except_view(&self, other: &AvccConfigExtended) -> bool {
+        *self
+            == AvccConfigExtended {
+                view: self.view,
+                ..other.clone()
+            }
+    }
+}
