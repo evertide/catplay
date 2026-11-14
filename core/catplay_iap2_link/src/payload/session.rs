@@ -14,6 +14,13 @@ impl PayloadSession {
     pub fn enqueue_tx(&mut self, packet: Vec<u8>) {
         self.queue_tx.push_back(packet);
     }
+
+    /// Drops all queued payloads. Returns whether anything was dropped.
+    pub(crate) fn clear_tx(&mut self) -> bool {
+        let had_work = !self.queue_tx.is_empty();
+        self.queue_tx.clear();
+        had_work
+    }
 }
 
 impl LinkSession for PayloadSession {

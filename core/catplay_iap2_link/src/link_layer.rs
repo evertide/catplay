@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 use catplay_util::{ModSeq, ModSeq8};
 use core::{cmp::Ordering, time::Duration};
-use log::{debug, trace};
+use log::{debug, trace, warn};
 
 #[cfg(test)]
 mod tests;
@@ -9,7 +9,7 @@ mod tests;
 use crate::{
     EAKPayload, LSPPayload, LinkSession, PayloadDecodable, PayloadSession, SessionType,
     clock::{Clock, ClockInstant},
-    files::{FileSession, FileTransferEvent},
+    files::{FileSession, FileTransferEvent, FileTransferReserved},
     negotiate::{LSPNegotiator, Negotiation, NegotiationTx, SimpleLSPNegotiator},
     packet::*,
 };
@@ -384,6 +384,36 @@ impl LinkLayer {
         counter
     }
 
+    /// Whether the local LSP has a session of the given type.
+    ///
+    /// Until negotiation completes the local LSP is a placeholder listing every session type;
+    /// on the host side it then becomes the set the accessory offered, which may lack sessions
+    /// (e.g. some head units negotiate only a Control session).
+    pub fn has_session_of_type(&self, session_type: SessionType) -> bool {
+        self.find_session_of_type(session_type).is_some()
+    }
+
+    /// Reserves an outgoing file transfer id, or `None` when the link has no
+    /// FileTransfer session to carry it.
+    pub fn reserve_file_tx(&mut self) -> Option<FileTransferReserved> {
+        if !self.has_session_of_type(SessionType::FileTransfer) {
+            return None;
+        }
+        self.files.reserve_file_tx()
+    }
+
+    /// Drops queued File/EA work for sessions that are not in the local LSP, releasing reserved
+    /// file ids and data instead of keeping them forever. Runs before every payload dequeue.
+    /// Dropped transfers emit no cancel event.
+    fn release_unsupported_sessions(&mut self) {
+        if !self.has_session_of_type(SessionType::FileTransfer) && self.files.reset_tx() {
+            warn!(target: self.logger, "Peer negotiated no FileTransfer session; dropped queued file transfers");
+        }
+        if !self.has_session_of_type(SessionType::ExternalAccessory) && self.ea.clear_tx() {
+            warn!(target: self.logger, "Peer negotiated no ExternalAccessory session; dropped queued EA payloads");
+        }
+    }
+
     fn find_session_of_type(&self, session_type: SessionType) -> Option<u8> {
         self.local_lsp
             .sessions
@@ -584,9 +614,12 @@ impl LinkLayer {
             && let Some(v) = self.next_payload()
         {
             let peer_seq = self.peer_seq?;
-            let session = self
-                .find_session_of_type(v.0)
-                .expect("missing session but wants to transmit");
+            // Unreachable in practice (next_payload() releases unsupported sessions first), but a peer
+            // that did not negotiate this session must not be able to panic the link here.
+            let Some(session) = self.find_session_of_type(v.0) else {
+                warn!(target: self.logger, "Dropping {:?} payload: session was not negotiated", v.0);
+                return None;
+            };
             let packet = Packet::new_ack(self.take_own_seq(), peer_seq, session, Some(v.1));
 
             if packet.size() > self.peer_lsp.max_len as _ {
@@ -635,6 +668,10 @@ impl LinkLayer {
     #[allow(clippy::manual_map)]
     fn next_payload(&mut self) -> Option<(SessionType, Vec<u8>)> {
         let max_payload_len = (self.peer_lsp.max_len as usize).saturating_sub(Packet::PACKET_OVERHEAD);
+
+        // Work submitted for a session the peer did not negotiate (also after negotiation,
+        // e.g. with an id reserved earlier) is dropped here instead of being kept or sent.
+        self.release_unsupported_sessions();
 
         if let Some(v) = self.csm.dequeue_tx(max_payload_len) {
             Some((SessionType::Control, v))

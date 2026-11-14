@@ -169,12 +169,7 @@ impl CsmClientHandle for AsyncHandle {
     }
 
     fn send_file_reserve(&self) -> Option<u8> {
-        self.link
-            .lock()
-            .unwrap()
-            .files()
-            .reserve_file_tx()
-            .map(|t| t.0)
+        self.link.lock().unwrap().reserve_file_tx().map(|t| t.0)
     }
 
     fn send_file(&self, file_id: u8, file_type: u16, setup_data: &[u8], source: Vec<u8>) {
