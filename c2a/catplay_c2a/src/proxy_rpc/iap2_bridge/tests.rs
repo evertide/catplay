@@ -1029,6 +1029,39 @@ fn stop_after_bluetooth_start(over_bluetooth: bool) {
 }
 
 #[test]
+fn airplay_before_bluetooth_start_survives_reconnection_on_the_same_bridge() {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    let phone_out = Arc::new(Capture::default());
+    ready(&mut car, &car_out);
+
+    // Reuse the bridge after teardown so the second connection has a retained owner.
+    for connection in 1..=2 {
+        let mut bluetooth = bluetooth(location.clone());
+        let mut airplay = phone(location.clone());
+        respond(&mut bluetooth, &phone_out, build_12_request());
+        pump(&mut car, &car_out);
+        let commands = car_out.location_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].cast::<StartLocationInformation>(), Some(&build_12_request()));
+        drop(bluetooth);
+        assert!(location.is_requested());
+
+        respond(&mut car, &car_out, sample());
+        pump(&mut airplay, &phone_out);
+        assert_eq!(take_location(&phone_out), sample(), "connection {connection}");
+
+        drop(airplay);
+        assert!(!location.is_requested(), "connection {connection}");
+        pump(&mut car, &car_out);
+        let commands = car_out.location_commands();
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].cast::<StopLocationInformation>().is_some());
+    }
+}
+
+#[test]
 fn airplay_stop_cancels_a_bluetooth_subscription() {
     stop_after_bluetooth_start(false);
 }

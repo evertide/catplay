@@ -116,7 +116,7 @@ impl LocationBridge {
     }
 
     fn update_request(&self, state: &mut LocationState, owner: u64, request: Option<StartLocationInformation>) {
-        // Only Start can select a newer Bluetooth session. Stale controls are inert.
+        // Bluetooth can select a newer session only with Start. Stale controls are inert.
         if owner < state.owner || (request.is_none() && owner != state.owner) {
             return;
         }
@@ -137,11 +137,10 @@ impl LocationBridge {
     /// AirPlay owns delivery; a Bluetooth disconnect must not cancel the request.
     pub fn subscribe(&self) -> LocationSubscription {
         let mut state = self.state.lock().unwrap();
-        if state.owner == 0 {
-            // AirPlay can open before the first Start, or without Bluetooth.
-            state.next_owner = state.next_owner.max(1);
-            state.owner = state.next_owner;
-        }
+        // Bind to the newest connection even if its Bluetooth Start is still pending.
+        // Reserve the first owner when AirPlay opens without Bluetooth.
+        state.next_owner = state.next_owner.max(1);
+        state.owner = state.next_owner;
         let (changed, updates) = watch::channel(());
         let buffer = Arc::new(Mutex::new(PendingLocation::new()));
         if let Some(previous) = state.updates.take() {
