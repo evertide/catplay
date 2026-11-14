@@ -24,6 +24,21 @@ pub struct Xc90Diag {
     pub alt_resetup: bool,
     /// `xc90_alt_latency_ms` (default 25): latency announced in the car's alt screen SETUP (the iPhone uses 75).
     pub alt_latency_ms: u64,
+    /// `xc90_alt_config_repeat` (default 1): write every VideoConfig of the iPhone's alt screen to the car again, also when
+    /// nothing changed, like the stock firmware. The iPhone sends a ClearScreen and a regular VideoConfig before the keyframe
+    /// after every showUI; up to build 17 the car only got the keyframe. 0 = build 17.
+    pub alt_config_repeat: bool,
+    /// `xc90_alt_showui_resetup` (default 0): TEARDOWN and SETUP the car's alt screen stream again at every showUI of the car.
+    pub alt_showui_resetup: bool,
+    /// `xc90_gps_bt_location` (default 0): offer Location in the Bluetooth iAP2 identification and hand a Bluetooth
+    /// StartLocationInformation over to AirPlay (build 13–17). 0 = offer it on AirPlay only and send GPS only after the iPhone
+    /// asked on that same link (iOS binds Location to the first endpoint that offers it, and BT goes away).
+    pub gps_bt_location: bool,
+    /// `xc90_bt_fast_close` (default 1): on the iPhone's disableBluetooth, also end our iAP2 Bluetooth session right away.
+    pub bt_fast_close: bool,
+    /// `xc90_mainhigh_latency` (default 1): add a MainHighAudio/media latency (copied from the car's MainAudio/media 48k/2ch
+    /// entry) to the /info for the iPhone; airplayd logs "No latency information found for MainHighAudio/media" otherwise.
+    pub mainhigh_latency: bool,
 }
 
 impl Default for Xc90Diag {
@@ -36,17 +51,33 @@ impl Default for Xc90Diag {
             alt_lazy_setup: true,
             alt_resetup: false,
             alt_latency_ms: 25,
+            alt_config_repeat: true,
+            alt_showui_resetup: false,
+            gps_bt_location: false,
+            bt_fast_close: true,
+            mainhigh_latency: true,
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests of code that reads the switches set them here (per test thread).
+    pub static TEST_OVERRIDE: std::cell::Cell<Option<Xc90Diag>> = const { std::cell::Cell::new(None) };
 }
 
 impl Xc90Diag {
     /// The switches from `/persist/config.txt`, read once (the car manager logs them at the start of every car session).
     pub fn get() -> Xc90Diag {
+        #[cfg(test)]
+        if let Some(diag) = TEST_OVERRIDE.with(|diag| diag.get()) {
+            return diag;
+        }
         static DIAG: OnceLock<Xc90Diag> = OnceLock::new();
         *DIAG.get_or_init(|| {
             let diag = Self::parse(&std::fs::read_to_string(CONFIG_FILE).unwrap_or_default());
             catplay_carplay::screen::XC90_STOCK_CONFIG_FLAGS.store(diag.config_flags, std::sync::atomic::Ordering::Relaxed);
+            catplay_carplay::screen::XC90_PASS_UNCHANGED_CLEAR_SCREEN.store(diag.alt_config_repeat, std::sync::atomic::Ordering::Relaxed);
             diag
         })
     }
@@ -73,6 +104,11 @@ impl Xc90Diag {
                 "xc90_alt_lazy_setup" => diag.alt_lazy_setup = value == "1",
                 "xc90_alt_resetup" => diag.alt_resetup = value == "1",
                 "xc90_alt_latency_ms" => diag.alt_latency_ms = value.parse().unwrap_or(diag.alt_latency_ms),
+                "xc90_alt_config_repeat" => diag.alt_config_repeat = value == "1",
+                "xc90_alt_showui_resetup" => diag.alt_showui_resetup = value == "1",
+                "xc90_gps_bt_location" => diag.gps_bt_location = value == "1",
+                "xc90_bt_fast_close" => diag.bt_fast_close = value == "1",
+                "xc90_mainhigh_latency" => diag.mainhigh_latency = value == "1",
                 _ => {}
             }
         }
@@ -88,7 +124,7 @@ mod tests {
     fn parses_switches_and_keeps_defaults() {
         assert_eq!(Xc90Diag::parse(""), Xc90Diag::default());
         let diag = Xc90Diag::parse(
-            "bluetooth_name=Volvo XC90\nxc90_alt_resetup=1\nxc90_alt_config = 0\nxc90_main_config=2\nxc90_suggest_ui=0\nxc90_config_flags=0\nxc90_alt_lazy_setup=0\nxc90_alt_latency_ms=75\n# xc90_alt_resetup=0\n",
+            "bluetooth_name=Volvo XC90\nxc90_alt_resetup=1\nxc90_alt_config = 0\nxc90_main_config=2\nxc90_suggest_ui=0\nxc90_config_flags=0\nxc90_alt_lazy_setup=0\nxc90_alt_latency_ms=75\nxc90_alt_config_repeat=0\nxc90_alt_showui_resetup=1\nxc90_gps_bt_location=1\nxc90_bt_fast_close=0\nxc90_mainhigh_latency=0\n# xc90_alt_resetup=0\n",
         );
         assert_eq!(
             diag,
@@ -99,7 +135,12 @@ mod tests {
                 config_flags: false,
                 alt_lazy_setup: false,
                 alt_resetup: true,
-                alt_latency_ms: 75
+                alt_latency_ms: 75,
+                alt_config_repeat: false,
+                alt_showui_resetup: true,
+                gps_bt_location: true,
+                bt_fast_close: false,
+                mainhigh_latency: false,
             }
         );
         assert_eq!(Xc90Diag::parse("xc90_alt_latency_ms=abc").alt_latency_ms, 25);

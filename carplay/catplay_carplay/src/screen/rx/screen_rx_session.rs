@@ -141,7 +141,8 @@ impl TcpSession for ScreenReceiverSession {
                 if msg.flags().contains(ScreenFlag::ClearScreen) {
                     // The iPhone sends a ClearScreen config when it switches the view (for example on showUI): apply it when
                     // only the view origin and size change (see clear_screen_update); anything else is still ignored.
-                    match clear_screen_update(config, self.config.as_ref()) {
+                    let repeat = crate::screen::XC90_PASS_UNCHANGED_CLEAR_SCREEN.load(std::sync::atomic::Ordering::Relaxed);
+                    match clear_screen_update(config, self.config.as_ref(), repeat) {
                         Some(config) => {
                             self.sink.set_avcc_config(config.clone()).await?;
                             self.config.replace(config);
@@ -179,9 +180,14 @@ impl TcpSession for ScreenReceiverSession {
 
 /// A ClearScreen VideoConfig is only applied when it changes nothing but the view origin and size; anything else only changes
 /// through a regular VideoConfig.
-fn clear_screen_update(config: Option<AvccConfigExtended>, current: Option<&AvccConfigExtended>) -> Option<AvccConfigExtended> {
+/// XC90 diagnostics: with `repeat` an unchanged one is passed on as well (see `XC90_PASS_UNCHANGED_CLEAR_SCREEN`).
+fn clear_screen_update(
+    config: Option<AvccConfigExtended>,
+    current: Option<&AvccConfigExtended>,
+    repeat: bool,
+) -> Option<AvccConfigExtended> {
     let (config, current) = (config?, current?);
-    (current.same_except_view(&config) && config.view != current.view).then_some(config)
+    (current.same_except_view(&config) && (repeat || config.view != current.view)).then_some(config)
 }
 
 impl EventSleeper for ScreenReceiverSession {}
@@ -216,18 +222,24 @@ mod tests {
     fn clear_screen_only_updates_the_view() {
         let current = config(&[1, 2], [0; 8]);
         let new_view = config(&[1, 2], [7; 8]);
-        assert_eq!(clear_screen_update(Some(new_view.clone()), Some(&current)), Some(new_view.clone()));
-        assert_eq!(clear_screen_update(Some(current.clone()), Some(&current)), None, "nothing changed");
+        assert_eq!(clear_screen_update(Some(new_view.clone()), Some(&current), false), Some(new_view.clone()));
+        assert_eq!(clear_screen_update(Some(current.clone()), Some(&current), false), None, "nothing changed");
         assert_eq!(
-            clear_screen_update(Some(config(&[3], [7; 8])), Some(&current)),
+            clear_screen_update(Some(current.clone()), Some(&current), true),
+            Some(current.clone()),
+            "XC90 diagnostics: an unchanged one is passed on to be repeated"
+        );
+        assert_eq!(clear_screen_update(Some(config(&[3], [7; 8])), Some(&current), true), None);
+        assert_eq!(
+            clear_screen_update(Some(config(&[3], [7; 8])), Some(&current), false),
             None,
             "codec config changes are ignored"
         );
         let resized = AvccConfigExtended { width: 800, ..new_view };
-        assert_eq!(clear_screen_update(Some(resized), Some(&current)), None, "size changes are ignored");
-        assert_eq!(clear_screen_update(None, Some(&current)), None);
+        assert_eq!(clear_screen_update(Some(resized), Some(&current), false), None, "size changes are ignored");
+        assert_eq!(clear_screen_update(None, Some(&current), false), None);
         assert_eq!(
-            clear_screen_update(Some(current.clone()), None),
+            clear_screen_update(Some(current.clone()), None, false),
             None,
             "no VideoConfig received yet"
         );

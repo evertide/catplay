@@ -938,6 +938,13 @@ fn build_12_request() -> StartLocationInformation {
 
 #[test]
 fn production_bluetooth_factory_hands_its_request_to_the_shared_airplay_bridge() {
+    // The build 13-17 path: Location offered on Bluetooth as well (xc90_gps_bt_location=1).
+    crate::proxy_rpc::xc90_diag::TEST_OVERRIDE.with(|diag| {
+        diag.set(Some(crate::proxy_rpc::xc90_diag::Xc90Diag {
+            gps_bt_location: true,
+            ..Default::default()
+        }))
+    });
     let location = LocationBridge::default();
     let mut car = CarPlayClientSession::with_location(location.clone());
     let car_out = Arc::new(Capture::default());

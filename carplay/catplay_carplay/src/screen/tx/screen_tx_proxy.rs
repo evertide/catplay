@@ -49,6 +49,13 @@ impl ScreenTransmitProxy {
     }
 }
 
+impl ScreenTransmitProxy {
+    /// XC90 diagnostics: write the next config to the receiver even if it equals the last one.
+    pub fn repeat_next_config(&mut self) {
+        self.last_config = None;
+    }
+}
+
 impl ScreenTransmitSink for ScreenTransmitProxy {
     fn stream_latency(&self) -> Duration {
         self.stream_latency

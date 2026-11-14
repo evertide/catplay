@@ -162,7 +162,11 @@ impl ProdGadget {
         let location = self.location.clone();
         let mfi = self.cfg.mfi.clone();
         rx.child_mut()
-            .set_bluetooth_session(move |identity| Iap2LocationBridge::new(mfi.clone(), identity, location.clone(), false));
+            .set_bluetooth_session(move |mut identity| {
+                // XC90 diagnostics: by default Location is offered on the AirPlay iAP2 link only (see xc90_gps_bt_location).
+                identity.has_gps &= crate::proxy_rpc::xc90_diag::Xc90Diag::get().gps_bt_location;
+                Iap2LocationBridge::new(mfi.clone(), identity, location.clone(), false)
+            });
         rx
     }
 }

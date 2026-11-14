@@ -10,7 +10,7 @@ mod overlay_manager;
 mod proxy_screen;
 mod rx_bridge;
 mod tx_adapter;
-mod xc90_diag;
+pub(crate) mod xc90_diag;
 
 pub use alt_screen_manager::*;
 pub use car_manager::*;

@@ -18,6 +18,9 @@ use crate::{
 /// unnamed flag bit 4 and NoDisplaySleep (bit 8) on top of RespectTimestamps and Encrypted. Set by the c2a switch
 /// `xc90_config_flags`.
 pub static XC90_STOCK_CONFIG_FLAGS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// XC90 diagnostics (`xc90_alt_config_repeat`): the receiver also passes on a ClearScreen VideoConfig that changes nothing (the
+/// iPhone sends one after every showUI), so a proxy can repeat it to the car like the stock firmware does.
+pub static XC90_PASS_UNCHANGED_CLEAR_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl ScreenFrame {
     fn scan(&mut self, nal_size_len: usize, from_length_prefixed: bool) -> Result<(), NalError> {

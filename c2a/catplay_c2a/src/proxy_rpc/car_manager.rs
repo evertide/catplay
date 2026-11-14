@@ -5,7 +5,10 @@ use catplay_carplay::{
     clock::{MediaClockBox, NtpU64},
     events::CommandPending,
     modes::{ChangeModesResponse, ResourceTransferPriority},
-    msg::{ALT_SCREEN_SUGGEST_UI_URLS, Command, CommandType, ControllerFeature, Display, HidDevice, InfoMessageResponse},
+    msg::{
+        ALT_SCREEN_SUGGEST_UI_URLS, AudioLatency, AudioType, Command, CommandType, ControllerFeature, Display, HidDevice,
+        InfoMessageResponse, StreamType,
+    },
     rtsp_frame::{HttpStatus, RtspError, RtspResponse, RtspResult},
     screen::tx::ScreenTransmitProxy,
     video::Pts,
@@ -543,7 +546,7 @@ impl CarManager {
                 displays,
                 alt_screen_suggest_ui_urls,
 
-                audio_latencies: other.audio_latencies,
+                audio_latencies: with_mainhigh_latency(other.audio_latencies, super::xc90_diag::Xc90Diag::get().mainhigh_latency),
                 features: other.features,
 
                 ..info_clone
@@ -569,6 +572,9 @@ impl CarManager {
                         return;
                     };
 
+                    if super::xc90_diag::Xc90Diag::get().bt_fast_close {
+                        super::iap2_bridge::request_bt_close();
+                    }
                     if let Ok(id) = MacAddr6::from_str(&cmd.device_id) {
                         warn!("Disconnecting BT peer: {id}");
                         let _ = BluezManager::new().disconnect_peer("hci0", id).await;
@@ -648,6 +654,13 @@ impl CarManager {
     }
 
     fn on_car_command_connected(&mut self, mut cmd: CommandPending) {
+        if cmd.command().get_type() == CommandType::ShowUI
+            && self.iphone_features.contains(&ControllerFeature::AltScreen)
+            && super::xc90_diag::Xc90Diag::get().alt_showui_resetup
+            && let Some(screen) = self.alt_screen.resetup_for_show_ui()
+        {
+            self.schedule_alt_screen_teardown(screen);
+        }
         let peer = self.iphone_peer.as_mut().expect("iPhone peer missing");
         let phone = peer.iphone.clone();
         let cmd_type = cmd.command().get_type();
@@ -813,6 +826,30 @@ fn negotiate_proxied_features(offered: &[ControllerFeature], car_enabled: &[Cont
         .collect()
 }
 
+/// XC90 diagnostics (`xc90_mainhigh_latency`): the car lists no MainHighAudio latency, so airplayd guesses for the media stream
+/// that CatPlay plays as MainHighAudio. Copy the car's MainAudio/media 48k/2ch entry when there is none yet.
+fn with_mainhigh_latency(mut latencies: Vec<AudioLatency>, enabled: bool) -> Vec<AudioLatency> {
+    let has_mainhigh = latencies
+        .iter()
+        .any(|l| l.stream_type == Some(StreamType::MainHighAudio));
+    let media = latencies
+        .iter()
+        .find(|l| {
+            l.stream_type == Some(StreamType::MainAudio) && l.audio_type == Some(AudioType::Media) && l.sr == Some(48000) && l.ch == Some(2)
+        })
+        .cloned();
+    if enabled
+        && !has_mainhigh
+        && let Some(media) = media
+    {
+        latencies.push(AudioLatency {
+            stream_type: Some(StreamType::MainHighAudio),
+            ..media
+        });
+    }
+    latencies
+}
+
 /// The car's alt screen suggestions for the iPhone, only when the alt screen is negotiated. A Volvo XC90, which has no per-display
 /// initialURL, got an empty (black) cluster from iOS without a suggestion, and names none unless the sender announced
 /// altScreenURLs; so fall back to the Apple Maps defaults, as the stock dongle firmware does.
@@ -850,6 +887,25 @@ impl Drop for CarManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mainhigh_latency_copies_the_car_media_entry() {
+        let media = AudioLatency {
+            stream_type: Some(StreamType::MainAudio),
+            audio_type: Some(AudioType::Media),
+            sr: Some(48000),
+            ss: Some(16),
+            ch: Some(2),
+            input_latency_micros: None,
+            output_latency_micros: Some(167300),
+        };
+        let out = with_mainhigh_latency(vec![media.clone()], true);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].stream_type, Some(StreamType::MainHighAudio));
+        assert_eq!(out[1].output_latency_micros, Some(167300));
+        assert_eq!(with_mainhigh_latency(vec![media.clone()], false).len(), 1, "switched off");
+        assert_eq!(with_mainhigh_latency(out, true).len(), 2, "never twice");
+    }
 
     const MAIN_UUID: &str = "e5f7a68d-7b0f-4305-984b-974f677a150b";
     const CLUSTER_UUID: &str = "b7e6c5a0-2222-4000-8000-000000000002";
