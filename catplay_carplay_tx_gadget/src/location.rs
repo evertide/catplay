@@ -27,10 +27,7 @@ const MAX_LOCATION_PAYLOAD_BYTES: usize = 60 * 1024;
 
 fn sentence_group_size(sentences: &[String]) -> usize {
     // Each sentence has a four-byte TLV header and a terminating NUL byte.
-    sentences
-        .iter()
-        .map(|sentence| sentence.len() + 5)
-        .sum()
+    sentences.iter().map(|sentence| sentence.len() + 5).sum()
 }
 
 #[derive(Clone)]
@@ -426,9 +423,7 @@ mod tests {
         assert!(registry.encode(&gsv).is_ok());
         assert!(registry.encode(&rmc).is_ok());
         let mut oversized = gsv.clone();
-        oversized
-            .nmea_sentence
-            .extend(rmc.nmea_sentence.clone());
+        oversized.nmea_sentence.extend(rmc.nmea_sentence.clone());
         assert!(registry.encode(&oversized).is_err());
         updates.push(&gsv);
         updates.push(&rmc);

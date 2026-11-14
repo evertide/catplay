@@ -436,10 +436,7 @@ impl CsmSession for CarPlayServerSession {
 
         let log_identification = packet.cast::<StartIdentification>().is_some() && !self.identification_sent;
         if log_identification {
-            info!(
-                "iPhone StartIdentification observed: transport={:?}",
-                _handle.remote()
-            );
+            info!("iPhone StartIdentification observed: transport={:?}", _handle.remote());
         }
 
         // if let Some(_) = packet.cast::<IdentificationAccepted>() {

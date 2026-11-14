@@ -234,8 +234,7 @@ impl AsyncClientDrain {
     }
 
     pub fn take(&mut self) -> Option<PacketFrame<Vec<u8>>> {
-        self.take_with_permit()
-            .map(|(packet, _permit)| packet)
+        self.take_with_permit().map(|(packet, _permit)| packet)
     }
 
     /// Retain the permit until the transport finishes sending this frame.

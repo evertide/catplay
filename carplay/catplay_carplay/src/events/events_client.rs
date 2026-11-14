@@ -65,9 +65,7 @@ impl EventsClient {
 
     fn response_log_level(&mut self) -> Level {
         // Event responses have no CSeq. Keep FIFO slots even if the caller drops its future.
-        self.response_log_levels
-            .pop_front()
-            .unwrap_or(Level::Warn)
+        self.response_log_levels.pop_front().unwrap_or(Level::Warn)
     }
 }
 
@@ -163,7 +161,10 @@ mod tests {
             .unwrap();
         let requests = client.rtsp_drain.drain();
         assert_eq!(requests.len(), 3);
-        for (request, expected) in requests.iter().zip([Level::Debug, Level::Warn, Level::Debug]) {
+        for (request, expected) in requests
+            .iter()
+            .zip([Level::Debug, Level::Warn, Level::Debug])
+        {
             assert_eq!(client.request_log_level(request), expected);
         }
         for expected in [Level::Debug, Level::Warn, Level::Debug, Level::Warn] {
