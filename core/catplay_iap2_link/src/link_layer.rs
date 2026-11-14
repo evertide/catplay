@@ -190,6 +190,11 @@ impl LinkLayer {
         &self.status
     }
 
+    /// Maximum outgoing payload size, excluding iAP2 framing.
+    pub fn max_payload_len(&self) -> usize {
+        (self.peer_lsp.max_len as usize).saturating_sub(Packet::PACKET_OVERHEAD)
+    }
+
     fn send_event(&mut self, ev: LinkEvent) {
         if let LinkEvent::Write(p) = &ev {
             self.trace_packet(true, p);
@@ -634,7 +639,7 @@ impl LinkLayer {
 
     #[allow(clippy::manual_map)]
     fn next_payload(&mut self) -> Option<(SessionType, Vec<u8>)> {
-        let max_payload_len = (self.peer_lsp.max_len as usize).saturating_sub(Packet::PACKET_OVERHEAD);
+        let max_payload_len = self.max_payload_len();
 
         if let Some(v) = self.csm.dequeue_tx(max_payload_len) {
             Some((SessionType::Control, v))

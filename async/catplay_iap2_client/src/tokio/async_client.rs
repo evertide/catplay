@@ -154,6 +154,14 @@ impl CsmClientHandle for AsyncHandle {
         self.link.lock().unwrap().csm().has_tx_pending() || self.tx_pending.load(Ordering::Relaxed) != 0
     }
 
+    fn max_csm_payload_len(&self) -> usize {
+        self.link
+            .lock()
+            .unwrap()
+            .max_payload_len()
+            .saturating_sub(6)
+    }
+
     fn send_lingo(&self, outgoing: Outgoing) -> CsmSessionResult<()> {
         let mut link = self.link.lock().unwrap();
         if !link.is_downgrade() {

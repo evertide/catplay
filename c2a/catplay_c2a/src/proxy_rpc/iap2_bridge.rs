@@ -108,7 +108,7 @@ impl CsmSession for Iap2LocationBridge {
             && let Some(update) = self
                 .subscription
                 .as_mut()
-                .and_then(LocationSubscription::take)
+                .and_then(|subscription| subscription.take(handle.max_csm_payload_len()))
         {
             self.session
                 .on_event(CarPlayServerSessionEventRx::FeedGpsNmea(update), handle.clone())?;

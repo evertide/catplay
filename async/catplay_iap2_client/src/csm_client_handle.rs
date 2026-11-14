@@ -48,6 +48,11 @@ pub trait CsmClientHandle: Send + Sync {
         false
     }
 
+    /// Maximum outgoing CSM payload size, excluding the six-byte CSM header.
+    fn max_csm_payload_len(&self) -> usize {
+        u16::MAX as usize - 6
+    }
+
     /// Sends multiple packets.
     fn send_all(&self, packets: &[CsmPacketBox]) -> CsmSessionResult<()>;
 

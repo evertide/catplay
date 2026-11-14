@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::{
     cipher::AirPlayCipherSaltType,
     msg::Command,
-    rtsp_frame::{RtspDrain, RtspError, RtspFuture, RtspMethod, RtspQueue, RtspRequest, RtspResult},
+    rtsp_frame::{HttpStatus, RtspDrain, RtspError, RtspFuture, RtspMethod, RtspQueue, RtspRequest, RtspResult},
     rtsp_transport::{AirPlayTransportCodec, RtspFrame},
 };
 
@@ -63,9 +63,14 @@ impl EventsClient {
         level
     }
 
-    fn response_log_level(&mut self) -> Level {
+    fn response_log_level(&mut self, status: HttpStatus) -> Level {
         // Event responses have no CSeq. Keep FIFO slots even if the caller drops its future.
-        self.response_log_levels.pop_front().unwrap_or(Level::Warn)
+        let level = self.response_log_levels.pop_front().unwrap_or(Level::Warn);
+        if status == HttpStatus::Ok {
+            level
+        } else {
+            Level::Warn
+        }
     }
 }
 
@@ -114,7 +119,7 @@ impl TcpSession for EventsClient {
     async fn on_msg(&mut self, _sink: &mut dyn TcpSink<Self>, msgs: CItem<Self::Codec>) -> RtspResult<()> {
         for msg in msgs {
             if let RtspFrame::Response(resp) = msg {
-                let level = self.response_log_level();
+                let level = self.response_log_level(resp.status);
                 log!(level, "Event socket: <- {resp}");
                 self.rtsp_drain.feed(resp);
             }
@@ -145,7 +150,7 @@ mod tests {
     use crate::msg::{CommandForceKeyFrame, CommandIApSendMessage};
 
     #[test]
-    fn only_iap2_commands_and_their_fifo_responses_use_debug() {
+    fn only_iap2_commands_and_their_successful_fifo_responses_use_debug() {
         let mut client = EventsClient::unencrypted();
         let queue = client.rtsp_client();
         let iap2 = Command::IApSendMessage(CommandIApSendMessage {
@@ -167,8 +172,13 @@ mod tests {
         {
             assert_eq!(client.request_log_level(request), expected);
         }
-        for expected in [Level::Debug, Level::Warn, Level::Debug, Level::Warn] {
-            assert_eq!(client.response_log_level(), expected);
+        for (status, expected) in [
+            (HttpStatus::BadRequest, Level::Warn),
+            (HttpStatus::Ok, Level::Warn),
+            (HttpStatus::Ok, Level::Debug),
+            (HttpStatus::Ok, Level::Warn),
+        ] {
+            assert_eq!(client.response_log_level(status), expected);
         }
     }
 
@@ -177,6 +187,6 @@ mod tests {
         let mut client = EventsClient::unencrypted();
         let request = RtspRequest::with_payload(RtspMethod::Post, "/command", &b"invalid plist"[..]);
         assert_eq!(client.request_log_level(&request), Level::Warn);
-        assert_eq!(client.response_log_level(), Level::Warn);
+        assert_eq!(client.response_log_level(HttpStatus::Ok), Level::Warn);
     }
 }

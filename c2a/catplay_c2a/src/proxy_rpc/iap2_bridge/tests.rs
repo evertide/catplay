@@ -408,20 +408,85 @@ fn slow_phone_keeps_each_sentence_type_after_a_cancelled_wait() {
     assert!(phone.wait_event().now_or_never().is_none());
 }
 
+async fn tick(client: &mut AsyncClient) {
+    let _ = client.sleep().now_or_never();
+    EventReconciler::reconcile(client).await.unwrap();
+}
+
+fn relay(drain: &mut AsyncClientDrain, client: &mut AsyncClient) {
+    let _ = drain.sleep().now_or_never();
+    if let Some(frame) = drain.take() {
+        assert!(frame.as_ref().len() <= 2048);
+        client.read_frame(&frame);
+    }
+}
+
+#[tokio::test]
+async fn merged_groups_are_split_through_the_default_2048_byte_link() {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    ready(&mut car, &car_out);
+    let phone_out = Arc::new(Capture::default());
+    let captured = phone_out.clone();
+    let peer_session = CsmSessionCallbacks::new(
+        async |handle| handle.send(&StartLocationInformation::all()),
+        move |packet, _| {
+            captured.0.lock().unwrap().push(packet);
+            async { Ok(()) }
+        },
+    );
+    let (mut client, mut outgoing) = AsyncClient::new(false, CsmRemote::airplay(), phone(location));
+    let (mut peer, mut incoming) = AsyncClient::new(true, CsmRemote::airplay(), Box::new(peer_session));
+    for _ in 0..100 {
+        tick(&mut client).await;
+        relay(&mut outgoing, &mut peer);
+        tick(&mut peer).await;
+        relay(&mut incoming, &mut client);
+    }
+    pump(&mut car, &car_out);
+    assert_eq!(car_out.location_commands().len(), 1);
+    assert_eq!(client.handle().max_csm_payload_len(), 2048 - 10 - 6);
+    phone_out.take();
+
+    // Each group has 1,200 payload bytes; merging them would produce a 2,416-byte frame.
+    let gsv = LocationInformation {
+        nmea_sentence: (1..=2)
+            .map(|part| format!("$GPGSV,2,{part},{}", "x".repeat(584)))
+            .collect(),
+    };
+    let rmc = LocationInformation {
+        nmea_sentence: vec![format!("$GPRMC,{}", "x".repeat(1188))],
+    };
+    let registry = CsmPacketRegistry::static_registry();
+    for group in [&gsv, &rmc] {
+        assert_eq!(registry.encode(group).unwrap().len(), 1206);
+    }
+    let mut merged = gsv.clone();
+    merged.nmea_sentence.extend(rmc.nmea_sentence.clone());
+    assert_eq!(registry.encode(&merged).unwrap().len() + 10, 2416);
+
+    for expected in [vec![gsv, rmc], vec![sample()]] {
+        for group in &expected {
+            respond(&mut car, &car_out, group.clone());
+        }
+        for _ in 0..100 {
+            tick(&mut client).await;
+            relay(&mut outgoing, &mut peer);
+            tick(&mut peer).await;
+            relay(&mut incoming, &mut client);
+        }
+        let packets = phone_out.take();
+        assert_eq!(packets.len(), expected.len());
+        for (packet, expected) in packets.iter().zip(&expected) {
+            assert_eq!(packet.cast::<LocationInformation>(), Some(expected));
+        }
+        assert!(!client.handle().has_pending_send());
+    }
+}
+
 #[tokio::test]
 async fn delayed_rtsp_response_keeps_new_fixes_in_the_accumulator() {
-    async fn tick(client: &mut AsyncClient) {
-        let _ = client.sleep().now_or_never();
-        EventReconciler::reconcile(client).await.unwrap();
-    }
-
-    fn relay(drain: &mut AsyncClientDrain, client: &mut AsyncClient) {
-        let _ = drain.sleep().now_or_never();
-        if let Some(frame) = drain.take() {
-            client.read_frame(&frame);
-        }
-    }
-
     let location = LocationBridge::default();
     let mut car = CarPlayClientSession::with_location(location.clone());
     let car_out = Arc::new(Capture::default());
@@ -626,9 +691,9 @@ fn replacing_a_request_discards_old_fixes_without_cancelling_the_new_subscriptio
     drop(first);
     pump(&mut car, &car_out);
     assert!(car_out.take().is_empty());
-    assert!(second.take().is_none());
+    assert!(second.take(2048 - 16).is_none());
     respond(&mut car, &car_out, sample());
-    assert_eq!(second.take(), Some(sample()));
+    assert_eq!(second.take(2048 - 16), Some(sample()));
     drop(second);
     pump(&mut car, &car_out);
     let commands = car_out.location_commands();

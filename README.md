@@ -85,13 +85,15 @@ Only data types supported by both sides are requested; power messages are indepe
 
 The accumulator merges pending updates by sentence type and holds at most 16 types.
 GPS waits for transport completion before taking the next update. Merged payloads
-are split at sentence group boundaries with a 60 KiB budget per message; a single
-group exceeding that budget is dropped.
+are split at sentence group boundaries to fit the peer's iAP2 packet limit minus
+16 bytes of iAP2/CSM framing, capped at 60 KiB per message; a single group exceeding
+that budget is dropped.
 Bluetooth disconnects do not interrupt forwarding. An iPhone Stop request or AirPlay
 teardown cancels it, and a replacement USB session repeats car negotiation.
 AirPlay GPS endpoint errors leave audio and video running. INFO logs report identification,
 negotiation gates, subscription changes and rejections, and the first received and
-forwarded location. Per-packet AirPlay iAP2 command dumps use DEBUG.
+forwarded location. Routine AirPlay iAP2 command dumps use DEBUG; unsuccessful
+response summaries remain at WARN.
 
 ## Known limitations
 - car GPS compatibility depends on the head unit exposing iAP2 location data

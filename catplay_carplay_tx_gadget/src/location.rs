@@ -131,7 +131,8 @@ impl EventSleeper for LocationSubscription {
 }
 
 impl LocationSubscription {
-    pub fn take(&mut self) -> Option<LocationInformation> {
+    pub fn take(&mut self, max_payload_bytes: usize) -> Option<LocationInformation> {
+        let max_payload_bytes = max_payload_bytes.min(MAX_LOCATION_PAYLOAD_BYTES);
         let updates = self.updates.as_mut()?;
         let mut buffer = self.buffer.lock().unwrap();
         if !self.pending && !updates.has_changed().unwrap_or(false) {
@@ -142,7 +143,12 @@ impl LocationSubscription {
         let mut payload_bytes = 0;
         while let Some((_, sentences)) = buffer.first_key_value() {
             let group_bytes = sentence_group_size(sentences);
-            if payload_bytes + group_bytes > MAX_LOCATION_PAYLOAD_BYTES {
+            if group_bytes > max_payload_bytes {
+                // An indivisible group that cannot fit must not block later updates.
+                buffer.pop_first();
+                continue;
+            }
+            if payload_bytes + group_bytes > max_payload_bytes {
                 break;
             }
             payload_bytes += group_bytes;
@@ -368,15 +374,15 @@ mod tests {
         let (mut subscription, updates) = subscription();
         let first = sentences(&["$GPGGA,1*00\r\n", "$GPRMC,1*00\r\n"]);
         updates.push(&first);
-        assert_eq!(subscription.take(), Some(first));
+        assert_eq!(subscription.take(usize::MAX), Some(first));
         assert!(subscription.sleep().now_or_never().is_none());
 
         let rmc = sentences(&["$GPRMC,1*00\r\n"]);
         for _ in 0..2 {
             updates.push(&rmc);
             assert!(subscription.sleep().now_or_never().flatten().is_some());
-            assert_eq!(subscription.take(), Some(rmc.clone()));
-            assert!(subscription.take().is_none());
+            assert_eq!(subscription.take(usize::MAX), Some(rmc.clone()));
+            assert!(subscription.take(usize::MAX).is_none());
             assert!(subscription.sleep().now_or_never().is_none());
         }
     }
@@ -389,14 +395,14 @@ mod tests {
             updates.push(&sentences(&[&format!("$P{kind:04},1*00\r\n")]));
         }
         updates.push(&sentences(&["$GPGGA,2*00\r\n"]));
-        let buffered = subscription.take().unwrap();
+        let buffered = subscription.take(usize::MAX).unwrap();
         assert_eq!(buffered.nmea_sentence.len(), MAX_PENDING_SENTENCE_TYPES);
         assert_eq!(buffered.nmea_sentence[0], "$GPGGA,2*00\r\n");
 
         // Taking an update frees all slots, including for previously unseen types.
         let rmc = sentences(&["$GPRMC,1*00\r\n"]);
         updates.push(&rmc);
-        assert_eq!(subscription.take(), Some(rmc));
+        assert_eq!(subscription.take(usize::MAX), Some(rmc));
     }
 
     #[test]
@@ -405,10 +411,10 @@ mod tests {
         updates.push(&sentences(&["$GPGSV,2,1,old*00\r\n", "$GPGSV,2,2,old*00\r\n", "$GPRMC,1*00\r\n"]));
         updates.push(&sentences(&["$GPGSV,2,1,new*00\r\n", "$GPGSV,2,2,new*00\r\n"]));
         assert_eq!(
-            subscription.take(),
+            subscription.take(usize::MAX),
             Some(sentences(&["$GPGSV,2,1,new*00\r\n", "$GPGSV,2,2,new*00\r\n", "$GPRMC,1*00\r\n"])),
         );
-        assert!(subscription.take().is_none());
+        assert!(subscription.take(usize::MAX).is_none());
     }
 
     #[test]
@@ -430,7 +436,7 @@ mod tests {
 
         for expected in [gsv, rmc] {
             assert!(subscription.sleep().now_or_never().flatten().is_some());
-            let batch = subscription.take().unwrap();
+            let batch = subscription.take(usize::MAX).unwrap();
             assert_eq!(batch, expected);
             let encoded = registry.encode(&batch).unwrap();
             assert!(encoded.len() <= MAX_LOCATION_PAYLOAD_BYTES + 6);
@@ -442,43 +448,49 @@ mod tests {
                 Some(&batch)
             );
         }
-        assert!(subscription.take().is_none());
+        assert!(subscription.take(usize::MAX).is_none());
         assert!(subscription.sleep().now_or_never().is_none());
     }
 
     #[test]
     fn payload_budget_counts_tlv_headers_nul_terminators_and_utf8_bytes() {
-        let (mut subscription, updates) = subscription();
-        let prefix = "$GPGGA,\u{00e9}";
-        let padding = "x".repeat(MAX_LOCATION_PAYLOAD_BYTES - prefix.len() - 5);
-        let exact = sentences(&[&format!("{prefix}{padding}")]);
-        let next = sentences(&["$GPRMC,next"]);
-        updates.push(&exact);
-        updates.push(&next);
-        let batch = subscription.take().unwrap();
-        assert_eq!(batch, exact);
-        assert_eq!(
-            CsmPacketRegistry::static_registry()
-                .encode(&batch)
-                .unwrap()
-                .len(),
-            MAX_LOCATION_PAYLOAD_BYTES + 6
-        );
-        assert_eq!(subscription.take(), Some(next));
+        for budget in [2048 - 16, MAX_LOCATION_PAYLOAD_BYTES] {
+            let (mut subscription, updates) = subscription();
+            let prefix = "$GPGGA,\u{00e9}";
+            let padding = "x".repeat(budget - prefix.len() - 5);
+            let exact = sentences(&[&format!("{prefix}{padding}")]);
+            let next = sentences(&["$GPRMC,next"]);
+            updates.push(&exact);
+            updates.push(&next);
+            let batch = subscription.take(budget).unwrap();
+            assert_eq!(batch, exact);
+            assert_eq!(
+                CsmPacketRegistry::static_registry()
+                    .encode(&batch)
+                    .unwrap()
+                    .len(),
+                budget + 6
+            );
+            assert_eq!(subscription.take(budget), Some(next));
+        }
     }
 
     #[test]
     fn oversized_sentence_group_is_dropped_without_blocking_later_updates() {
-        let (mut subscription, updates) = subscription();
-        let prefix = "$GPGSV,";
-        let padding = "x".repeat(MAX_LOCATION_PAYLOAD_BYTES - prefix.len() - 4);
-        let oversized = sentences(&[&format!("{prefix}{padding}")]);
-        updates.push(&oversized);
-        assert!(subscription.take().is_none());
-        assert!(subscription.sleep().now_or_never().is_none());
-        let next = sentences(&["$GPGSV,1,1,new", "$GPRMC,new"]);
-        updates.push(&next);
-        assert_eq!(subscription.take(), Some(next));
+        for budget in [2048 - 16, MAX_LOCATION_PAYLOAD_BYTES] {
+            let (mut subscription, updates) = subscription();
+            let prefix = "$GPGSV,";
+            let padding = "x".repeat(budget - prefix.len() - 4);
+            let oversized = sentences(&[&format!("{prefix}{padding}")]);
+            updates.push(&oversized);
+            assert!(subscription.take(budget).is_none());
+            assert!(subscription.sleep().now_or_never().is_none());
+            let next = sentences(&["$GPRMC,new"]);
+            updates.push(&oversized);
+            updates.push(&next);
+            assert_eq!(subscription.take(budget), Some(next));
+            assert!(subscription.sleep().now_or_never().is_none());
+        }
     }
 
     #[test]
