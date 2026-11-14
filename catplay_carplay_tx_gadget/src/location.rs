@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Mutex, Weak,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use catplay_csm::{
@@ -14,7 +17,52 @@ use catplay_util::{EventSleeper, EventToken};
 use log::info;
 use tokio::sync::watch;
 
-type LocationRequest = (StartLocationInformation, watch::Sender<Option<LocationInformation>>);
+type LocationRequest = (StartLocationInformation, LocationUpdates);
+type PendingLocation = BTreeMap<String, Vec<String>>;
+
+// Covers the seven advertised types and alternate talker IDs without an unbounded backlog.
+const MAX_PENDING_SENTENCE_TYPES: usize = 16;
+// Leave room below the 65,529-byte CSM payload limit and for iAP2 framing.
+const MAX_LOCATION_PAYLOAD_BYTES: usize = 60 * 1024;
+
+fn sentence_group_size(sentences: &[String]) -> usize {
+    // Each sentence has a four-byte TLV header and a terminating NUL byte.
+    sentences.iter().map(|sentence| sentence.len() + 5).sum()
+}
+
+#[derive(Clone)]
+struct LocationUpdates {
+    changed: watch::Sender<()>,
+    buffer: Arc<Mutex<PendingLocation>>,
+}
+
+impl LocationUpdates {
+    fn push(&self, packet: &LocationInformation) {
+        let mut incoming = BTreeMap::<&str, Vec<String>>::new();
+        for sentence in &packet.nmea_sentence {
+            let kind = sentence.split_once(',').map_or("", |(kind, _)| kind);
+            incoming.entry(kind).or_default().push(sentence.clone());
+        }
+        if incoming.is_empty() {
+            return;
+        }
+
+        let mut buffer = self.buffer.lock().unwrap();
+        for (kind, sentences) in incoming {
+            // Keep same-type sentences from one message together (e.g. multipart GSV).
+            if sentence_group_size(&sentences) > MAX_LOCATION_PAYLOAD_BYTES {
+                continue;
+            }
+            if let Some(pending) = buffer.get_mut(kind) {
+                *pending = sentences;
+            } else if buffer.len() < MAX_PENDING_SENTENCE_TYPES {
+                buffer.insert(kind.into(), sentences);
+            }
+        }
+        // Publish under the buffer lock so take() cannot mark unseen data as read.
+        self.changed.send_replace(());
+    }
+}
 
 /// The current iPhone request, shared with each successive USB iAP2 session.
 /// Negotiation and the active car request remain local to the USB session.
@@ -44,20 +92,29 @@ impl LocationBridge {
     }
 
     pub fn subscribe(&self, request: StartLocationInformation) -> LocationSubscription {
-        let (tx, updates) = watch::channel(None);
-        self.request.send_replace(Some((request, tx)));
+        let (changed, updates) = watch::channel(());
+        let buffer = Arc::new(Mutex::new(PendingLocation::new()));
+        self.request.send_replace(Some((
+            request,
+            LocationUpdates {
+                changed,
+                buffer: buffer.clone(),
+            },
+        )));
         LocationSubscription {
             updates: Some(updates),
+            buffer,
             pending: false,
             request: self.request.clone(),
         }
     }
 }
 
-/// Keeps only the latest fix. Closing the receiver cancels its request and wakes
-/// every USB session, including briefly overlapping sessions during reconnects.
+/// Keeps the latest unconsumed message per sentence type. Closing the receiver
+/// cancels its request and wakes every USB session, including overlapping reconnects.
 pub struct LocationSubscription {
-    updates: Option<watch::Receiver<Option<LocationInformation>>>,
+    updates: Option<watch::Receiver<()>>,
+    buffer: Arc<Mutex<PendingLocation>>,
     pending: bool,
     request: watch::Sender<Option<LocationRequest>>,
 }
@@ -74,13 +131,32 @@ impl EventSleeper for LocationSubscription {
 }
 
 impl LocationSubscription {
-    pub fn take(&mut self) -> Option<LocationInformation> {
+    pub fn take(&mut self, max_payload_bytes: usize) -> Option<LocationInformation> {
+        let max_payload_bytes = max_payload_bytes.min(MAX_LOCATION_PAYLOAD_BYTES);
         let updates = self.updates.as_mut()?;
+        let mut buffer = self.buffer.lock().unwrap();
         if !self.pending && !updates.has_changed().unwrap_or(false) {
             return None;
         }
-        self.pending = false;
-        updates.borrow_and_update().clone()
+        updates.borrow_and_update();
+        let mut nmea_sentence = Vec::new();
+        let mut payload_bytes = 0;
+        while let Some((_, sentences)) = buffer.first_key_value() {
+            let group_bytes = sentence_group_size(sentences);
+            if group_bytes > max_payload_bytes {
+                // An indivisible group that cannot fit must not block later updates.
+                buffer.pop_first();
+                continue;
+            }
+            if payload_bytes + group_bytes > max_payload_bytes {
+                break;
+            }
+            payload_bytes += group_bytes;
+            nmea_sentence.extend(buffer.pop_first().unwrap().1);
+        }
+        // A split batch stays ready even though the watch notification was consumed.
+        self.pending = !buffer.is_empty();
+        (!nmea_sentence.is_empty()).then_some(LocationInformation { nmea_sentence })
     }
 }
 
@@ -92,7 +168,7 @@ impl Drop for LocationSubscription {
         self.request.send_if_modified(|request| {
             if request
                 .as_ref()
-                .is_some_and(|(_, updates)| updates.is_closed())
+                .is_some_and(|(_, updates)| updates.changed.is_closed())
             {
                 *request = None;
                 true
@@ -110,6 +186,8 @@ pub(crate) struct CarLocation {
     started: bool,
     authenticated: bool,
     active: Option<StartLocationInformation>,
+    rejected: Option<StartLocationInformation>,
+    received_location: bool,
 }
 
 impl Default for CarLocation {
@@ -129,14 +207,20 @@ impl CarLocation {
             started: false,
             authenticated: false,
             active: None,
+            rejected: None,
+            received_location: false,
         }
     }
 
     pub fn start(&mut self, handle: &CsmClientHandleRef) {
         self.started = !handle.is_downgrade();
+        info!("Car GPS bridge started: iAP2={}", self.started);
     }
 
     pub fn authenticate(&mut self) {
+        if !self.authenticated {
+            info!("Car GPS authentication complete");
+        }
         self.authenticated = true;
     }
 
@@ -149,33 +233,67 @@ impl CarLocation {
         self.authenticated = false;
         self.supported
             .store(self.started && supports_location(id), Ordering::Relaxed);
+        info!(
+            "Car GPS identification complete: component={:?}, wants_rx(StartLocationInformation)={}, \
+             wants_rx(StopLocationInformation)={}, wants_tx(LocationInformation)={}, available={}",
+            id.location_information_component,
+            id.wants_rx(StartLocationInformation::PACKET_ID),
+            id.wants_rx(StopLocationInformation::PACKET_ID),
+            id.wants_tx(LocationInformation::PACKET_ID),
+            self.supported.load(Ordering::Relaxed),
+        );
         Ok(())
     }
 
     pub fn reconcile(&mut self, id: &IdentificationInformation, handle: &CsmClientHandleRef) -> CsmSessionResult<bool> {
-        let request = self.requests.borrow_and_update().clone();
+        let request = self
+            .requests
+            .borrow_and_update()
+            .as_ref()
+            .filter(|(_, updates)| !updates.changed.is_closed())
+            .map(|(request, _)| request.clone());
         // Authentication and explicit location capabilities are sufficient. Power
         // messages are independent and some cars advertise them without sending any.
         let wanted = request
-            .filter(|(_, updates)| !updates.is_closed() && self.authenticated && self.supported.load(Ordering::Relaxed))
-            .and_then(|(request, _)| intersect(&request, id.location_information_component.as_ref()));
+            .as_ref()
+            .filter(|_| self.authenticated && self.supported.load(Ordering::Relaxed))
+            .and_then(|request| intersect(request, id.location_information_component.as_ref()));
+        let rejected = request.filter(|_| self.authenticated && wanted.is_none());
+        if rejected != self.rejected {
+            if let Some(request) = &rejected {
+                info!(
+                    "Car GPS request rejected: empty or unsupported subscription, request={request:?}, component={:?}, available={}",
+                    id.location_information_component,
+                    self.supported.load(Ordering::Relaxed),
+                );
+            }
+            self.rejected = rejected;
+        }
         if wanted == self.active {
             return Ok(false);
         }
         self.stop(handle)?;
         if let Some(request) = wanted {
             handle.send(&request)?;
-            info!("Requested car location updates: {request:?}");
+            info!("Car GPS StartLocationInformation sent: {request:?}");
             self.active = Some(request);
         }
         Ok(true)
     }
 
-    pub fn forward(&self, packet: &LocationInformation) {
+    pub fn forward(&mut self, packet: &LocationInformation) {
+        if !self.received_location {
+            info!(
+                "Car GPS first LocationInformation received: sentences={}, active={}",
+                packet.nmea_sentence.len(),
+                self.active.is_some(),
+            );
+            self.received_location = true;
+        }
         if self.active.is_some()
             && let Some((_, updates)) = self.bridge.request.borrow().as_ref()
         {
-            updates.send_replace(Some(packet.clone()));
+            updates.push(packet);
         }
     }
 
@@ -232,6 +350,148 @@ fn intersect(request: &StartLocationInformation, component: Option<&LocationInfo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use catplay_csm::decoder::CsmPacketRegistry;
+    use futures::FutureExt;
+
+    fn subscription() -> (LocationSubscription, LocationUpdates) {
+        let bridge = LocationBridge::default();
+        let subscription = bridge.subscribe(StartLocationInformation::all());
+        let updates = bridge.request.borrow().as_ref().unwrap().1.clone();
+        (subscription, updates)
+    }
+
+    fn sentences(sentences: &[&str]) -> LocationInformation {
+        LocationInformation {
+            nmea_sentence: sentences
+                .iter()
+                .map(|sentence| (*sentence).into())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn consumed_types_are_not_replayed_but_identical_updates_are_delivered() {
+        let (mut subscription, updates) = subscription();
+        let first = sentences(&["$GPGGA,1*00\r\n", "$GPRMC,1*00\r\n"]);
+        updates.push(&first);
+        assert_eq!(subscription.take(usize::MAX), Some(first));
+        assert!(subscription.sleep().now_or_never().is_none());
+
+        let rmc = sentences(&["$GPRMC,1*00\r\n"]);
+        for _ in 0..2 {
+            updates.push(&rmc);
+            assert!(subscription.sleep().now_or_never().flatten().is_some());
+            assert_eq!(subscription.take(usize::MAX), Some(rmc.clone()));
+            assert!(subscription.take(usize::MAX).is_none());
+            assert!(subscription.sleep().now_or_never().is_none());
+        }
+    }
+
+    #[test]
+    fn pending_sentence_types_are_bounded_and_existing_types_still_update() {
+        let (mut subscription, updates) = subscription();
+        updates.push(&sentences(&["$GPGGA,1*00\r\n"]));
+        for kind in 0..1000 {
+            updates.push(&sentences(&[&format!("$P{kind:04},1*00\r\n")]));
+        }
+        updates.push(&sentences(&["$GPGGA,2*00\r\n"]));
+        let buffered = subscription.take(usize::MAX).unwrap();
+        assert_eq!(buffered.nmea_sentence.len(), MAX_PENDING_SENTENCE_TYPES);
+        assert_eq!(buffered.nmea_sentence[0], "$GPGGA,2*00\r\n");
+
+        // Taking an update frees all slots, including for previously unseen types.
+        let rmc = sentences(&["$GPRMC,1*00\r\n"]);
+        updates.push(&rmc);
+        assert_eq!(subscription.take(usize::MAX), Some(rmc));
+    }
+
+    #[test]
+    fn same_type_sentences_in_one_message_are_replaced_together() {
+        let (mut subscription, updates) = subscription();
+        updates.push(&sentences(&["$GPGSV,2,1,old*00\r\n", "$GPGSV,2,2,old*00\r\n", "$GPRMC,1*00\r\n"]));
+        updates.push(&sentences(&["$GPGSV,2,1,new*00\r\n", "$GPGSV,2,2,new*00\r\n"]));
+        assert_eq!(
+            subscription.take(usize::MAX),
+            Some(sentences(&["$GPGSV,2,1,new*00\r\n", "$GPGSV,2,2,new*00\r\n", "$GPRMC,1*00\r\n"])),
+        );
+        assert!(subscription.take(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn merged_payloads_are_split_without_splitting_sentence_groups() {
+        let (mut subscription, updates) = subscription();
+        let gsv = sentences(&[
+            &format!("$GPGSV,2,1,{}", "x".repeat(20_000)),
+            &format!("$GPGSV,2,2,{}", "x".repeat(20_000)),
+        ]);
+        let rmc = sentences(&[&format!("$GPRMC,{}", "x".repeat(40_000))]);
+        let registry = CsmPacketRegistry::static_registry();
+        assert!(registry.encode(&gsv).is_ok());
+        assert!(registry.encode(&rmc).is_ok());
+        let mut oversized = gsv.clone();
+        oversized.nmea_sentence.extend(rmc.nmea_sentence.clone());
+        assert!(registry.encode(&oversized).is_err());
+        updates.push(&gsv);
+        updates.push(&rmc);
+
+        for expected in [gsv, rmc] {
+            assert!(subscription.sleep().now_or_never().flatten().is_some());
+            let batch = subscription.take(usize::MAX).unwrap();
+            assert_eq!(batch, expected);
+            let encoded = registry.encode(&batch).unwrap();
+            assert!(encoded.len() <= MAX_LOCATION_PAYLOAD_BYTES + 6);
+            assert_eq!(
+                registry
+                    .decode(&encoded)
+                    .unwrap()
+                    .cast::<LocationInformation>(),
+                Some(&batch)
+            );
+        }
+        assert!(subscription.take(usize::MAX).is_none());
+        assert!(subscription.sleep().now_or_never().is_none());
+    }
+
+    #[test]
+    fn payload_budget_counts_tlv_headers_nul_terminators_and_utf8_bytes() {
+        for budget in [2048 - 16, MAX_LOCATION_PAYLOAD_BYTES] {
+            let (mut subscription, updates) = subscription();
+            let prefix = "$GPGGA,\u{00e9}";
+            let padding = "x".repeat(budget - prefix.len() - 5);
+            let exact = sentences(&[&format!("{prefix}{padding}")]);
+            let next = sentences(&["$GPRMC,next"]);
+            updates.push(&exact);
+            updates.push(&next);
+            let batch = subscription.take(budget).unwrap();
+            assert_eq!(batch, exact);
+            assert_eq!(
+                CsmPacketRegistry::static_registry()
+                    .encode(&batch)
+                    .unwrap()
+                    .len(),
+                budget + 6
+            );
+            assert_eq!(subscription.take(budget), Some(next));
+        }
+    }
+
+    #[test]
+    fn oversized_sentence_group_is_dropped_without_blocking_later_updates() {
+        for budget in [2048 - 16, MAX_LOCATION_PAYLOAD_BYTES] {
+            let (mut subscription, updates) = subscription();
+            let prefix = "$GPGSV,";
+            let padding = "x".repeat(budget - prefix.len() - 4);
+            let oversized = sentences(&[&format!("{prefix}{padding}")]);
+            updates.push(&oversized);
+            assert!(subscription.take(budget).is_none());
+            assert!(subscription.sleep().now_or_never().is_none());
+            let next = sentences(&["$GPRMC,new"]);
+            updates.push(&oversized);
+            updates.push(&next);
+            assert_eq!(subscription.take(budget), Some(next));
+            assert!(subscription.sleep().now_or_never().is_none());
+        }
+    }
 
     #[test]
     fn each_type_requires_both_flags_and_preserves_only_its_interval() {

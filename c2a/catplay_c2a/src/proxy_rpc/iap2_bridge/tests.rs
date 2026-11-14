@@ -2,15 +2,20 @@ use std::sync::{Arc, Mutex};
 
 use catplay_carplay::{
     carplay_rx::AirPlayReceiverSink,
+    events::CommandsClient,
     msg::{Command, CommandIApSendMessage},
-    rtsp_frame::{HttpStatus, RtspResponse},
+    rtsp_frame::{HttpStatus, RtspQueue, RtspResponse},
 };
 use catplay_carplay_tx_gadget::carplay_client_session::CarPlayClientSession;
 use catplay_csm::{
     decoder::{AsCsmPacket, CsmFlag, CsmPacketId, CsmPacketRegistry},
     msg::*,
 };
-use catplay_iap2_client::{CsmClientHandle, CsmRemote, CsmSessionStatus};
+use catplay_iap2_client::{
+    CsmClient, CsmClientHandle, CsmRemote, CsmSessionCallbacks, CsmSessionStatus,
+    tokio::{AsyncClient, AsyncClientDrain},
+};
+use catplay_util::{EventReconciler, EventSleeper};
 use futures::executor::block_on;
 
 use super::*;
@@ -292,6 +297,53 @@ fn stop_before_authentication_cancels_deferred_request() {
 }
 
 #[test]
+fn empty_or_unsupported_replacements_stop_gps_until_a_usable_request() {
+    for rejected in [
+        StartLocationInformation::default(),
+        StartLocationInformation {
+            vehicle_gyro_data: CsmFlag::Yes,
+            ..StartLocationInformation::default()
+        },
+    ] {
+        let location = LocationBridge::default();
+        let mut car = CarPlayClientSession::with_location(location.clone());
+        let mut phone = phone(location);
+        let car_out = Arc::new(Capture::default());
+        let phone_out = Arc::new(Capture::default());
+        ready(&mut car, &car_out);
+        respond(&mut phone, &phone_out, StartLocationInformation::all());
+        pump(&mut phone, &phone_out);
+        pump(&mut car, &car_out);
+        assert_eq!(car_out.location_commands().len(), 1);
+        respond(&mut car, &car_out, sample());
+
+        for expected_stops in [1, 0] {
+            respond(&mut phone, &phone_out, rejected.clone());
+            pump(&mut phone, &phone_out);
+            pump(&mut car, &car_out);
+            let commands = car_out.location_commands();
+            assert_eq!(commands.len(), expected_stops);
+            assert!(
+                commands
+                    .iter()
+                    .all(|packet| packet.cast::<StopLocationInformation>().is_some())
+            );
+            respond(&mut car, &car_out, sample());
+            assert!(phone.wait_event().now_or_never().is_none());
+            assert!(phone_out.take().is_empty());
+        }
+
+        respond(&mut phone, &phone_out, StartLocationInformation::all());
+        pump(&mut phone, &phone_out);
+        pump(&mut car, &car_out);
+        assert_eq!(car_out.location_commands().len(), 1);
+        respond(&mut car, &car_out, sample());
+        pump(&mut phone, &phone_out);
+        assert_eq!(phone_out.take()[0].cast::<LocationInformation>(), Some(&sample()));
+    }
+}
+
+#[test]
 fn replacement_usb_session_repeats_negotiation_for_the_live_iphone_request() {
     let location = LocationBridge::default();
     let mut car = CarPlayClientSession::with_location(location.clone());
@@ -317,7 +369,7 @@ fn replacement_usb_session_repeats_negotiation_for_the_live_iphone_request() {
 }
 
 #[test]
-fn slow_phone_receives_only_the_latest_fix_even_after_a_cancelled_wait() {
+fn slow_phone_keeps_each_sentence_type_after_a_cancelled_wait() {
     let location = LocationBridge::default();
     let mut car = CarPlayClientSession::with_location(location.clone());
     let mut phone = phone(location);
@@ -332,8 +384,21 @@ fn slow_phone_receives_only_the_latest_fix_even_after_a_cancelled_wait() {
     phone.wait_event().now_or_never().unwrap();
     let mut latest = sample();
     for counter in 0..1000 {
-        latest.nmea_sentence = vec![format!("$PASCD,{counter}*00\r\n").into()];
-        respond(&mut car, &car_out, latest.clone());
+        latest.nmea_sentence = vec![
+            format!("$GPGGA,{counter}*00\r\n"),
+            format!("$GPRMC,{counter}*00\r\n"),
+            format!("$PASCD,{counter}*00\r\n"),
+        ];
+        // Cars can send each sentence type in a separate LocationInformation.
+        for sentence in &latest.nmea_sentence {
+            respond(
+                &mut car,
+                &car_out,
+                LocationInformation {
+                    nmea_sentence: vec![sentence.clone()],
+                },
+            );
+        }
     }
     pump(&mut phone, &phone_out);
     let packets = phone_out.take();
@@ -341,6 +406,173 @@ fn slow_phone_receives_only_the_latest_fix_even_after_a_cancelled_wait() {
     assert_eq!(packets[0].cast::<LocationInformation>(), Some(&latest));
     assert!(!phone.process_event(phone_out.clone()).unwrap());
     assert!(phone.wait_event().now_or_never().is_none());
+}
+
+async fn tick(client: &mut AsyncClient) {
+    let _ = client.sleep().now_or_never();
+    EventReconciler::reconcile(client).await.unwrap();
+}
+
+fn relay(drain: &mut AsyncClientDrain, client: &mut AsyncClient) {
+    let _ = drain.sleep().now_or_never();
+    if let Some(frame) = drain.take() {
+        assert!(frame.as_ref().len() <= 2048);
+        client.read_frame(&frame);
+    }
+}
+
+#[tokio::test]
+async fn merged_groups_are_split_through_the_default_2048_byte_link() {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    ready(&mut car, &car_out);
+    let phone_out = Arc::new(Capture::default());
+    let captured = phone_out.clone();
+    let peer_session = CsmSessionCallbacks::new(
+        async |handle| handle.send(&StartLocationInformation::all()),
+        move |packet, _| {
+            captured.0.lock().unwrap().push(packet);
+            async { Ok(()) }
+        },
+    );
+    let (mut client, mut outgoing) = AsyncClient::new(false, CsmRemote::airplay(), phone(location));
+    let (mut peer, mut incoming) = AsyncClient::new(true, CsmRemote::airplay(), Box::new(peer_session));
+    for _ in 0..100 {
+        tick(&mut client).await;
+        relay(&mut outgoing, &mut peer);
+        tick(&mut peer).await;
+        relay(&mut incoming, &mut client);
+    }
+    pump(&mut car, &car_out);
+    assert_eq!(car_out.location_commands().len(), 1);
+    assert_eq!(client.handle().max_csm_payload_len(), 2048 - 10 - 6);
+    phone_out.take();
+
+    // Each group has 1,200 payload bytes; merging them would produce a 2,416-byte frame.
+    let gsv = LocationInformation {
+        nmea_sentence: (1..=2)
+            .map(|part| format!("$GPGSV,2,{part},{}", "x".repeat(584)))
+            .collect(),
+    };
+    let rmc = LocationInformation {
+        nmea_sentence: vec![format!("$GPRMC,{}", "x".repeat(1188))],
+    };
+    let registry = CsmPacketRegistry::static_registry();
+    for group in [&gsv, &rmc] {
+        assert_eq!(registry.encode(group).unwrap().len(), 1206);
+    }
+    let mut merged = gsv.clone();
+    merged.nmea_sentence.extend(rmc.nmea_sentence.clone());
+    assert_eq!(registry.encode(&merged).unwrap().len() + 10, 2416);
+
+    for expected in [vec![gsv, rmc], vec![sample()]] {
+        for group in &expected {
+            respond(&mut car, &car_out, group.clone());
+        }
+        for _ in 0..100 {
+            tick(&mut client).await;
+            relay(&mut outgoing, &mut peer);
+            tick(&mut peer).await;
+            relay(&mut incoming, &mut client);
+        }
+        let packets = phone_out.take();
+        assert_eq!(packets.len(), expected.len());
+        for (packet, expected) in packets.iter().zip(&expected) {
+            assert_eq!(packet.cast::<LocationInformation>(), Some(expected));
+        }
+        assert!(!client.handle().has_pending_send());
+    }
+}
+
+#[tokio::test]
+async fn delayed_rtsp_response_keeps_new_fixes_in_the_accumulator() {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    ready(&mut car, &car_out);
+    let phone_out = Arc::new(Capture::default());
+    let captured = phone_out.clone();
+    let peer_session = CsmSessionCallbacks::new(
+        async |handle| handle.send(&StartLocationInformation::all()),
+        move |packet, _| {
+            captured.0.lock().unwrap().push(packet);
+            async { Ok(()) }
+        },
+    );
+    let (mut client, mut outgoing) = AsyncClient::new(false, CsmRemote::airplay(), phone(location));
+    let (mut peer, mut incoming) = AsyncClient::new(true, CsmRemote::airplay(), Box::new(peer_session));
+    // Complete real iAP2 link negotiation and deliver the phone's subscription.
+    for _ in 0..100 {
+        tick(&mut client).await;
+        relay(&mut outgoing, &mut peer);
+        tick(&mut peer).await;
+        relay(&mut incoming, &mut client);
+    }
+    pump(&mut car, &car_out);
+    assert_eq!(car_out.location_commands().len(), 1);
+    assert!(!client.handle().has_pending_send());
+    phone_out.take();
+
+    respond(&mut car, &car_out, sample());
+    for _ in 0..10 {
+        tick(&mut client).await;
+        let _ = outgoing.sleep().now_or_never();
+    }
+    let (frame, permit) = outgoing.take_with_permit().expect("first location frame");
+    peer.read_frame(&frame);
+    let (queue, mut responses) = RtspQueue::fifo();
+    let mut response = Box::pin(
+        queue
+            .send_command(
+                &Command::IApSendMessage(CommandIApSendMessage {
+                    data: frame.into_inner().into(),
+                }),
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap(),
+    );
+    assert_eq!(responses.drain().len(), 1);
+
+    let mut latest = sample();
+    for counter in 0..1000 {
+        latest.nmea_sentence = vec![
+            format!("$GPGGA,{counter}"),
+            format!("$GPRMC,{counter}"),
+            format!("$PASCD,{counter}"),
+        ];
+        for sentence in &latest.nmea_sentence {
+            respond(
+                &mut car,
+                &car_out,
+                LocationInformation {
+                    nmea_sentence: vec![sentence.clone()],
+                },
+            );
+        }
+        tick(&mut client).await;
+        tick(&mut peer).await;
+        relay(&mut incoming, &mut client);
+        assert!(response.as_mut().now_or_never().is_none());
+        assert!(client.handle().has_pending_send());
+        assert!(outgoing.sleep().now_or_never().is_none());
+        assert!(outgoing.take().is_none());
+    }
+    assert_eq!(phone_out.take()[0].cast::<LocationInformation>(), Some(&sample()));
+    responses.feed(RtspResponse::new(None, HttpStatus::Ok));
+    response.await.unwrap();
+    drop(permit);
+
+    for _ in 0..100 {
+        tick(&mut client).await;
+        relay(&mut outgoing, &mut peer);
+        tick(&mut peer).await;
+        relay(&mut incoming, &mut client);
+    }
+    let packets = phone_out.take();
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].cast::<LocationInformation>(), Some(&latest));
+    assert!(!client.handle().has_pending_send());
 }
 
 #[test]
@@ -459,9 +691,9 @@ fn replacing_a_request_discards_old_fixes_without_cancelling_the_new_subscriptio
     drop(first);
     pump(&mut car, &car_out);
     assert!(car_out.take().is_empty());
-    assert!(second.take().is_none());
+    assert!(second.take(2048 - 16).is_none());
     respond(&mut car, &car_out, sample());
-    assert_eq!(second.take(), Some(sample()));
+    assert_eq!(second.take(2048 - 16), Some(sample()));
     drop(second);
     pump(&mut car, &car_out);
     let commands = car_out.location_commands();
@@ -499,6 +731,52 @@ fn iap2_command() -> Command {
     Command::IApSendMessage(CommandIApSendMessage {
         data: vec![1, 2, 3].into(),
     })
+}
+
+#[test]
+fn volvo_negotiation_waits_for_an_iphone_location_request() {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    block_on(car.start(car_out.clone())).unwrap();
+    // Message lists from the XC90 build 10 identification, including 0xFFFA/B/C.
+    respond(
+        &mut car,
+        &car_out,
+        IdentificationInformation {
+            messages_sent_by_accessory: IdentificationInformation::pack_ids(&[
+                16724, 16726, 16731, 16732, 43521, 43523, 43526, 44544, 44546, 44547, 65531, 16736, 20480, 20482, 16727, 16729,
+            ]),
+            messages_received_from_device: IdentificationInformation::pack_ids(&[
+                16725, 19982, 43520, 43525, 43524, 43522, 44545, 65530, 65532, 19979, 20481, 16728,
+            ]),
+            ..car_id()
+        },
+    );
+    respond(&mut car, &car_out, AuthenticationResponse::default());
+    assert!(location.is_available());
+
+    let (mut sink, _proxy) = airplay_sink(location, Some(wireless_identity()));
+    let mut endpoint = sink.open_iap2().now_or_never().unwrap().unwrap();
+    let phone_out = Arc::new(Capture::default());
+    respond(&mut endpoint, &phone_out, StartIdentification::default());
+    let packets = phone_out.take();
+    let id = packets[0].cast::<IdentificationInformation>().unwrap();
+    assert!(id.location_information_component.is_some());
+    assert!(id.wants_tx(LocationInformation::PACKET_ID));
+    assert!(id.wants_rx(StartLocationInformation::PACKET_ID));
+    assert!(id.wants_rx(StopLocationInformation::PACKET_ID));
+    respond(&mut endpoint, &phone_out, IdentificationAccepted::default());
+    respond(&mut endpoint, &phone_out, AuthenticationSucceeded::default());
+    assert!(!car.process_event(car_out.clone()).unwrap());
+    assert!(car_out.location_commands().is_empty());
+
+    respond(&mut endpoint, &phone_out, StartLocationInformation::all());
+    pump(&mut endpoint, &phone_out);
+    pump(&mut car, &car_out);
+    let commands = car_out.location_commands();
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].cast::<StartLocationInformation>().is_some());
 }
 
 fn assert_proxied(sink: &mut CarPlayRxSession, proxy: &mut mpsc::UnboundedReceiver<TxAdapterOp>) {

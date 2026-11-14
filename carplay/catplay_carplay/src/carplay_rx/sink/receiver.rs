@@ -3,7 +3,7 @@ use catplay_hap::{HomekitStorage, HomekitStorageRef};
 
 use catplay_iap2_client::{
     CsmRemote,
-    tokio::{AsyncClient, AsyncClientDrain},
+    tokio::{AsyncClient, AsyncClientDrain, AsyncClientTxPermit},
 };
 use catplay_mfi::MfiDevice;
 use catplay_plist::CachingSerializer;
@@ -148,7 +148,9 @@ struct Streams {
     iap2_drain: Option<AsyncClientDrain>,
     #[sleep]
     iap2_commands: FuturesUnordered<RtspFuture>,
+    iap2_tx_permit: Option<AsyncClientTxPermit>,
     iap2_optional: bool,
+    received_iap2: bool,
 
     handle: Option<AirPlayReceiverHandleRef>,
 }
@@ -161,6 +163,7 @@ impl Streams {
                 self.iap2 = None;
                 self.iap2_drain = None;
                 self.iap2_commands = Default::default();
+                self.iap2_tx_permit = None;
                 Ok(())
             }
             result => result,
@@ -175,6 +178,7 @@ impl Streams {
             .map_err(AirPlayReceiverSessionError::IAp2);
         self.iap2_result(result)?;
         if let Some(response) = self.iap2_commands.take() {
+            self.iap2_tx_permit = None;
             let result = response.and_then(|response| {
                 if response.status == HttpStatus::Ok {
                     Ok(())
@@ -630,6 +634,7 @@ impl AirPlayReceiver {
         let (client, drain) = AsyncClient::new(false, CsmRemote::airplay(), _sink);
         self.streams.iap2_drain.replace(drain);
         self.streams.iap2.replace(client);
+        info!("AirPlay iAP2 endpoint opened: optional={}", self.streams.iap2_optional);
     }
 
     async fn flush_iap2(&mut self) -> RtspResult<()> {
@@ -639,13 +644,16 @@ impl AirPlayReceiver {
             && self.streams.iap2_commands.peek().is_none()
             && let Some(handle) = self.streams.handle.as_mut()
             && let Some(drain) = self.streams.iap2_drain.as_mut()
-            && let Some(packet) = drain.take()
+            && let Some((packet, permit)) = drain.take_with_permit()
         {
             debug!("Forwarding iAP2 packet");
             match handle.send_command(Command::IApSendMessage(CommandIApSendMessage {
                 data: packet.into_inner().into(),
             })) {
-                Ok(future) if self.streams.iap2_optional => self.streams.iap2_commands.push(future),
+                Ok(future) if self.streams.iap2_optional => {
+                    self.streams.iap2_tx_permit = Some(permit);
+                    self.streams.iap2_commands.push(future);
+                }
                 Ok(_) => {}
                 Err(err) if self.streams.iap2_optional => {
                     self.streams
@@ -1031,6 +1039,16 @@ impl AirPlayReceiver {
     }
 
     async fn handle_command(&mut self, cmd: Command) -> RtspResult<RtspResponse> {
+        if let Command::IApSendMessage(message) = &cmd
+            && !self.streams.received_iap2
+        {
+            info!(
+                "First AirPlay iAPSendMessage received: bytes={}, local_endpoint={}",
+                message.data.len(),
+                self.streams.iap2.is_some(),
+            );
+            self.streams.received_iap2 = true;
+        }
         self.sink.on_command_raw(&cmd).await?;
 
         match cmd {
@@ -1069,7 +1087,7 @@ impl AirPlayReceiver {
 mod iap2_tests {
     use super::*;
     use catplay_csm::decoder::CsmPacketBox;
-    use catplay_iap2_client::{CsmClientHandleRef, CsmSession, CsmSessionError, CsmSessionResult};
+    use catplay_iap2_client::{CsmClient, CsmClientHandleRef, CsmSession, CsmSessionError, CsmSessionResult};
     use futures::{FutureExt, executor::block_on};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1175,6 +1193,19 @@ mod iap2_tests {
     #[test]
     fn pending_iap2_response_does_not_block_reconciliation() {
         let (mut streams, dropped) = endpoint(true, false);
+        for _ in 0..10 {
+            let _ = streams.iap2.sleep().now_or_never();
+            block_on(streams.reconcile()).unwrap();
+            let _ = streams.iap2_drain.sleep().now_or_never();
+        }
+        let (_, permit) = streams
+            .iap2_drain
+            .as_mut()
+            .unwrap()
+            .take_with_permit()
+            .unwrap();
+        let handle = streams.iap2.as_ref().unwrap().handle();
+        streams.iap2_tx_permit = Some(permit);
         let (queue, drain) = RtspQueue::fifo();
         streams
             .iap2_commands
@@ -1187,6 +1218,7 @@ mod iap2_tests {
             .unwrap();
         assert!(streams.event_rtsp.is_some());
         assert!(!dropped.load(Ordering::Relaxed));
+        assert!(handle.has_pending_send());
 
         drain.feed(RtspResponse::new(None, HttpStatus::Ok));
         assert!(
@@ -1202,6 +1234,7 @@ mod iap2_tests {
         assert!(streams.iap2_drain.is_some());
         assert!(streams.iap2_commands.is_empty());
         assert!(streams.iap2_commands.peek().is_none());
+        assert!(!handle.has_pending_send());
         assert!(!dropped.load(Ordering::Relaxed));
     }
 }

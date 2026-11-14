@@ -77,29 +77,23 @@ If you have a spare Aston Martin 2025 with CarPlay Ultra collecting dust, please
 
 ## Car GPS forwarding
 
-Carplay2Air forwards car location updates over the AirPlay iAP2 channel for the
-lifetime of wireless CarPlay. Bluetooth still handles pairing and Wi-Fi setup;
-its expected disconnect after `DisableBluetooth` does not end the GPS feed.
-There is no GPS configuration switch.
+Carplay2Air forwards car NMEA location data to the iPhone over AirPlay iAP2.
+The car must advertise a location component, send `LocationInformation`, and accept
+`StartLocationInformation` and `StopLocationInformation`. Forwarding starts when
+the iPhone requests it and car identification and authentication are complete.
+Only data types supported by both sides are requested; power messages are independent.
 
-The local endpoint is opened only when the current USB car session advertises a
-location component with a supported data type, accepts both `StartLocationInformation`
-and `StopLocationInformation`, and lists `LocationInformation` among the messages
-it sends. Cars without these capabilities keep the existing command proxy path.
-The bridge waits for an iPhone location request and car identification/authentication,
-but does not wait for power messages: some cars advertise them without sending them.
-Existing power replies are unchanged. Requested data types are intersected with the
-car's capabilities, and only the latest unconsumed location packet is retained.
-
-The endpoint starts without waiting for GPS, power, or an extra handshake during
-connection setup. Its errors stop GPS without tearing down audio/video. An iPhone
-Stop request or AirPlay teardown cancels the feed; a replacement USB session repeats
-identification/authentication for the live AirPlay request. No lock is held across
-an await in the bridge.
-
-Build-server and vehicle validation should check that location packets continue
-in AirPlay after `DisableBluetooth`, that Stop is sent on AirPlay teardown, and
-that connection timing and command routing remain unchanged on a car without GPS.
+The accumulator merges pending updates by sentence type and holds at most 16 types.
+GPS waits for transport completion before taking the next update. Merged payloads
+are split at sentence group boundaries to fit the peer's iAP2 packet limit minus
+16 bytes of iAP2/CSM framing, capped at 60 KiB per message; a single group exceeding
+that budget is dropped.
+Bluetooth disconnects do not interrupt forwarding. An iPhone Stop request or AirPlay
+teardown cancels it, and a replacement USB session repeats car negotiation.
+AirPlay GPS endpoint errors leave audio and video running. INFO logs report identification,
+negotiation gates, subscription changes and rejections, and the first received and
+forwarded location. Routine AirPlay iAP2 command dumps use DEBUG; unsuccessful
+response summaries remain at WARN.
 
 ## Known limitations
 - car GPS compatibility depends on the head unit exposing iAP2 location data

@@ -1,13 +1,16 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
 use bytes::BytesMut;
 use catplay_csm::decoder::{AsCsmPacket, CsmPacketBox, CsmPacketRegistry};
 use catplay_iap2_link::{
-    LinkEvent, LinkLayer, LinkStatus, PacketCoder, PacketFrame,
+    LinkEvent, LinkLayer, LinkSession, LinkStatus, PacketCoder, PacketFrame,
     files::{FileTransferEvent, FileTransferOutgoingSource, FileTransferReserved},
 };
 use catplay_lingo::{
@@ -43,7 +46,7 @@ pub struct AsyncClient {
 
     rx_buf: BytesMut,
 
-    send: mpsc::UnboundedSender<(PacketFrame<Vec<u8>>, oneshot::Sender<()>)>,
+    send: mpsc::UnboundedSender<(PacketFrame<Vec<u8>>, AsyncClientTxPermit)>,
     session: Box<dyn CsmSession>,
 
     had_init: bool,
@@ -63,6 +66,7 @@ pub struct AsyncClient {
     /// no further iAP2 packets will be generated for the drain.
     #[sleep]
     pending_tx: Option<oneshot::PeekReceiver<()>>,
+    tx_pending: Arc<AtomicUsize>,
 }
 
 pub struct AsyncHandle {
@@ -72,6 +76,7 @@ pub struct AsyncHandle {
     status: Arc<Mutex<CsmSessionStatus>>,
     link: Arc<Mutex<LinkLayer>>,
     lingo: Arc<Mutex<LingoLinkLayer>>,
+    tx_pending: Arc<AtomicUsize>,
 }
 
 impl CsmClientHandle for AsyncHandle {
@@ -145,6 +150,18 @@ impl CsmClientHandle for AsyncHandle {
         Ok(())
     }
 
+    fn has_pending_send(&self) -> bool {
+        self.link.lock().unwrap().csm().has_tx_pending() || self.tx_pending.load(Ordering::Relaxed) != 0
+    }
+
+    fn max_csm_payload_len(&self) -> usize {
+        self.link
+            .lock()
+            .unwrap()
+            .max_payload_len()
+            .saturating_sub(6)
+    }
+
     fn send_lingo(&self, outgoing: Outgoing) -> CsmSessionResult<()> {
         let mut link = self.link.lock().unwrap();
         if !link.is_downgrade() {
@@ -199,16 +216,33 @@ impl AsyncShutdown for AsyncClient {}
 #[derive(EventSleeper)]
 pub struct AsyncClientDrain {
     #[sleep]
-    receiver: mpsc::UnboundedReceiver<(PacketFrame<Vec<u8>>, oneshot::Sender<()>)>,
+    receiver: mpsc::UnboundedReceiver<(PacketFrame<Vec<u8>>, AsyncClientTxPermit)>,
+}
+
+/// Dropping the permit marks a frame as sent and wakes the client.
+pub struct AsyncClientTxPermit {
+    _sender: oneshot::Sender<()>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Drop for AsyncClientTxPermit {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl AsyncClientDrain {
-    fn new(receiver: mpsc::UnboundedReceiver<(PacketFrame<Vec<u8>>, oneshot::Sender<()>)>) -> Self {
+    fn new(receiver: mpsc::UnboundedReceiver<(PacketFrame<Vec<u8>>, AsyncClientTxPermit)>) -> Self {
         Self { receiver }
     }
 
     pub fn take(&mut self) -> Option<PacketFrame<Vec<u8>>> {
-        self.receiver.take().map(|(packet, _os)| packet)
+        self.take_with_permit().map(|(packet, _permit)| packet)
+    }
+
+    /// Retain the permit until the transport finishes sending this frame.
+    pub fn take_with_permit(&mut self) -> Option<(PacketFrame<Vec<u8>>, AsyncClientTxPermit)> {
+        self.receiver.take()
     }
 }
 
@@ -224,7 +258,12 @@ impl AsyncClient {
         let (link_events_tx, link_events_rx) = mpsc::unbounded();
         let notify = Notify::new();
 
+        let tx_pending = Arc::new(AtomicUsize::new(0));
+        let link_tx_pending = tx_pending.clone();
         let link = Arc::new(Mutex::new(LinkLayer::new(server, move |ev| {
+            if matches!(&ev, LinkEvent::Write(_)) {
+                link_tx_pending.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = link_events_tx.unbounded_send(ev);
         })));
         let lingo = Arc::new(Mutex::new(LingoLinkLayer::with_role(server)));
@@ -239,6 +278,7 @@ impl AsyncClient {
             status: status.clone(),
             link: link.clone(),
             lingo: lingo.clone(),
+            tx_pending: tx_pending.clone(),
         });
 
         (
@@ -260,6 +300,7 @@ impl AsyncClient {
                 deadline: None,
                 link_events_rx,
                 pending_tx: None,
+                tx_pending,
                 files: Default::default(),
             },
             AsyncClientDrain::new(tx.1),
@@ -432,7 +473,11 @@ impl AsyncClient {
 
                     let (os_tx, os_rx) = oneshot::channel();
                     let frame = PacketFrame::new(Some(self.tx_counter), b.into());
-                    if self.send.unbounded_send((frame, os_tx)).is_err() {
+                    let permit = AsyncClientTxPermit {
+                        _sender: os_tx,
+                        pending: self.tx_pending.clone(),
+                    };
+                    if self.send.unbounded_send((frame, permit)).is_err() {
                         return Err(CsmSessionError::DrainClosed)?;
                     };
                     self.pending_tx.replace(os_rx);
