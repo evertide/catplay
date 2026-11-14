@@ -388,6 +388,7 @@ impl CarManager {
             TxAdapterOp::IphoneDisconnected => {
                 self.on_peer_disconnect();
             }
+            TxAdapterOp::InvitingIphone(inviting) => self.overlay.set_inviting_iphone(inviting),
             TxAdapterOp::ScreenChannel { channel } => {
                 debug!("iPhone: screen");
                 self.overlay.set_iphone_peer_screen(Some(channel));

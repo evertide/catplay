@@ -24,6 +24,8 @@ pub enum TxAdapterOp {
         handle: AirPlayReceiverHandleRef,
     },
     IphoneDisconnected,
+    /// The wireless side is up and inviting the iPhone (Bluetooth paging, Wi-Fi/Bonjour advertised).
+    InvitingIphone(bool),
     ScreenChannel {
         channel: mpsc::UnboundedReceiver<ScreenProxyOp>,
     },

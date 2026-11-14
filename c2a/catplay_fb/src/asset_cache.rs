@@ -5,7 +5,7 @@ use image::{ImageError, RgbaImage};
 use log::debug;
 use turbojpeg::PixelFormat;
 
-use crate::{FontRenderer, Surface};
+use crate::{Canvas, FontRenderer, Surface};
 
 const JPEG_MAGIC: &[u8; 3] = &[0xFF, 0xD8, 0xFF];
 
@@ -13,6 +13,7 @@ pub struct AssetCache {
     img_originals: HashMap<String, Surface>,
 
     img_scaled: HashMap<(String, u32, u32), Surface>,
+    img_cover: HashMap<(String, u32, u32), Surface>,
 
     fonts: HashMap<String, FontArc>,
     fonts_cache: HashMap<(String, u32), FontRenderer>,
@@ -30,6 +31,8 @@ pub enum AssetCacheError {
     InvalidFont(#[from] InvalidFont),
     #[error("Asset not found: {0}")]
     AssetNotFound(String),
+    #[error("Not a JPEG image")]
+    NotJpeg,
 }
 
 impl AssetCache {
@@ -37,6 +40,7 @@ impl AssetCache {
         Self {
             img_originals: HashMap::new(),
             img_scaled: HashMap::new(),
+            img_cover: HashMap::new(),
             fonts: HashMap::new(),
             fonts_cache: HashMap::new(),
         }
@@ -81,6 +85,7 @@ impl AssetCache {
     pub fn release_img(&mut self, id: &str) {
         self.img_originals.retain(|k, _v| k != id);
         self.img_scaled.retain(|k, _v| k.0 != id);
+        self.img_cover.retain(|k, _v| k.0 != id);
         debug!("Releasing asset {id}");
     }
 
@@ -88,6 +93,56 @@ impl AssetCache {
         self.fonts.retain(|k, _v| *k != id);
         self.fonts_cache.retain(|k, _v| k.0 != id);
         debug!("Releasing font {id}");
+    }
+
+    /// Reads a JPEG's dimensions from its header, without decoding the pixels.
+    pub fn jpeg_dimensions(buf: &[u8]) -> Result<(u32, u32), AssetCacheError> {
+        if !buf.starts_with(JPEG_MAGIC) {
+            return Err(AssetCacheError::NotJpeg);
+        }
+        let header = turbojpeg::read_header(buf)?;
+        Ok((header.width as u32, header.height as u32))
+    }
+
+    /// The image scaled to cover `w`x`h` (aspect kept, overflow cropped evenly).
+    ///
+    /// Only the visible part of the original is sampled, so memory stays at the output size.
+    pub fn get_cover(&mut self, id: String, w: u32, h: u32) -> Result<&Surface, AssetCacheError> {
+        let key = (id.clone(), w, h);
+
+        if !self.img_cover.contains_key(&key) {
+            let orig = self
+                .img_originals
+                .get(&id)
+                .ok_or_else(|| AssetCacheError::AssetNotFound(id.clone()))?;
+            let (iw, ih) = (orig.width.max(1) as u64, orig.height.max(1) as u64);
+            let (fw, fh) = (w.max(1) as u64, h.max(1) as u64);
+            // Largest centred source region with the frame's aspect ratio.
+            // (`w` and `h` are at least 1: callers pass the frame size.)
+            let (cw, ch) = if iw * fh > ih * fw {
+                (ih * fw / fh, ih)
+            } else {
+                (iw, iw * fh / fw)
+            };
+            let (cw, ch) = (cw.max(1) as u32, ch.max(1) as u32);
+            let (x, y) = ((iw as u32 - cw) / 2, (ih as u32 - ch) / 2);
+
+            // Nearest-neighbour sampling straight into the output surface.
+            let src = orig.rgba_u32();
+            let src_stride = orig.width as usize;
+            let mut out = Surface::new(w as i32, h as i32);
+            let dst = out.as_rgba_u32();
+            for oy in 0..h as usize {
+                let sy = y as usize + oy * ch as usize / h as usize;
+                for ox in 0..w as usize {
+                    let sx = x as usize + ox * cw as usize / w as usize;
+                    dst[oy * w as usize + ox] = src[sy * src_stride + sx];
+                }
+            }
+            self.img_cover.insert(key.clone(), out);
+        }
+
+        Ok(self.img_cover.get(&key).unwrap())
     }
 
     pub fn get_scaled(&mut self, id: String, w: u32, h: u32) -> Result<&Surface, AssetCacheError> {

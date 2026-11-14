@@ -57,6 +57,8 @@ pub struct ProdGadget {
 
     last_tx: Arc<Mutex<Option<ProdGadgetSession>>>,
     location: LocationBridge,
+    // Last invite phase sent to the car session (for its waiting screen); None = not sent yet
+    inviting_sent: Option<bool>,
     burst_wakeups: bool,
 }
 
@@ -117,6 +119,7 @@ impl ProdGadget {
                 pending_transmitter: Default::default(),
                 last_tx: Default::default(),
                 location: Default::default(),
+                inviting_sent: None,
                 burst_wakeups: false,
             },
             Ok(ProdGadgetState::Initial),
@@ -283,11 +286,24 @@ impl Reconcilable for ProdGadget {
             let transmitter2 = CarManager::new(transmitter, proxy_chan.1, self.cfg.persist_dir.clone());
             transmitter2.await.expect("TODO").background();
             self.last_tx.lock().unwrap().replace(car_state);
+            self.inviting_sent = None;
         }
 
         // TODO: this doesn't properly go back to `blocked` after transmit session is closed
         rx.child_mut()
             .set_invites_blocked(self.last_tx.lock().unwrap().is_none());
+
+        // The car session's waiting screen shows whether the iPhone is being invited yet.
+        let inviting = matches!(
+            rx.state(),
+            Ok(CarPlayWirelessGadgetState::Inviting | CarPlayWirelessGadgetState::Receiving)
+        );
+        if self.inviting_sent != Some(inviting)
+            && let Some(car) = self.last_tx.lock().unwrap().as_ref()
+        {
+            let _ = car.proxy_tx.unbounded_send(TxAdapterOp::InvitingIphone(inviting));
+            self.inviting_sent = Some(inviting);
+        }
 
         match _status {
             ProdGadgetState::Initial => ProdGadgetState::WaitingForUdc.into(),
