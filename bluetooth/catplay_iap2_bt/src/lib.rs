@@ -1,6 +1,12 @@
 use std::{io, str::FromStr};
 use std::{net::TcpStream, sync::Mutex};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use catplay_bt::{BluezError, BluezManager, CARPLAY_EIR_ACCESSORY, CARPLAY_EIR_PHONE, CARPLAY_HCI_CLASS_ACCESSORY_MGMT_BYTES, HciSocket};
 use catplay_iap2_client::{
@@ -35,6 +41,23 @@ pub struct BluetoothManager {
     csm: CsmSessionCallback,
 
     last_connect: Arc<Mutex<Option<MacAddr6>>>,
+    live_links: Arc<AtomicUsize>,
+}
+
+/// Counts one live iAP2 link for as long as its session task runs.
+struct LiveLink(Arc<AtomicUsize>);
+
+impl LiveLink {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for LiveLink {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl BluetoothManager {
@@ -58,7 +81,15 @@ impl BluetoothManager {
             bluez: None,
             csm,
             last_connect: Default::default(),
+            live_links: Default::default(),
         }
+    }
+
+    /// Counts live iAP2 links in `counter` instead of a private one, so the count can be shared
+    /// before the manager starts and survives a restart of the manager.
+    pub fn with_live_links(mut self, counter: Arc<AtomicUsize>) -> Self {
+        self.live_links = counter;
+        self
     }
 
     /// Sets Powered = true on Bluetooth adapter.
@@ -177,6 +208,7 @@ impl BluetoothManager {
         let server = self.server;
 
         let last_connect = self.last_connect.clone();
+        let live_links = self.live_links.clone();
         self.bluez
             .as_mut()
             .unwrap()
@@ -192,7 +224,9 @@ impl BluetoothManager {
                         error!("Failed to wrap Bluetooth socket: {}", err);
                     }
                     Ok(socket) => {
+                        let live_link = LiveLink::new(live_links.clone());
                         handle.spawn(async move {
+                            let _live_link = live_link;
                             let task = AsyncClient::new(server, CsmRemote::bluetooth(conn.peer, conn.local), session);
                             let mut t = AsyncClientStream::new(task.0, task.1, socket);
 
@@ -212,5 +246,22 @@ impl BluetoothManager {
 
         info!("Started iAP2 Bluetooth server");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_link_counts_while_held() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first = LiveLink::new(counter.clone());
+        let second = LiveLink::new(counter.clone());
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        drop(first);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        drop(second);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }

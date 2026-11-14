@@ -15,7 +15,7 @@ use log::{debug, error, info, warn};
 use std::{
     mem,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicUsize},
     time::{Duration, Instant},
 };
 use tokio::task::spawn_blocking;
@@ -44,7 +44,7 @@ pub struct OverlayManager {
 }
 
 impl OverlayManager {
-    pub fn new(width: u32, height: u32, fps: u32, dpi: f32, persist_dir: Option<PathBuf>) -> Self {
+    pub fn new(width: u32, height: u32, fps: u32, dpi: f32, persist_dir: Option<PathBuf>, iphone_bt_links: Arc<AtomicUsize>) -> Self {
         Self {
             width,
             height,
@@ -63,7 +63,7 @@ impl OverlayManager {
 
             renderer: None,
 
-            policy: OverlayPolicyDefault::new(),
+            policy: OverlayPolicyDefault::new(iphone_bt_links),
             lazy_screen: None,
         }
     }

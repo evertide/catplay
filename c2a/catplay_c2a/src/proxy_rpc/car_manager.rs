@@ -20,6 +20,7 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     str::FromStr,
+    sync::{Arc, atomic::AtomicUsize},
     time::{Duration, Instant},
 };
 
@@ -86,6 +87,7 @@ impl CarManager {
         car: TeardownGuard<AirPlayTransmitterProxyRef>,
         proxy_rx: mpsc::UnboundedReceiver<TxAdapterOp>,
         persist_dir: Option<PathBuf>,
+        iphone_bt_links: Arc<AtomicUsize>,
     ) -> RtspResult<Self> {
         let info = car.info_cached();
         let car_media_clock = car.media_clock();
@@ -97,7 +99,7 @@ impl CarManager {
             screen.max_fps.unwrap_or(30),
             screen.dpi(),
         );
-        let overlay = OverlayManager::new(width, height, fps, dpi, persist_dir);
+        let overlay = OverlayManager::new(width, height, fps, dpi, persist_dir, iphone_bt_links);
 
         Ok(Self {
             car_media_clock,

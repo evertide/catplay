@@ -5,20 +5,43 @@ use crate::{
 use catplay_bt::BluezManager;
 use catplay_util::{EventReconciler, EventSleeper, EventToken, LazyAsync};
 use log::{debug, warn};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 pub struct OverlayPolicyDefault {
     bluez: LazyAsync<BluezManager>,
     peer: OverlayPeerState,
     overlay: Option<UiState>,
+    iphone_bt_links: Arc<AtomicUsize>,
+}
+
+/// The waiting screen while no iPhone session runs: a pairing request wins, then a found iPhone
+/// (a live Bluetooth iAP2 link, kept by iOS until the AirPlay session runs), else still searching.
+fn waiting_screen(pairing: Option<UiState>, iphone_found: bool) -> UiState {
+    match (pairing, iphone_found) {
+        (Some(pairing), _) => pairing,
+        (None, true) => UiState::Connecting {
+            // The Bluetooth link carries no name; the AirPlay name only arrives with the session.
+            device: "iPhone".into(),
+            // Static dots: the screen is redrawn only when the phase changes.
+            ticks: 2,
+        },
+        (None, false) => UiState::WaitingForConnection,
+    }
 }
 
 impl OverlayPolicyDefault {
-    pub fn new() -> Self {
+    pub fn new(iphone_bt_links: Arc<AtomicUsize>) -> Self {
         Self {
             bluez: LazyAsync::new(Self::start_pin_agent),
             peer: OverlayPeerState::Unconnected,
             overlay: None,
+            iphone_bt_links,
         }
     }
     async fn start_pin_agent() -> BluezManager {
@@ -53,24 +76,18 @@ impl OverlayPolicy for OverlayPolicyDefault {
             return None;
         }
 
-        if let Some(req) = self
+        let pairing = self
             .bluez
             .as_ref()
             .as_ref()
             .and_then(|bluez| bluez.get_pairing_request())
-        {
-            return Some(UiState::Pairing {
+            .map(|req| UiState::Pairing {
                 device: req.remote_name.unwrap_or("unknown".into()),
                 pin: format!("{}", req.passkey),
             });
-        }
+        let iphone_found = self.iphone_bt_links.load(Ordering::Relaxed) > 0;
 
-        // return Some(UiState::Connecting {
-        //     device: "iPhone".into(),
-        //     ticks: 10,
-        // });
-
-        Some(UiState::WaitingForConnection)
+        Some(waiting_screen(pairing, iphone_found))
     }
 
     fn on_hid_interact(&mut self) -> bool {
@@ -104,5 +121,43 @@ impl EventReconciler for OverlayPolicyDefault {
 impl EventSleeper for OverlayPolicyDefault {
     async fn sleep(&mut self) -> Option<EventToken> {
         self.bluez.sleep().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waiting_screen_follows_the_connection_phase() {
+        assert_eq!(waiting_screen(None, false), UiState::WaitingForConnection);
+        let connecting = waiting_screen(None, true);
+        assert!(matches!(connecting, UiState::Connecting { .. }), "{connecting}");
+        assert_eq!(
+            connecting,
+            waiting_screen(None, true),
+            "a phase renders the same state, so it is not redrawn"
+        );
+
+        let pairing = UiState::Pairing {
+            device: "iPhone".into(),
+            pin: "1234".into(),
+        };
+        assert_eq!(waiting_screen(Some(pairing.clone()), false), pairing);
+        assert_eq!(waiting_screen(Some(pairing.clone()), true), pairing, "pairing wins over connecting");
+    }
+
+    #[test]
+    fn found_iphone_switches_to_connecting_until_the_link_drops() {
+        let links = Arc::new(AtomicUsize::new(0));
+        let mut policy = OverlayPolicyDefault::new(links.clone());
+        assert_eq!(policy.overlay(), Some(UiState::WaitingForConnection));
+        links.store(1, Ordering::Relaxed);
+        assert!(matches!(policy.overlay(), Some(UiState::Connecting { .. })));
+        policy.set_peer_state(OverlayPeerState::ConnectedWithoutScreen);
+        assert_eq!(policy.overlay(), None, "the session hides the waiting screen");
+        policy.set_peer_state(OverlayPeerState::Unconnected);
+        links.store(0, Ordering::Relaxed);
+        assert_eq!(policy.overlay(), Some(UiState::WaitingForConnection), "back to searching");
     }
 }

@@ -45,11 +45,12 @@ pub struct UiTheme {
     /// Full-screen background image (JPEG), scaled to cover the screen.
     pub background: Option<PathBuf>,
     pub waiting_text: Option<String>,
-    /// Smaller second line under the waiting text.
+    /// Smaller second line under the waiting and connecting text.
     pub subtitle: Option<String>,
     /// Main text size in points (default 30).
     pub text_size: Option<f32>,
-    /// `{device}` is replaced by the phone name.
+    /// Shown once an iPhone is found, until the session starts. `{device}` is replaced by the
+    /// phone name ("iPhone" while only the Bluetooth link is up).
     pub connecting_text: Option<String>,
     /// `{device}` and `{pin}` are replaced.
     pub pairing_text: Option<String>,
@@ -177,6 +178,15 @@ impl UiTheme {
         Ok(buf.into())
     }
 
+    /// The state to render for `state`. The connecting phase is shown only with a theme; without
+    /// one the upstream waiting screen stays up until the session starts.
+    pub fn shown_state(&self, state: UiState) -> UiState {
+        match state {
+            UiState::Connecting { .. } if self.is_default() => UiState::WaitingForConnection,
+            state => state,
+        }
+    }
+
     /// The same theme without its background, used when the image cannot be rendered.
     pub fn without_background(&self) -> Self {
         Self {
@@ -208,7 +218,7 @@ impl UiTheme {
         let Some(text) = self.text(state, &upstream) else {
             return upstream;
         };
-        let subtitle = matches!(state, UiState::WaitingForConnection)
+        let subtitle = matches!(state, UiState::WaitingForConnection | UiState::Connecting { .. })
             .then(|| self.subtitle.clone())
             .flatten();
 
@@ -449,7 +459,7 @@ mod tests {
             device: "iPhone".into(),
             ticks: 0,
         };
-        assert_eq!(texts(&theme.ops(&connecting, SCREEN)), ["Verbinden met iPhone."]);
+        assert_eq!(texts(&theme.ops(&connecting, SCREEN)), ["Verbinden met iPhone.", "Volvo XC90"]);
         let pairing = UiState::Pairing {
             device: "Phone {pin}".into(),
             pin: "1234".into(),
@@ -563,6 +573,36 @@ mod tests {
         let big_file = load_with_background(&dir, &padded, "");
         assert_eq!(big_file.background_bytes, None, "files over the size limit are rejected");
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn connecting_phase_needs_a_theme() {
+        let connecting = UiState::Connecting {
+            device: "iPhone".into(),
+            ticks: 2,
+        };
+        assert_eq!(
+            UiTheme::default().shown_state(connecting.clone()),
+            UiState::WaitingForConnection,
+            "without a theme the upstream waiting screen stays"
+        );
+
+        let dir = temp_dir("connecting");
+        std::fs::write(
+            dir.join(UiTheme::FILE_NAME),
+            "connecting_text = \"Verbinden met {device}\"\nsubtitle = \"Volvo XC90\"\n",
+        )
+        .unwrap();
+        let theme = UiTheme::load(Some(&dir));
+        assert_eq!(theme.shown_state(connecting.clone()), connecting);
+        assert_eq!(theme.shown_state(UiState::Hidden), UiState::Hidden);
+        assert_eq!(texts(&theme.ops(&connecting, SCREEN)), ["Verbinden met iPhone...", "Volvo XC90"]);
+
+        // A theme without connecting_text still shows the phase, with the upstream text.
+        std::fs::write(dir.join(UiTheme::FILE_NAME), "waiting_text = \"iPhone zoeken...\"\n").unwrap();
+        let theme = UiTheme::load(Some(&dir));
+        assert_eq!(texts(&theme.ops(&connecting, SCREEN)), ["Connecting to device: iPhone..."]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

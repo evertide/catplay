@@ -236,6 +236,7 @@ impl UiRenderer {
 
     #[trace_time(warn)]
     pub fn render_and_encode_frame(&mut self, state: UiState, latency: Duration, reset: bool) -> UiResult<EncodedVideoFrame> {
+        let state = self.theme().shown_state(state);
         if state.cache_file_name().is_some() {
             info!("UI renderer requested cacheable state {state}");
         }

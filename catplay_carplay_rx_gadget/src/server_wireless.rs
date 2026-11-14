@@ -1,6 +1,6 @@
 use std::{
     fs, io,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicUsize},
     time::{Duration, Instant},
 };
 
@@ -26,6 +26,8 @@ pub struct CarPlayWirelessGadget<T: AirPlayReceiverSink> {
     server: Option<AirPlayServer>,
     // Bluetooth manager
     bluetooth: Option<BluetoothManager>,
+    // Live Bluetooth iAP2 links with an iPhone, across Bluetooth restarts
+    iphone_bt_links: Arc<AtomicUsize>,
     last_bt_peer: Option<MacAddr6>,
     last_bt_peer_task: Option<AbortOnDropHandle<()>>,
     name: String,
@@ -81,6 +83,7 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
                 name: name.into(),
                 server: None,
                 bluetooth: None,
+                iphone_bt_links: Default::default(),
 
                 hci: hci.into(),
                 iface: iface.into(),
@@ -228,6 +231,12 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
     pub fn set_invites_blocked(&mut self, blocked: bool) {
         self.invites_blocked = blocked;
     }
+
+    /// Shared count of live Bluetooth iAP2 links with an iPhone. A link means an iPhone was found and
+    /// is being set up for wireless CarPlay; iOS drops it once the AirPlay session runs.
+    pub fn iphone_bt_links(&self) -> Arc<AtomicUsize> {
+        self.iphone_bt_links.clone()
+    }
 }
 
 impl<T: AirPlayReceiverSink> AsyncShutdown for CarPlayWirelessGadget<T> {
@@ -345,7 +354,7 @@ impl<T: AirPlayReceiverSink> Reconcilable for CarPlayWirelessGadget<T> {
                 };
 
                 let cb = move || CarPlayServerSession::new(mfi.clone(), identity.clone()).0;
-                let mut mgr = BluetoothManager::new(false, true, true, hci, cb);
+                let mut mgr = BluetoothManager::new(false, true, true, hci, cb).with_live_links(self.iphone_bt_links.clone());
                 mgr.start()
                     .await
                     .map_err(|e| LocalError::Bluetooth(e.into()))?;

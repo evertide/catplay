@@ -261,7 +261,8 @@ impl Reconcilable for ProdGadget {
             let proxy_chan = mpsc::unbounded();
             let car_state = ProdGadgetSession { proxy_tx: proxy_chan.0 };
 
-            let transmitter2 = CarManager::new(transmitter, proxy_chan.1, self.cfg.persist_dir.clone());
+            let iphone_bt_links = rx.child().iphone_bt_links();
+            let transmitter2 = CarManager::new(transmitter, proxy_chan.1, self.cfg.persist_dir.clone(), iphone_bt_links);
             transmitter2.await.expect("TODO").background();
             self.last_tx.lock().unwrap().replace(car_state);
         }
