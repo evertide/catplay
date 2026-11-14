@@ -7,7 +7,9 @@ use catplay_plist::{FlexBool, PlistByteArray, downcast_enum_to_legacy_u64, plist
 
 plist_struct! {
     pub struct InfoMessage {
-       pub qualifier: Option<Vec<String>>
+       pub qualifier: Option<Vec<String>>,
+       #[serde(rename = "altScreenURLs")]
+       pub alt_screen_urls: Option<Vec<String>>,
     }
 }
 
