@@ -128,11 +128,16 @@ impl TcpSession for ScreenReceiverSession {
             }
 
             ScreenOpCode::VideoConfig => {
+                let config = msg.config_decode(self.video_latency);
                 if msg.flags().contains(ScreenFlag::ClearScreen) {
-                    warn!("Ignoring ScreenFlag::ClearScreen");
+                    // The sender repeats its current config with ClearScreen when a display is shown again (showUI). Tell the
+                    // sink, so a proxy can repeat it to its receiver; a ClearScreen config that changes anything stays ignored.
+                    match repeated_config(config, self.config.as_ref()) {
+                        Some(config) => self.sink.set_avcc_config(config).await?,
+                        None => warn!("Ignoring ScreenFlag::ClearScreen"),
+                    }
                     return Ok(());
                 }
-                let config = msg.config_decode(self.video_latency);
                 let Some(config) = config else {
                     return Err(RtspError::ProtocolViolation("received unparsable VideoConfig frame"));
                 };
@@ -162,10 +167,47 @@ impl TcpSession for ScreenReceiverSession {
     }
 }
 
+/// The config of a ClearScreen VideoConfig, if it only repeats the current one.
+fn repeated_config(config: Option<AvccConfigExtended>, current: Option<&AvccConfigExtended>) -> Option<AvccConfigExtended> {
+    config.filter(|config| current == Some(config))
+}
+
 impl EventSleeper for ScreenReceiverSession {}
 
 impl AsyncShutdown for ScreenReceiverSession {
     async fn shutdown(&mut self) {
         self.sink.shutdown_pinned().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::video::AvccConfig;
+
+    fn config(width: u32, sps_pps: &[u8]) -> AvccConfigExtended {
+        AvccConfigExtended {
+            hevc: false,
+            avcc: AvccConfig {
+                nal_size_len: 4,
+                sps_pps: sps_pps.to_vec().into(),
+            },
+            video_latency: Duration::ZERO,
+            width,
+            height: 720,
+            respect_timestamps: true,
+        }
+    }
+
+    #[test]
+    fn clear_screen_config_is_passed_on_only_when_it_repeats_the_current_one() {
+        let current = config(1920, &[1, 2]);
+        assert_eq!(repeated_config(Some(current.clone()), Some(&current)), Some(current.clone()));
+        // An empty 0x0 ClearScreen config, another size or another codec config never replaces the current one.
+        assert_eq!(repeated_config(Some(config(0, &[])), Some(&current)), None);
+        assert_eq!(repeated_config(Some(config(800, &[1, 2])), Some(&current)), None);
+        assert_eq!(repeated_config(Some(config(1920, &[3])), Some(&current)), None);
+        assert_eq!(repeated_config(None, Some(&current)), None, "unparsable");
+        assert_eq!(repeated_config(Some(current), None), None, "no VideoConfig received yet");
     }
 }

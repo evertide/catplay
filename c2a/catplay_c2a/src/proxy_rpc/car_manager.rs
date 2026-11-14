@@ -134,6 +134,8 @@ impl CarManager {
             CommandType::ForceKeyFrame
             | CommandType::RequestSiri
             | CommandType::RequestUI
+            | CommandType::ShowUI
+            | CommandType::StopUI
             | CommandType::SetNightMode
             | CommandType::SetLimitedUI
             | CommandType::HidSendReport => {
@@ -494,6 +496,10 @@ impl CarManager {
                 // anyway makes the iPhone tear down the session right after RECORD.
                 restrict_to_main_display(&mut displays, &mut hid_devices);
             }
+            let alt_screen_suggest_ui_urls = alt_screen_suggestions(
+                other.alt_screen_suggest_ui_urls,
+                self.iphone_features.contains(&ControllerFeature::AltScreen),
+            );
 
             InfoMessageResponse {
                 hid_devices,
@@ -511,6 +517,7 @@ impl CarManager {
                 manufacturer: other.manufacturer,
                 model: other.model,
                 displays,
+                alt_screen_suggest_ui_urls,
 
                 audio_latencies: other.audio_latencies,
                 features: other.features,
@@ -546,6 +553,8 @@ impl CarManager {
                 task.detach();
                 true
             }
+            // suggestUI is only parsed so the iPhone gets 200 instead of 501; it is not forwarded, because a car that never
+            // answers it would hit the proxy timeout and tear the session down.
             _ => false,
         };
 
@@ -621,6 +630,12 @@ impl CarManager {
             self.night_mode = mode.night_mode;
         }
 
+        // Display switches only make sense for displays the iPhone was told about (see restrict_to_main_display).
+        if matches!(cmd_type, CommandType::ShowUI | CommandType::StopUI) && !self.iphone_features.contains(&ControllerFeature::AltScreen) {
+            cmd.respond_status(HttpStatus::NotImplemented);
+            return;
+        }
+
         if let Command::ChangeModes(cm) = cmd.command() {
             self.modes.on_peer_change_modes_start(cm);
         }
@@ -638,6 +653,9 @@ impl CarManager {
                 | CommandType::ForceKeyFrame // TODO
                 | CommandType::RequestSiri
                 | CommandType::RequestUI
+                // showUI/stopUI: the car switches a display (e.g. the instrument cluster) to or from CarPlay.
+                | CommandType::ShowUI
+                | CommandType::StopUI
                 | CommandType::SetNightMode
                 | CommandType::SetLimitedUI
                 | CommandType::ChangeMapZoomLevel => ProxyType::Proxy,
@@ -705,6 +723,8 @@ impl CarManager {
                 self.night_mode = v.night_mode;
                 cmd.respond_ok();
             }
+            // Without an iPhone there is nothing to show; answer as before instead of pretending it worked.
+            Command::ShowUI(_) | Command::StopUI(_) => cmd.respond_status(HttpStatus::NotImplemented),
             Command::RequestUI(_) => {
                 warn!("requestUI during overlay!");
                 self.modes
@@ -729,6 +749,25 @@ fn negotiate_proxied_features(offered: &[ControllerFeature], car_enabled: &[Cont
         .into_iter()
         .filter(|feature| offered.contains(feature) && car_enabled.contains(feature))
         .collect()
+}
+
+/// Alt screen suggestions offered to the iPhone when the car names none: the Apple Maps instrument cluster URLs.
+const DEFAULT_ALT_SCREEN_SUGGESTIONS: [&str; 3] = [
+    "maps:/car/instrumentcluster/instructioncard",
+    "maps:/car/instrumentcluster/map",
+    "maps:/car/instrumentcluster",
+];
+
+/// The car's alt screen suggestions for the iPhone, only when the alt screen is negotiated.
+///
+/// Without a suggestion iOS streams an empty (black) alt screen for a display that has no initialURL either, so fall back to
+/// the Apple Maps defaults when the car names none.
+fn alt_screen_suggestions(car: Option<Vec<String>>, alt_screen: bool) -> Option<Vec<String>> {
+    match car {
+        _ if !alt_screen => None,
+        Some(urls) if !urls.is_empty() => Some(urls),
+        _ => Some(DEFAULT_ALT_SCREEN_SUGGESTIONS.map(String::from).to_vec()),
+    }
 }
 
 /// Keeps only the main display, and the HID devices that belong to it.
@@ -849,5 +888,16 @@ mod tests {
 
         assert_eq!(displays, vec![display(MAIN_UUID)]);
         assert_eq!(hid_devices.len(), 2);
+    }
+
+    #[test]
+    fn alt_screen_suggestions_follow_the_car_or_default() {
+        let car = vec!["maps:/car/instrumentcluster".to_owned()];
+        let defaults = Some(DEFAULT_ALT_SCREEN_SUGGESTIONS.map(String::from).to_vec());
+        assert_eq!(alt_screen_suggestions(Some(car.clone()), true), Some(car.clone()));
+        assert_eq!(alt_screen_suggestions(Some(vec![]), true), defaults);
+        assert_eq!(alt_screen_suggestions(None, true), defaults);
+        assert_eq!(alt_screen_suggestions(Some(car), false), None);
+        assert_eq!(alt_screen_suggestions(None, false), None);
     }
 }
