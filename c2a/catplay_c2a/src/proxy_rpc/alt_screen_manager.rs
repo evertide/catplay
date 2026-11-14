@@ -107,14 +107,20 @@ impl AltScreenManager {
                 }
                 let _ = consumed.send(());
             }
-            // A config update without a frame (for example the view switch on showUI) is passed on right away.
-            ScreenProxyOp::IphoneConfig { config } => {
-                if let Some(car_screen) = self.car_screen.as_mut()
-                    && let Err(err) = car_screen.push_avcc_config(config)
-                {
-                    warn!("Sink rejected iPhone alt screen config?: {err}");
+            // A config update without a frame (for example the view switch on showUI) is passed on right away, or kept with the
+            // held keyframe while the car SETUP is pending.
+            ScreenProxyOp::IphoneConfig { config } => match self.car_screen.as_mut() {
+                Some(car_screen) => {
+                    if let Err(err) = car_screen.push_avcc_config(config) {
+                        warn!("Sink rejected iPhone alt screen config?: {err}");
+                    }
                 }
-            }
+                None => {
+                    if let Some(keyframe) = self.pending_keyframe.as_mut() {
+                        keyframe.config = Some(config);
+                    }
+                }
+            },
             ScreenProxyOp::IphoneStreamFinish => {
                 info!("iPhone has finished its alt screen stream");
                 self.iphone_screen_rx.take();
@@ -262,5 +268,44 @@ mod tests {
 
         assert!(manager.reset().is_some());
         assert!(manager.reset().is_none());
+    }
+
+    #[test]
+    fn config_update_during_setup_is_kept_with_the_held_keyframe() {
+        use catplay_carplay::video::{AvccConfig, AvccConfigExtended};
+
+        let config = |view: u8| AvccConfigExtended {
+            hevc: false,
+            avcc: AvccConfig {
+                nal_size_len: 4,
+                sps_pps: vec![1, 2],
+            },
+            video_latency: Duration::ZERO,
+            width: 1920,
+            height: 720,
+            respect_timestamps: true,
+            view: [[0; 8], [view; 8]],
+        };
+        let mut manager = AltScreenManager::default();
+        let (iphone_tx, iphone_rx) = mpsc::unbounded();
+        let (_setup_tx, setup_rx) = oneshot::channel();
+        manager.set_iphone_screen(iphone_rx, Some(UUID.into()));
+        manager.set_pending_setup(setup_rx);
+        manager.pending_keyframe = Some(EncodedVideoFrame {
+            pts: Instant::now().into(),
+            width: 1920,
+            height: 720,
+            data: [0u8; 4].as_slice().into(),
+            config: Some(config(1)),
+            nal_offsets: None,
+            is_keyframe: Some(true),
+            header_buf: Default::default(),
+            chacha_tag_buf: Default::default(),
+        });
+
+        let _ = iphone_tx.unbounded_send(ScreenProxyOp::IphoneConfig { config: config(2) });
+        assert!(step(&mut manager).is_none());
+        let held = manager.pending_keyframe.as_ref().unwrap();
+        assert_eq!(held.config, Some(config(2)), "the car stream must start with the latest view");
     }
 }

@@ -138,8 +138,8 @@ impl TcpSession for ScreenReceiverSession {
                 );
 
                 if msg.flags().contains(ScreenFlag::ClearScreen) {
-                    // A ClearScreen config with the same codec config only updates the header parameters (for example the view
-                    // origin and size the iPhone switches to on showUI), so keep those; anything else is still ignored.
+                    // The iPhone sends a ClearScreen config when it switches the view (for example on showUI): apply it when
+                    // only the view origin and size change (see clear_screen_update); anything else is still ignored.
                     match clear_screen_update(config, self.config.as_ref()) {
                         Some(config) => {
                             self.sink.set_avcc_config(config.clone()).await?;
