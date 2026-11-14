@@ -5,6 +5,14 @@ use crate::{
 };
 use catplay_plist::{FlexBool, PlistByteArray, Value, downcast_enum_to_legacy_u64, plist_struct};
 
+/// Instrument cluster URLs of Apple Maps: what an iPhone announces in its GET /info (as captured from a real session), and what
+/// a receiver suggests for its alt screen when the car names none (the stock dongle firmware uses the same defaults).
+pub const ALT_SCREEN_URLS: [&str; 3] = [
+    "maps:/car/instrumentcluster/map",
+    "maps:/car/instrumentcluster/instructioncard",
+    "maps:/car/instrumentcluster",
+];
+
 plist_struct! {
     pub struct InfoMessage {
        pub qualifier: Option<Vec<String>>,
