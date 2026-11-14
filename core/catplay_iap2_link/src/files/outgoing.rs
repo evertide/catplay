@@ -183,6 +183,11 @@ impl FileTransferTransmitter {
         }
     }
 
+    /// Whether any id is reserved or any outgoing transfer is still tracked.
+    pub(crate) fn has_state(&self) -> bool {
+        self.taken_ids.iter().any(|&taken| taken) || self.outgoing.iter().any(Option::is_some)
+    }
+
     pub fn reserve(&mut self) -> Option<FileTransferReserved> {
         let valid_range = if self.server { 128u8..255 } else { 0u8..127 };
 

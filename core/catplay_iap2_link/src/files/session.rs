@@ -34,6 +34,21 @@ impl FileSession {
         self.tx.cancel_reserved(f);
     }
 
+    /// Whether outgoing transfers, reservations or queued payloads are being kept.
+    pub(crate) fn has_tx_state(&self) -> bool {
+        !self.queue_tx.is_empty() || self.tx.has_state()
+    }
+
+    /// Forgets all outgoing transfers and reservations. Returns whether anything was dropped.
+    pub(crate) fn reset_tx(&mut self) -> bool {
+        if !self.has_tx_state() {
+            return false;
+        }
+        self.tx = FileTransferTransmitter::new(self.server);
+        self.queue_tx.clear();
+        true
+    }
+
     pub fn send_file(&mut self, id: FileTransferReserved, file_type: u16, setup_data: &[u8], source: FileTransferOutgoingSource) {
         let ret = self
             .tx
