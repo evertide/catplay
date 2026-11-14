@@ -403,7 +403,12 @@ impl CarManager {
                 if let Some(screen) = self.alt_screen.set_iphone_screen(channel, uuid.clone()) {
                     self.schedule_alt_screen_teardown(screen);
                 }
-                self.schedule_alt_screen_setup(uuid);
+                if super::xc90_diag::Xc90Diag::get().alt_lazy_setup {
+                    info!("XC90: alt screen SETUP for display {uuid:?} waits for the first iPhone keyframe");
+                    self.alt_screen.defer_setup();
+                } else {
+                    self.schedule_alt_screen_setup(uuid);
+                }
             }
             TxAdapterOp::NegotiateFeatures { offered, enabled } => {
                 let _ = enabled.send(self.on_negotiate_features(&offered));

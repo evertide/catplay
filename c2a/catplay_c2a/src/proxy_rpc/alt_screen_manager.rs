@@ -26,6 +26,10 @@ pub struct AltScreenManager {
     /// XC90 diagnostics: last config sent to the car stream, and whether a re-SETUP is due (see [Xc90Diag::alt_resetup]).
     sent_config: Option<AvccConfigExtended>,
     resetup: bool,
+    /// XC90 diagnostics ([Xc90Diag::alt_lazy_setup]): the car SETUP waits for the iPhone's first keyframe, like the stock firmware.
+    lazy_setup: bool,
+    /// Whether the keyframe held during a lazy SETUP was followed by frames the car never got, so a fresh one is needed.
+    lazy_keyframe: Option<catplay_carplay::carplay_rx::AirPlayReceiverHandleRef>,
 }
 
 /// Diagnostics: captures started by this process (a new [AltScreenManager] is created per car session).
@@ -111,7 +115,14 @@ impl AltScreenManager {
         self.pending_keyframe.take();
         self.sent_config = None;
         self.resetup = false;
+        self.lazy_setup = false;
+        self.lazy_keyframe = None;
         self.car_screen.take()
+    }
+
+    /// XC90 diagnostics: do not SETUP the car stream yet; [Self::take_resetup] asks for it at the iPhone's first keyframe.
+    pub fn defer_setup(&mut self) {
+        self.lazy_setup = true;
     }
 
     pub fn set_pending_setup(&mut self, pending_setup: oneshot::Receiver<TeardownGuard<ScreenTransmitProxy>>) {
@@ -128,6 +139,8 @@ impl AltScreenManager {
         self.pending_keyframe.take();
         self.sent_config = None;
         self.resetup = false;
+        self.lazy_setup = false;
+        self.lazy_keyframe = None;
         if let Some(capture) = self.capture.take() {
             capture.finish();
         }
@@ -201,6 +214,10 @@ impl AltScreenManager {
                             warn!("Sink rejected iPhone alt screen keyframe?: {err}");
                         }
                     }
+                    // Frames after the held keyframe were dropped during the lazy SETUP: get a fresh keyframe as well.
+                    if let (Some(handle), Some(uuid)) = (self.lazy_keyframe.take(), self.uuid.as_deref()) {
+                        handle.request_display_keyframe(uuid);
+                    }
 
                     self.car_screen.replace(screen);
                 }
@@ -234,6 +251,11 @@ impl AltScreenManager {
                     None if frame.is_known_keyframe() => {
                         debug!("Holding iPhone alt screen keyframe until car alt screen is ready");
                         self.pending_keyframe.replace(frame);
+                        if std::mem::take(&mut self.lazy_setup) {
+                            info!("XC90: first iPhone alt screen keyframe, SETUP of the car stream now");
+                            self.resetup = true;
+                            self.lazy_keyframe = Some(handle);
+                        }
                     }
                     None => debug!("Dropping iPhone alt screen frame, no car alt screen (yet)"),
                     Some(car_screen) => {

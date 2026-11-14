@@ -17,6 +17,9 @@ pub struct Xc90Diag {
     pub suggest_ui: bool,
     /// `xc90_config_flags` (default 1): VideoConfig flag bytes like the stock firmware (see `XC90_STOCK_CONFIG_FLAGS`).
     pub config_flags: bool,
+    /// `xc90_alt_lazy_setup` (default 1): SETUP the car's alt screen stream at the iPhone's first alt screen keyframe instead of
+    /// at the iPhone's SETUP, so the car gets VideoConfig and frames right after its SETUP (the stock firmware does).
+    pub alt_lazy_setup: bool,
     /// `xc90_alt_resetup` (default 0): re-SETUP the car's alt screen stream whenever the iPhone's alt screen config changes.
     pub alt_resetup: bool,
     /// `xc90_alt_latency_ms` (default 25): latency announced in the car's alt screen SETUP (the iPhone uses 75).
@@ -30,6 +33,7 @@ impl Default for Xc90Diag {
             main_config: 1,
             suggest_ui: true,
             config_flags: true,
+            alt_lazy_setup: true,
             alt_resetup: false,
             alt_latency_ms: 25,
         }
@@ -66,6 +70,7 @@ impl Xc90Diag {
                 "xc90_main_config" => diag.main_config = value.parse().unwrap_or(diag.main_config),
                 "xc90_suggest_ui" => diag.suggest_ui = value == "1",
                 "xc90_config_flags" => diag.config_flags = value == "1",
+                "xc90_alt_lazy_setup" => diag.alt_lazy_setup = value == "1",
                 "xc90_alt_resetup" => diag.alt_resetup = value == "1",
                 "xc90_alt_latency_ms" => diag.alt_latency_ms = value.parse().unwrap_or(diag.alt_latency_ms),
                 _ => {}
@@ -83,7 +88,7 @@ mod tests {
     fn parses_switches_and_keeps_defaults() {
         assert_eq!(Xc90Diag::parse(""), Xc90Diag::default());
         let diag = Xc90Diag::parse(
-            "bluetooth_name=Volvo XC90\nxc90_alt_resetup=1\nxc90_alt_config = 0\nxc90_main_config=2\nxc90_suggest_ui=0\nxc90_config_flags=0\nxc90_alt_latency_ms=75\n# xc90_alt_resetup=0\n",
+            "bluetooth_name=Volvo XC90\nxc90_alt_resetup=1\nxc90_alt_config = 0\nxc90_main_config=2\nxc90_suggest_ui=0\nxc90_config_flags=0\nxc90_alt_lazy_setup=0\nxc90_alt_latency_ms=75\n# xc90_alt_resetup=0\n",
         );
         assert_eq!(
             diag,
@@ -92,6 +97,7 @@ mod tests {
                 main_config: 2,
                 suggest_ui: false,
                 config_flags: false,
+                alt_lazy_setup: false,
                 alt_resetup: true,
                 alt_latency_ms: 75
             }
