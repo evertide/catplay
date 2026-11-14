@@ -23,8 +23,10 @@ pub struct AltScreenManager {
     pending_keyframe: Option<EncodedVideoFrame>,
     /// Diagnostics: frame capture after the last showUI (see [Capture]).
     capture: Option<Capture>,
-    captures: u32,
 }
+
+/// Diagnostics: captures started by this process (a new [AltScreenManager] is created per car session).
+static CAPTURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Diagnostics (XC90 build only): after each showUI, the alt screen frames of the next few seconds are logged and written to
 /// `/tmp/altscreen-<n>.h264` (Annex-B with SPS/PPS, starting at a keyframe), so a car log shows whether the iPhone draws anything.
@@ -130,13 +132,13 @@ impl AltScreenManager {
         if let Some(previous) = self.capture.take() {
             previous.finish();
         }
-        if self.captures >= CAPTURE_MAX_COUNT {
+        let n = CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n > CAPTURE_MAX_COUNT {
             return;
         }
-        self.captures += 1;
-        info!("Alt screen capture {} started (showUI)", self.captures);
+        info!("Alt screen capture {n} started (showUI)");
         self.capture = Some(Capture {
-            n: self.captures,
+            n,
             until: Instant::now() + CAPTURE_WINDOW,
             frames: 0,
             buf: Vec::new(),
@@ -222,6 +224,14 @@ impl AltScreenManager {
         }
 
         None
+    }
+}
+
+impl Drop for AltScreenManager {
+    fn drop(&mut self) {
+        if let Some(capture) = self.capture.take() {
+            capture.finish();
+        }
     }
 }
 
@@ -411,6 +421,9 @@ mod tests {
         for _ in 0..CAPTURE_MAX_COUNT + 2 {
             manager.capture_after_show_ui();
         }
-        assert_eq!(manager.captures, CAPTURE_MAX_COUNT);
+        assert!(manager.capture.is_none(), "no capture beyond the per-process limit");
+        // A new manager (next car session) shares the process-wide limit.
+        AltScreenManager::default().capture_after_show_ui();
+        assert!(CAPTURES.load(std::sync::atomic::Ordering::Relaxed) > CAPTURE_MAX_COUNT);
     }
 }
