@@ -15,6 +15,7 @@ use catplay_carplay::{
         sink::{AirPlayReceiver, AirPlayServerShared},
     },
     carplay_tx::{AirPlayTransmitterBootstrap, AirPlayTransmitterBootstrapError, AirPlayTransmitterImpl},
+    cipher::AirPlayStreamEncryption,
     common::AirPlayEncryptionType,
     msg::{AudioFormat, AudioType, Display, InfoMessageResponse, InitialSetup, StreamType},
     rtsp_frame::{HttpStatus, RtspError, RtspMethod, RtspResult},
@@ -129,13 +130,20 @@ struct Seen {
     et: Option<AirPlayEncryptionType>,
 }
 
-/// What the transmitter sent, in order.
-type RequestLog = Arc<Mutex<Vec<Seen>>>;
+#[derive(Debug, Default)]
+struct Recorded {
+    /// What the transmitter sent, in order.
+    requests: Vec<Seen>,
+    /// The session key the receiver switched to after /pair-verify.
+    shared_secret: Option<[u8; 32]>,
+}
+
+type RequestLog = Arc<Mutex<Recorded>>;
 
 /// Which requests the receiver answers with 403.
-type Refuse = fn(RtspMethod, &str) -> bool;
+type Refuse = fn(&Seen) -> bool;
 
-fn refuse_nothing(_: RtspMethod, _: &str) -> bool {
+fn refuse_nothing(_: &Seen) -> bool {
     false
 }
 
@@ -158,20 +166,23 @@ impl EventSink<RtspReceiverEvent<'_>, RtspReceiverEventResult> for RecordingRece
                     .and_then(|setup| setup.et),
                 _ => None,
             };
-            let url = request.url.to_string();
-            let refused = (self.refuse)(request.method, &url);
-            self.log.lock().unwrap().push(Seen {
+            let seen = Seen {
                 method: request.method,
-                url,
+                url: request.url.to_string(),
                 encrypted: self.encrypted,
                 et,
-            });
+            };
+            let refused = (self.refuse)(&seen);
+            self.log.lock().unwrap().requests.push(seen);
             if refused {
                 return RtspReceiverEventResult::new(Err(RtspError::Code(HttpStatus::Forbidden)));
             }
         }
         let result = self.inner.on_event(event).await;
-        self.encrypted |= result.encrypt_after_response.is_some();
+        if let Some(shared_secret) = result.encrypt_after_response {
+            self.encrypted = true;
+            self.log.lock().unwrap().shared_secret = Some(shared_secret);
+        }
         result
     }
 }
@@ -263,6 +274,7 @@ async fn connect_recording(
 fn count(log: &RequestLog, method: RtspMethod, url: &str) -> usize {
     log.lock()
         .unwrap()
+        .requests
         .iter()
         .filter(|seen| seen.method == method && seen.url == url)
         .count()
@@ -272,6 +284,7 @@ fn count(log: &RequestLog, method: RtspMethod, url: &str) -> usize {
 fn setups(log: &RequestLog) -> Vec<bool> {
     log.lock()
         .unwrap()
+        .requests
         .iter()
         .filter(|seen| seen.method == RtspMethod::Setup)
         .map(|seen| seen.encrypted)
@@ -282,18 +295,41 @@ fn setups(log: &RequestLog) -> Vec<bool> {
 fn setup_ets(log: &RequestLog) -> Vec<Option<AirPlayEncryptionType>> {
     log.lock()
         .unwrap()
+        .requests
         .iter()
         .filter(|seen| seen.method == RtspMethod::Setup)
         .map(|seen| seen.et)
         .collect()
 }
 
-fn is_setup(method: RtspMethod, _: &str) -> bool {
-    method == RtspMethod::Setup
+/// The transmitter's media streams use the session key the receiver got from pairing.
+fn assert_streams_use_pairing_secret(transmitter: &mut AirPlayTransmitterImpl, log: &RequestLog) {
+    let receiver_secret = log
+        .lock()
+        .unwrap()
+        .shared_secret
+        .expect("receiver was paired");
+    let cipher = transmitter.raw_streams().cipher;
+    assert!(
+        matches!(cipher, AirPlayStreamEncryption::ChaCha { shared_secret } if shared_secret == receiver_secret),
+        "streams must use the pairing secret, got {cipher:?}"
+    );
 }
 
-fn is_pair_setup_or_setup(method: RtspMethod, url: &str) -> bool {
-    url == "/pair-setup" || method == RtspMethod::Setup
+fn is_setup(seen: &Seen) -> bool {
+    seen.method == RtspMethod::Setup
+}
+
+fn is_unpaired_setup(seen: &Seen) -> bool {
+    is_setup(seen) && !seen.encrypted
+}
+
+fn is_paired_setup(seen: &Seen) -> bool {
+    is_setup(seen) && seen.encrypted
+}
+
+fn is_pair_setup_or_setup(seen: &Seen) -> bool {
+    seen.url == "/pair-setup" || is_setup(seen)
 }
 
 #[tokio::test]
@@ -310,11 +346,12 @@ async fn skips_pairing_unless_requested() {
 #[tokio::test]
 async fn pairs_before_setup_when_requested() {
     let (_rx, transmitter, log) = connect_recording(true, None, refuse_nothing, Identities::new()).await;
-    transmitter.unwrap();
+    let mut transmitter = transmitter.unwrap();
     assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 3, "M1, M3, M5: {log:?}");
     assert_eq!(count(&log, RtspMethod::Post, "/pair-verify"), 2, "M1, M3: {log:?}");
     assert_eq!(setups(&log), [true], "one SETUP, on the encrypted session: {log:?}");
-    assert_eq!(setup_ets(&log), [None], "no et: the streams use the pairing secret: {log:?}");
+    assert_eq!(setup_ets(&log), [None], "no et after pairing: {log:?}");
+    assert_streams_use_pairing_secret(&mut transmitter, &log);
 }
 
 /// The next connection to a known receiver skips /pair-setup and goes straight to /pair-verify.
@@ -328,7 +365,8 @@ async fn reconnects_with_pair_verify_only_when_already_paired() {
     assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 3, "first connection pairs: {log:?}");
 
     let (_rx, transmitter, log) = connect_recording(true, receiver_id, refuse_nothing, identities.clone()).await;
-    transmitter.unwrap();
+    let mut transmitter = transmitter.unwrap();
+    assert_streams_use_pairing_secret(&mut transmitter, &log);
     assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 0, "known pairing: {log:?}");
     assert_eq!(count(&log, RtspMethod::Post, "/pair-verify"), 2, "M1, M3: {log:?}");
     assert_eq!(setups(&log), [true], "{log:?}");
@@ -353,7 +391,7 @@ async fn falls_back_to_unpaired_setup_once_when_pairing_first_fails() {
 /// Same fallback when the receiver itself refuses /pair-setup.
 #[tokio::test]
 async fn falls_back_to_unpaired_setup_once_when_the_receiver_refuses_pairing() {
-    let (_rx, transmitter, log) = connect_recording(true, None, |_, url| url == "/pair-setup", Identities::new()).await;
+    let (_rx, transmitter, log) = connect_recording(true, None, |seen| seen.url == "/pair-setup", Identities::new()).await;
     transmitter.unwrap();
     assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 1, "refused at M1: {log:?}");
     assert_eq!(count(&log, RtspMethod::Post, "/pair-verify"), 0, "{log:?}");
@@ -363,7 +401,7 @@ async fn falls_back_to_unpaired_setup_once_when_the_receiver_refuses_pairing() {
 /// Same fallback when the receiver refuses /pair-verify after a successful /pair-setup.
 #[tokio::test]
 async fn falls_back_to_unpaired_setup_once_when_the_receiver_refuses_pair_verify() {
-    let (_rx, transmitter, log) = connect_recording(true, None, |_, url| url == "/pair-verify", Identities::new()).await;
+    let (_rx, transmitter, log) = connect_recording(true, None, |seen| seen.url == "/pair-verify", Identities::new()).await;
     transmitter.unwrap();
     assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 3, "{log:?}");
     assert_eq!(count(&log, RtspMethod::Post, "/pair-verify"), 1, "refused at M1: {log:?}");
@@ -389,14 +427,32 @@ async fn gives_up_when_setup_and_the_pairing_upgrade_both_fail() {
     assert_eq!(setups(&log), [false], "no second unpaired SETUP: {log:?}");
 }
 
-/// Without pair-first, a refused SETUP is retried once on a paired session.
+/// Without pair-first, a refused unpaired SETUP is retried on a paired session.
 #[tokio::test]
-async fn upgrades_to_pairing_once_when_the_unpaired_setup_is_refused() {
-    // The mock refuses the paired SETUP too, so this checks the order of attempts and that it stops there.
+async fn upgrades_to_pairing_when_the_unpaired_setup_is_refused() {
+    let (_rx, transmitter, log) = connect_recording(false, None, is_unpaired_setup, Identities::new()).await;
+    let mut transmitter = transmitter.unwrap();
+    assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 3, "{log:?}");
+    assert_eq!(setups(&log), [false, true], "unpaired first, then paired: {log:?}");
+    assert_streams_use_pairing_secret(&mut transmitter, &log);
+}
+
+/// The pairing upgrade happens once: if the paired SETUP is refused too, connect() fails.
+#[tokio::test]
+async fn gives_up_when_the_paired_setup_after_the_upgrade_is_refused() {
     let (_rx, transmitter, log) = connect_recording(false, None, is_setup, Identities::new()).await;
     assert!(transmitter.is_err(), "{log:?}");
     assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 3, "{log:?}");
-    assert_eq!(setups(&log), [false, true], "unpaired first, then paired: {log:?}");
+    assert_eq!(setups(&log), [false, true], "{log:?}");
+}
+
+/// With pair-first, a refused SETUP after successful pairing fails connect(): there is no unpaired fallback then.
+#[tokio::test]
+async fn gives_up_when_the_setup_after_pairing_first_is_refused() {
+    let (_rx, transmitter, log) = connect_recording(true, None, is_paired_setup, Identities::new()).await;
+    assert!(transmitter.is_err(), "{log:?}");
+    assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 3, "{log:?}");
+    assert_eq!(setups(&log), [true], "no unpaired retry after pairing worked: {log:?}");
 }
 
 #[tokio::test]
