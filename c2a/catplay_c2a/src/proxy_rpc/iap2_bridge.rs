@@ -26,7 +26,11 @@ pub struct Iap2LocationBridge {
 
 impl Iap2LocationBridge {
     pub fn new(mfi: Option<MfiDeficeRef>, identity: CarPlaySessionIdentity, location: LocationBridge) -> CsmSessionBox {
-        info!("AirPlay GPS bridge created: gps_advertised={}, mfi_present={}", identity.has_gps, mfi.is_some());
+        info!(
+            "AirPlay GPS bridge created: gps_advertised={}, mfi_present={}",
+            identity.has_gps,
+            mfi.is_some()
+        );
         let (session, events) = CarPlayServerSession::new(mfi, identity);
         Box::new(Self {
             session,
@@ -59,7 +63,10 @@ impl CsmSession for Iap2LocationBridge {
         }
         if packet.cast::<AuthenticationSucceeded>().is_some() && !self.authenticated {
             self.authenticated = true;
-            info!("AirPlay GPS authentication complete: iPhone_location_requested={}", self.received_start);
+            info!(
+                "AirPlay GPS authentication complete: iPhone_location_requested={}",
+                self.received_start
+            );
         }
         self.session.respond(packet, handle).await
     }

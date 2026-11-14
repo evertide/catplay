@@ -319,7 +319,10 @@ mod tests {
 
     fn sentences(sentences: &[&str]) -> LocationInformation {
         LocationInformation {
-            nmea_sentence: sentences.iter().map(|sentence| (*sentence).into()).collect(),
+            nmea_sentence: sentences
+                .iter()
+                .map(|sentence| (*sentence).into())
+                .collect(),
         }
     }
 
