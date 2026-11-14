@@ -26,6 +26,9 @@ plist_struct! {
     pub struct InfoMessageResponse {
         pub audio_formats: Vec<AudioFormatStruct>,
         pub audio_latencies: Vec<AudioLatency>,
+        /// What the car wants on its alt screen (e.g. `maps:/car/instrumentcluster`); without it iOS draws an empty cluster.
+        #[serde(rename = "altScreenSuggestUIURLs")]
+        pub alt_screen_suggest_ui_urls: Option<Vec<String>>,
         #[serde(rename = "bluetoothIDs", default)]
         pub bluetooth_ids: Vec<String>,
         #[serde(rename = "deviceID")]
@@ -413,5 +416,46 @@ plist_struct! {
         pub hid_vendor_id: u16,
         pub name: String,
         pub uuid: String,
+    }
+}
+
+#[cfg(test)]
+mod info_response_tests {
+    use super::*;
+    use catplay_plist::{Value, from_bytes, to_writer_binary};
+
+    #[test]
+    fn alt_screen_suggest_ui_urls_survive_a_round_trip() {
+        // A Volvo XC90 (AirTunes/365.10.4) names what its instrument cluster shows only here, not as a per-display initialURL.
+        // Dropping it while proxying /info made iOS stream an empty (black) cluster.
+        let urls = vec!["maps:/car/instrumentcluster".to_owned()];
+        let info = InfoMessageResponse {
+            alt_screen_suggest_ui_urls: Some(urls.clone()),
+            ..Default::default()
+        };
+        let mut binary = Vec::new();
+        to_writer_binary(&mut binary, &info).unwrap();
+
+        let Value::Dictionary(dict) = from_bytes::<Value>(&binary).unwrap() else {
+            panic!("not a dictionary");
+        };
+        assert_eq!(
+            dict.get("altScreenSuggestUIURLs"),
+            Some(&Value::Array(vec!["maps:/car/instrumentcluster".into()]))
+        );
+        assert_eq!(
+            from_bytes::<InfoMessageResponse>(&binary)
+                .unwrap()
+                .alt_screen_suggest_ui_urls,
+            Some(urls)
+        );
+
+        // Cars without an alt screen keep the key absent.
+        binary.clear();
+        to_writer_binary(&mut binary, &InfoMessageResponse::default()).unwrap();
+        let Value::Dictionary(dict) = from_bytes::<Value>(&binary).unwrap() else {
+            panic!("not a dictionary");
+        };
+        assert!(dict.get("altScreenSuggestUIURLs").is_none());
     }
 }
