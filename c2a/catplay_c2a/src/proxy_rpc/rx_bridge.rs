@@ -128,7 +128,7 @@ impl AirPlayReceiverSink for CarPlayRxSession {
         }
         let identity = identity?;
         self.local_iap2 = true;
-        Some(Iap2LocationBridge::new(self.mfi.clone(), identity, self.location.clone()))
+        Some(Iap2LocationBridge::new(self.mfi.clone(), identity, self.location.clone(), true))
     }
 
     fn iap2_is_optional(&self) -> bool {

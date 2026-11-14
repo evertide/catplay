@@ -15,8 +15,8 @@ use catplay_iap2_client::{
     CsmClient, CsmClientHandle, CsmRemote, CsmSessionCallbacks, CsmSessionStatus,
     tokio::{AsyncClient, AsyncClientDrain},
 };
-use catplay_util::{EventReconciler, EventSleeper};
-use futures::executor::block_on;
+use catplay_util::{EventReconciler, EventSleeper, mpsc};
+use futures::{FutureExt, StreamExt, executor::block_on};
 
 use super::*;
 use crate::proxy_rpc::{CarPlayRxSession, TxAdapter, TxAdapterOp};
@@ -89,10 +89,10 @@ fn pump(session: &mut dyn CsmSession, handle: &Arc<Capture>) {
         .wait_event()
         .now_or_never()
         .expect("queued event must wake the session");
-    session.process_event(handle.clone()).unwrap();
+    while session.process_event(handle.clone()).unwrap() {}
 }
 
-fn phone(location: LocationBridge) -> CsmSessionBox {
+fn unready_phone(location: LocationBridge) -> CsmSessionBox {
     Iap2LocationBridge::new(
         None,
         CarPlaySessionIdentity {
@@ -100,7 +100,33 @@ fn phone(location: LocationBridge) -> CsmSessionBox {
             ..CarPlaySessionIdentity::default()
         },
         location,
+        true,
     )
+}
+
+fn authenticate_phone(session: &mut dyn CsmSession, out: &Arc<Capture>) {
+    block_on(session.start(out.clone())).unwrap();
+    respond(session, out, IdentificationAccepted::default());
+    respond(session, out, AuthenticationSucceeded::default());
+}
+
+fn phone(location: LocationBridge) -> CsmSessionBox {
+    let mut session = unready_phone(location);
+    authenticate_phone(&mut session, &Arc::new(Capture::default()));
+    session
+}
+
+fn take_location(out: &Arc<Capture>) -> LocationInformation {
+    let nmea_sentence = out
+        .take()
+        .into_iter()
+        .flat_map(|packet| {
+            let packet = packet.cast::<LocationInformation>().expect("only location data");
+            assert_eq!(packet.nmea_sentence.len(), 1, "one sentence per message");
+            packet.nmea_sentence.clone()
+        })
+        .collect();
+    LocationInformation { nmea_sentence }
 }
 
 fn car_id() -> IdentificationInformation {
@@ -150,7 +176,6 @@ fn early_request_waits_for_identification_and_authentication_but_not_power() {
         let car_out = Arc::new(Capture::default());
         let phone_out = Arc::new(Capture::default());
         respond(&mut phone, &phone_out, StartLocationInformation::all());
-        pump(&mut phone, &phone_out);
         pump(&mut car, &car_out);
         assert!(car_out.take().is_empty());
 
@@ -232,7 +257,6 @@ fn no_commands_without_subscription_or_full_location_capabilities() {
         if subscribe {
             assert!(!location.is_available());
             respond(&mut phone, &phone_out, StartLocationInformation::all());
-            pump(&mut phone, &phone_out);
             pump(&mut car, &car_out);
         }
         respond(&mut car, &car_out, sample());
@@ -254,14 +278,11 @@ fn forwards_only_while_subscribed_and_stops_on_unsubscribe_or_disconnect() {
         respond(&mut car, &car_out, sample());
         assert!(phone.wait_event().now_or_never().is_none());
         respond(&mut phone, &phone_out, StartLocationInformation::all());
-        pump(&mut phone, &phone_out);
         pump(&mut car, &car_out);
         assert_eq!(car_out.location_commands().len(), 1);
         respond(&mut car, &car_out, sample());
         pump(&mut phone, &phone_out);
-        let packets = phone_out.take();
-        assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].cast::<LocationInformation>(), Some(&sample()));
+        assert_eq!(take_location(&phone_out), sample());
 
         respond(&mut car, &car_out, sample()); // Queue data just before Stop/disconnect.
         phone.wait_event().now_or_never().unwrap();
@@ -269,7 +290,6 @@ fn forwards_only_while_subscribed_and_stops_on_unsubscribe_or_disconnect() {
             drop(phone);
         } else {
             respond(&mut phone, &phone_out, StopLocationInformation::default());
-            pump(&mut phone, &phone_out);
         }
         pump(&mut car, &car_out);
         let commands = car_out.location_commands();
@@ -289,9 +309,7 @@ fn stop_before_authentication_cancels_deferred_request() {
     let car_out = Arc::new(Capture::default());
     let phone_out = Arc::new(Capture::default());
     respond(&mut phone, &phone_out, StartLocationInformation::all());
-    pump(&mut phone, &phone_out);
     respond(&mut phone, &phone_out, StopLocationInformation::default());
-    pump(&mut phone, &phone_out);
     ready(&mut car, &car_out);
     assert!(car_out.location_commands().is_empty());
 }
@@ -312,14 +330,12 @@ fn empty_or_unsupported_replacements_stop_gps_until_a_usable_request() {
         let phone_out = Arc::new(Capture::default());
         ready(&mut car, &car_out);
         respond(&mut phone, &phone_out, StartLocationInformation::all());
-        pump(&mut phone, &phone_out);
         pump(&mut car, &car_out);
         assert_eq!(car_out.location_commands().len(), 1);
         respond(&mut car, &car_out, sample());
 
         for expected_stops in [1, 0] {
             respond(&mut phone, &phone_out, rejected.clone());
-            pump(&mut phone, &phone_out);
             pump(&mut car, &car_out);
             let commands = car_out.location_commands();
             assert_eq!(commands.len(), expected_stops);
@@ -334,12 +350,11 @@ fn empty_or_unsupported_replacements_stop_gps_until_a_usable_request() {
         }
 
         respond(&mut phone, &phone_out, StartLocationInformation::all());
-        pump(&mut phone, &phone_out);
         pump(&mut car, &car_out);
         assert_eq!(car_out.location_commands().len(), 1);
         respond(&mut car, &car_out, sample());
         pump(&mut phone, &phone_out);
-        assert_eq!(phone_out.take()[0].cast::<LocationInformation>(), Some(&sample()));
+        assert_eq!(take_location(&phone_out), sample());
     }
 }
 
@@ -352,7 +367,6 @@ fn replacement_usb_session_repeats_negotiation_for_the_live_iphone_request() {
     let phone_out = Arc::new(Capture::default());
     ready(&mut car, &car_out);
     respond(&mut phone, &phone_out, StartLocationInformation::all());
-    pump(&mut phone, &phone_out);
     pump(&mut car, &car_out);
     car_out.take();
     drop(car);
@@ -365,7 +379,7 @@ fn replacement_usb_session_repeats_negotiation_for_the_live_iphone_request() {
     assert_eq!(car_out.location_commands().len(), 1);
     respond(&mut car, &car_out, sample());
     pump(&mut phone, &phone_out);
-    assert_eq!(phone_out.take()[0].cast::<LocationInformation>(), Some(&sample()));
+    assert_eq!(take_location(&phone_out), sample());
 }
 
 #[test]
@@ -377,7 +391,6 @@ fn slow_phone_keeps_each_sentence_type_after_a_cancelled_wait() {
     let phone_out = Arc::new(Capture::default());
     ready(&mut car, &car_out);
     respond(&mut phone, &phone_out, StartLocationInformation::all());
-    pump(&mut phone, &phone_out);
     pump(&mut car, &car_out);
     assert!(phone.wait_event().now_or_never().is_none());
     respond(&mut car, &car_out, sample());
@@ -401,9 +414,7 @@ fn slow_phone_keeps_each_sentence_type_after_a_cancelled_wait() {
         }
     }
     pump(&mut phone, &phone_out);
-    let packets = phone_out.take();
-    assert_eq!(packets.len(), 1);
-    assert_eq!(packets[0].cast::<LocationInformation>(), Some(&latest));
+    assert_eq!(take_location(&phone_out), latest);
     assert!(!phone.process_event(phone_out.clone()).unwrap());
     assert!(phone.wait_event().now_or_never().is_none());
 }
@@ -422,7 +433,7 @@ fn relay(drain: &mut AsyncClientDrain, client: &mut AsyncClient) {
 }
 
 #[tokio::test]
-async fn merged_groups_are_split_through_the_default_2048_byte_link() {
+async fn single_sentence_messages_fit_the_default_2048_byte_link() {
     let location = LocationBridge::default();
     let mut car = CarPlayClientSession::with_location(location.clone());
     let car_out = Arc::new(Capture::default());
@@ -430,13 +441,17 @@ async fn merged_groups_are_split_through_the_default_2048_byte_link() {
     let phone_out = Arc::new(Capture::default());
     let captured = phone_out.clone();
     let peer_session = CsmSessionCallbacks::new(
-        async |handle| handle.send(&StartLocationInformation::all()),
+        async |handle| {
+            handle.send(&IdentificationAccepted::default())?;
+            handle.send(&AuthenticationSucceeded::default())?;
+            handle.send(&StartLocationInformation::all())
+        },
         move |packet, _| {
             captured.0.lock().unwrap().push(packet);
             async { Ok(()) }
         },
     );
-    let (mut client, mut outgoing) = AsyncClient::new(false, CsmRemote::airplay(), phone(location));
+    let (mut client, mut outgoing) = AsyncClient::new(false, CsmRemote::airplay(), unready_phone(location));
     let (mut peer, mut incoming) = AsyncClient::new(true, CsmRemote::airplay(), Box::new(peer_session));
     for _ in 0..100 {
         tick(&mut client).await;
@@ -449,24 +464,22 @@ async fn merged_groups_are_split_through_the_default_2048_byte_link() {
     assert_eq!(client.handle().max_csm_payload_len(), 2048 - 10 - 6);
     phone_out.take();
 
-    // Each group has 1,200 payload bytes; merging them would produce a 2,416-byte frame.
-    let gsv = LocationInformation {
-        nmea_sentence: (1..=2)
-            .map(|part| format!("$GPGSV,2,{part},{}", "x".repeat(584)))
-            .collect(),
+    // Each sentence fits, but combining GGA and RMC exceeds the peer limit.
+    let gga = LocationInformation {
+        nmea_sentence: vec![format!("$GPGGA,{}", "x".repeat(1188))],
     };
     let rmc = LocationInformation {
         nmea_sentence: vec![format!("$GPRMC,{}", "x".repeat(1188))],
     };
     let registry = CsmPacketRegistry::static_registry();
-    for group in [&gsv, &rmc] {
+    for group in [&gga, &rmc] {
         assert_eq!(registry.encode(group).unwrap().len(), 1206);
     }
-    let mut merged = gsv.clone();
+    let mut merged = gga.clone();
     merged.nmea_sentence.extend(rmc.nmea_sentence.clone());
     assert_eq!(registry.encode(&merged).unwrap().len() + 10, 2416);
 
-    for expected in [vec![gsv, rmc], vec![sample()]] {
+    for expected in [vec![gga, rmc], vec![sample()]] {
         for group in &expected {
             respond(&mut car, &car_out, group.clone());
         }
@@ -476,11 +489,10 @@ async fn merged_groups_are_split_through_the_default_2048_byte_link() {
             tick(&mut peer).await;
             relay(&mut incoming, &mut client);
         }
-        let packets = phone_out.take();
-        assert_eq!(packets.len(), expected.len());
-        for (packet, expected) in packets.iter().zip(&expected) {
-            assert_eq!(packet.cast::<LocationInformation>(), Some(expected));
-        }
+        let expected = LocationInformation {
+            nmea_sentence: expected.into_iter().flat_map(|packet| packet.nmea_sentence).collect(),
+        };
+        assert_eq!(take_location(&phone_out), expected);
         assert!(!client.handle().has_pending_send());
     }
 }
@@ -494,13 +506,17 @@ async fn delayed_rtsp_response_keeps_new_fixes_in_the_accumulator() {
     let phone_out = Arc::new(Capture::default());
     let captured = phone_out.clone();
     let peer_session = CsmSessionCallbacks::new(
-        async |handle| handle.send(&StartLocationInformation::all()),
+        async |handle| {
+            handle.send(&IdentificationAccepted::default())?;
+            handle.send(&AuthenticationSucceeded::default())?;
+            handle.send(&StartLocationInformation::all())
+        },
         move |packet, _| {
             captured.0.lock().unwrap().push(packet);
             async { Ok(()) }
         },
     );
-    let (mut client, mut outgoing) = AsyncClient::new(false, CsmRemote::airplay(), phone(location));
+    let (mut client, mut outgoing) = AsyncClient::new(false, CsmRemote::airplay(), unready_phone(location));
     let (mut peer, mut incoming) = AsyncClient::new(true, CsmRemote::airplay(), Box::new(peer_session));
     // Complete real iAP2 link negotiation and deliver the phone's subscription.
     for _ in 0..100 {
@@ -558,7 +574,7 @@ async fn delayed_rtsp_response_keeps_new_fixes_in_the_accumulator() {
         assert!(outgoing.sleep().now_or_never().is_none());
         assert!(outgoing.take().is_none());
     }
-    assert_eq!(phone_out.take()[0].cast::<LocationInformation>(), Some(&sample()));
+    assert_eq!(take_location(&phone_out).nmea_sentence, vec![sample().nmea_sentence[0].clone()]);
     responses.feed(RtspResponse::new(None, HttpStatus::Ok));
     response.await.unwrap();
     drop(permit);
@@ -569,9 +585,7 @@ async fn delayed_rtsp_response_keeps_new_fixes_in_the_accumulator() {
         tick(&mut peer).await;
         relay(&mut incoming, &mut client);
     }
-    let packets = phone_out.take();
-    assert_eq!(packets.len(), 1);
-    assert_eq!(packets[0].cast::<LocationInformation>(), Some(&latest));
+    assert_eq!(take_location(&phone_out), latest);
     assert!(!client.handle().has_pending_send());
 }
 
@@ -619,7 +633,6 @@ fn overlapping_usb_sessions_both_wake_for_start_and_stop() {
         } else {
             respond(&mut phone, &phone_out, StopLocationInformation::default());
         }
-        pump(&mut phone, &phone_out);
         assert!(first_wakes.0.load(Ordering::Relaxed) > 0);
         assert!(second_wakes.0.load(Ordering::Relaxed) > 0);
         assert!(first_wait.as_mut().poll(&mut first_context).is_ready());
@@ -662,7 +675,6 @@ fn reidentification_stops_gps_until_authentication_is_repeated() {
     let phone_out = Arc::new(Capture::default());
     ready(&mut car, &car_out);
     respond(&mut phone, &phone_out, StartLocationInformation::all());
-    pump(&mut phone, &phone_out);
     pump(&mut car, &car_out);
     car_out.take();
     respond(&mut car, &car_out, car_id());
@@ -683,17 +695,21 @@ fn replacing_a_request_discards_old_fixes_without_cancelling_the_new_subscriptio
     let mut car = CarPlayClientSession::with_location(location.clone());
     let car_out = Arc::new(Capture::default());
     ready(&mut car, &car_out);
-    let first = location.subscribe(StartLocationInformation::all());
+    location.set_request(Some(StartLocationInformation::all()));
+    let first = location.subscribe();
     pump(&mut car, &car_out);
     car_out.take();
     respond(&mut car, &car_out, sample());
-    let mut second = location.subscribe(StartLocationInformation::all());
+    location.set_request(Some(StartLocationInformation::all()));
+    let mut second = location.subscribe();
     drop(first);
     pump(&mut car, &car_out);
     assert!(car_out.take().is_empty());
     assert!(second.take(2048 - 16).is_none());
     respond(&mut car, &car_out, sample());
-    assert_eq!(second.take(2048 - 16), Some(sample()));
+    for sentence in sample().nmea_sentence {
+        assert_eq!(second.take(2048 - 16), Some(LocationInformation { nmea_sentence: vec![sentence] }));
+    }
     drop(second);
     pump(&mut car, &car_out);
     let commands = car_out.location_commands();
@@ -772,7 +788,6 @@ fn volvo_negotiation_waits_for_an_iphone_location_request() {
     assert!(car_out.location_commands().is_empty());
 
     respond(&mut endpoint, &phone_out, StartLocationInformation::all());
-    pump(&mut endpoint, &phone_out);
     pump(&mut car, &car_out);
     let commands = car_out.location_commands();
     assert_eq!(commands.len(), 1);
@@ -864,49 +879,200 @@ fn airplay_uses_the_wireless_identity_and_keeps_ownership_after_endpoint_failure
     assert!(proxy.next().now_or_never().is_none());
 }
 
+fn bluetooth(location: LocationBridge) -> CsmSessionBox {
+    // The production Bluetooth factory uses this adapter and the same bridge.
+    Iap2LocationBridge::new(None, wireless_identity(), location, false)
+}
+
+fn build_12_request() -> StartLocationInformation {
+    StartLocationInformation {
+        global_positioning_system_fix_data: CsmFlag::Yes,
+        recommended_minimum_specific_gps_transit_data: CsmFlag::Yes,
+        vehicle_speed_data: CsmFlag::Yes,
+        nmea_sentence_gpgga_interval_min: Some(250),
+        nmea_sentence_gprmc_interval_min: Some(250),
+        nmea_sentence_pascd_interval_min: Some(20),
+        ..StartLocationInformation::default()
+    }
+}
+
 #[test]
-fn bluetooth_disconnect_leaves_gps_flowing_until_airplay_teardown() {
+fn bluetooth_start_delivers_over_airplay_after_authentication_without_another_start() {
     let location = LocationBridge::default();
     let mut car = CarPlayClientSession::with_location(location.clone());
     let car_out = Arc::new(Capture::default());
+    let bt_out = Arc::new(Capture::default());
     let phone_out = Arc::new(Capture::default());
     ready(&mut car, &car_out);
-
-    // Use the same unwrapped Bluetooth session as CarPlayWirelessGadget.
-    let identity = wireless_identity();
-    let mut bluetooth = CarPlayServerSession::new(None, identity.clone()).0;
-    respond(&mut bluetooth, &phone_out, StartLocationInformation::all());
-    assert!(!car.process_event(car_out.clone()).unwrap());
-    assert!(car_out.location_commands().is_empty());
-
-    let (mut sink, _proxy) = airplay_sink(location, Some(identity));
-    let mut airplay = block_on(sink.open_iap2()).unwrap();
-    respond(&mut airplay, &phone_out, StartLocationInformation::all());
-    pump(&mut airplay, &phone_out);
+    let mut bluetooth = bluetooth(location.clone());
+    respond(&mut bluetooth, &bt_out, StartIdentification::default());
+    let bt_id = bt_out.take();
+    let bt_id = bt_id[0].cast::<IdentificationInformation>().unwrap();
+    respond(&mut bluetooth, &bt_out, build_12_request());
     pump(&mut car, &car_out);
-    assert_eq!(car_out.location_commands().len(), 1);
+    let commands = car_out.location_commands();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].cast::<StartLocationInformation>(), Some(&build_12_request()));
+
+    let (mut sink, _proxy) = airplay_sink(location.clone(), Some(wireless_identity()));
+    let mut airplay = block_on(sink.open_iap2()).unwrap();
+    block_on(airplay.start(phone_out.clone())).unwrap();
+    respond(&mut airplay, &phone_out, StartIdentification::default());
+    let packets = phone_out.take();
+    assert_eq!(packets[0].cast::<IdentificationInformation>(), Some(bt_id));
+    let mut update = sample();
+    update.nmea_sentence.insert(0, "$GNGGA,1*00\r\n".into());
+    let mut unfiltered = update.clone();
+    unfiltered
+        .nmea_sentence
+        .extend(["$GPGSV,unrequested".into(), "$UNKNOWN,ignored".into()]);
+    respond(&mut car, &car_out, unfiltered);
+    assert!(!airplay.process_event(phone_out.clone()).unwrap());
+    assert!(airplay.wait_event().now_or_never().is_none());
+    respond(&mut airplay, &phone_out, IdentificationAccepted::default());
+    assert!(!airplay.process_event(phone_out.clone()).unwrap());
+    assert!(phone_out.take().is_empty());
+    respond(&mut airplay, &phone_out, AuthenticationSucceeded::default());
+    pump(&mut airplay, &phone_out);
+    assert_eq!(take_location(&phone_out), update);
+    assert!(bt_out.take().is_empty());
+
+    // disableBluetooth destroys the BT session, but is not StopLocationInformation.
+    drop(bluetooth);
+    assert!(location.is_requested());
+    assert!(!car.process_event(car_out.clone()).unwrap());
     respond(&mut car, &car_out, sample());
     pump(&mut airplay, &phone_out);
-    assert_eq!(phone_out.take()[0].cast::<LocationInformation>(), Some(&sample()));
-
-    // DisableBluetooth closes this session while AirPlay stays alive.
-    respond(&mut bluetooth, &phone_out, StopLocationInformation::default());
-    drop(bluetooth);
-    assert!(!car.process_event(car_out.clone()).unwrap());
-    assert!(car_out.take().is_empty());
-    assert!(car.wait_event().now_or_never().is_none());
-    let next = LocationInformation {
-        nmea_sentence: vec!["$PASCD,42*00\r\n".into()],
-    };
-    respond(&mut car, &car_out, next.clone());
-    pump(&mut airplay, &phone_out);
-    let packets = phone_out.take();
-    assert_eq!(packets.len(), 1);
-    assert_eq!(packets[0].cast::<LocationInformation>(), Some(&next));
+    assert_eq!(take_location(&phone_out), sample());
 
     drop(airplay);
     pump(&mut car, &car_out);
     let commands = car_out.location_commands();
     assert_eq!(commands.len(), 1);
     assert!(commands[0].cast::<StopLocationInformation>().is_some());
+    assert!(!location.is_requested());
+}
+
+fn stop_after_bluetooth_start(over_bluetooth: bool) {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    let phone_out = Arc::new(Capture::default());
+    ready(&mut car, &car_out);
+    let mut bluetooth = bluetooth(location.clone());
+    let mut airplay = phone(location.clone());
+    respond(&mut bluetooth, &phone_out, build_12_request());
+    pump(&mut car, &car_out);
+    assert_eq!(car_out.location_commands().len(), 1);
+    respond(&mut car, &car_out, sample());
+    pump(&mut airplay, &phone_out);
+    assert_eq!(take_location(&phone_out), sample());
+    respond(&mut car, &car_out, sample());
+    airplay
+        .wait_event()
+        .now_or_never()
+        .expect("pending data before Stop");
+
+    let stopping_transport = if over_bluetooth { &mut bluetooth } else { &mut airplay };
+    respond(stopping_transport, &phone_out, StopLocationInformation::default());
+    assert!(!location.is_requested());
+    // Even before the car processes Stop, neither buffered nor late data may escape.
+    respond(&mut car, &car_out, sample());
+    assert!(!airplay.process_event(phone_out.clone()).unwrap());
+    assert!(airplay.wait_event().now_or_never().is_none());
+    assert!(phone_out.take().is_empty());
+    pump(&mut car, &car_out);
+    let commands = car_out.location_commands();
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].cast::<StopLocationInformation>().is_some());
+}
+
+#[test]
+fn airplay_stop_cancels_a_bluetooth_subscription() {
+    stop_after_bluetooth_start(false);
+}
+
+#[test]
+fn bluetooth_stop_cancels_airplay_delivery() {
+    stop_after_bluetooth_start(true);
+}
+
+#[test]
+fn no_location_delivery_without_start_on_either_transport() {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    let phone_out = Arc::new(Capture::default());
+    ready(&mut car, &car_out);
+    let mut bluetooth = bluetooth(location.clone());
+    let mut airplay = phone(location);
+    respond(&mut car, &car_out, sample());
+    assert!(!car.process_event(car_out.clone()).unwrap());
+    assert!(car_out.location_commands().is_empty());
+    assert!(!bluetooth.process_event(phone_out.clone()).unwrap());
+    assert!(!airplay.process_event(phone_out.clone()).unwrap());
+    assert!(airplay.wait_event().now_or_never().is_none());
+    assert!(phone_out.take().is_empty());
+}
+
+#[test]
+fn bluetooth_stop_before_airplay_creation_cancels_the_handoff() {
+    let location = LocationBridge::default();
+    let phone_out = Arc::new(Capture::default());
+    let mut bluetooth = bluetooth(location.clone());
+    respond(&mut bluetooth, &phone_out, build_12_request());
+    respond(&mut bluetooth, &phone_out, StopLocationInformation::default());
+    let mut airplay = phone(location.clone());
+    let mut car = CarPlayClientSession::with_location(location);
+    let car_out = Arc::new(Capture::default());
+    ready(&mut car, &car_out);
+    respond(&mut car, &car_out, sample());
+    assert!(car_out.location_commands().is_empty());
+    assert!(!airplay.process_event(phone_out.clone()).unwrap());
+    assert!(phone_out.take().is_empty());
+}
+
+#[test]
+fn replacement_bluetooth_request_discards_fixes_and_delivers_only_requested_speed() {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    let phone_out = Arc::new(Capture::default());
+    ready(&mut car, &car_out);
+    let mut bluetooth = bluetooth(location.clone());
+    let mut airplay = phone(location);
+    respond(&mut bluetooth, &phone_out, build_12_request());
+    pump(&mut car, &car_out);
+    car_out.take();
+    respond(&mut car, &car_out, sample());
+    airplay.wait_event().now_or_never().unwrap();
+
+    let speed_only = StartLocationInformation {
+        vehicle_speed_data: CsmFlag::Yes,
+        nmea_sentence_pascd_interval_min: Some(20),
+        ..StartLocationInformation::default()
+    };
+    respond(&mut bluetooth, &phone_out, speed_only.clone());
+    assert!(!airplay.process_event(phone_out.clone()).unwrap());
+    assert!(airplay.wait_event().now_or_never().is_none());
+    pump(&mut car, &car_out);
+    let commands = car_out.location_commands();
+    assert_eq!(commands.len(), 2);
+    assert!(commands[0].cast::<StopLocationInformation>().is_some());
+    assert_eq!(commands[1].cast::<StartLocationInformation>(), Some(&speed_only));
+    respond(&mut car, &car_out, sample());
+    pump(&mut airplay, &phone_out);
+    assert_eq!(take_location(&phone_out).nmea_sentence, vec![sample().nmea_sentence[1].clone()]);
+}
+
+#[test]
+fn a_new_bluetooth_connection_does_not_inherit_an_unfinished_handoff() {
+    let location = LocationBridge::default();
+    let phone_out = Arc::new(Capture::default());
+    let mut first = bluetooth(location.clone());
+    respond(&mut first, &phone_out, build_12_request());
+    drop(first);
+    assert!(location.is_requested()); // Still available for this phone's AirPlay handoff.
+    let _next = bluetooth(location.clone());
+    assert!(!location.is_requested());
 }

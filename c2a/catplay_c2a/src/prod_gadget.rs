@@ -23,7 +23,7 @@ use catplay_util::{
 use log::{debug, error, info};
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::proxy_rpc::{CarManager, CarPlayRxSession, TxAdapter, TxAdapterOp};
+use crate::proxy_rpc::{CarManager, CarPlayRxSession, Iap2LocationBridge, TxAdapter, TxAdapterOp};
 
 pub struct ProdGadgetConfig {
     pub homekit_rx: HomekitStorageRef,
@@ -247,6 +247,13 @@ impl Reconcilable for ProdGadget {
                 .set_identity_callback(move |wireless_identity| {
                     identity.lock().unwrap().replace(wireless_identity);
                 });
+            let location = self.location.clone();
+            let mfi = self.cfg.mfi.clone();
+            self.rx
+                .as_mut()
+                .unwrap()
+                .child_mut()
+                .set_bluetooth_session(move |identity| Iap2LocationBridge::new(mfi.clone(), identity, location.clone(), false));
         }
 
         if self.tx.is_none() {
