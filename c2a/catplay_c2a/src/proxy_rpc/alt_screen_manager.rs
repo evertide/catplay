@@ -21,6 +21,47 @@ pub struct AltScreenManager {
     pending_setup: Option<oneshot::Receiver<TeardownGuard<ScreenTransmitProxy>>>,
     /// Last iPhone keyframe received while the car SETUP was pending, so the car stream does not start with delta frames only.
     pending_keyframe: Option<EncodedVideoFrame>,
+    /// Diagnostics: frames submitted to the car since the last iPhone stream started.
+    submitted: u64,
+}
+
+/// Diagnostics (XC90 build only): where the first submitted alt screen keyframe is written, as Annex-B H.264 with SPS/PPS.
+const DUMP_PATH: &str = "/tmp/altscreen.h264";
+/// Only one dump attempt per process, whatever its outcome.
+static DUMP_TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Diagnostics: log the first frames and every keyframe submitted to the car's alt screen (a submission is not proof of delivery),
+/// and dump the first keyframe of the process on a background thread so the frame path never waits on I/O.
+fn trace_submitted(count: u64, frame: &EncodedVideoFrame) {
+    let keyframe = frame.is_known_keyframe();
+    if count < 5 || keyframe {
+        let head: Vec<String> = frame
+            .data
+            .iter()
+            .take(6)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        info!(
+            "Submitting alt screen frame #{count} to car: {} bytes, {}x{}, keyframe={keyframe}, config={}, head={}",
+            frame.data.len(),
+            frame.width,
+            frame.height,
+            frame.config.is_some(),
+            head.join(" ")
+        );
+    }
+    if keyframe && !DUMP_TRIED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let mut out = frame
+            .config
+            .as_ref()
+            .map(|c| c.avcc.sps_pps.clone())
+            .unwrap_or_default();
+        out.extend_from_slice(&frame.data);
+        std::thread::spawn(move || match std::fs::write(DUMP_PATH, &out) {
+            Ok(()) => info!("Dumped alt screen keyframe ({} bytes) to {DUMP_PATH}", out.len()),
+            Err(err) => warn!("Could not dump alt screen keyframe: {err}"),
+        });
+    }
 }
 
 impl AltScreenManager {
@@ -35,6 +76,7 @@ impl AltScreenManager {
         self.iphone_screen_rx.replace(channel);
         self.uuid = uuid;
         self.pending_keyframe.take();
+        self.submitted = 0;
         self.car_screen.take()
     }
 
@@ -67,6 +109,8 @@ impl AltScreenManager {
                     if let Some(mut keyframe) = self.pending_keyframe.take() {
                         warn!("Repeating iPhone alt screen keyframe received during SETUP");
                         keyframe.pts = (Instant::now() + Duration::from_millis(75)).into();
+                        trace_submitted(self.submitted, &keyframe);
+                        self.submitted += 1;
 
                         if let Err((err, _frame)) = screen.push_frame(keyframe).await {
                             warn!("Sink rejected iPhone alt screen keyframe?: {err}");
@@ -93,17 +137,21 @@ impl AltScreenManager {
                         self.pending_keyframe.replace(frame);
                     }
                     None => debug!("Dropping iPhone alt screen frame, no car alt screen (yet)"),
-                    Some(car_screen) => match car_screen.push_frame(frame).await {
-                        Err((ScreenTransmitError::NeedsKeyframe, _frame)) => {
-                            warn!("Dropping iPhone alt screen delta frame, requesting a keyframe ASAP");
-                            match self.uuid.as_deref() {
-                                Some(uuid) => handle.request_display_keyframe(uuid),
-                                None => warn!("Cannot request alt screen keyframe without display UUID"),
+                    Some(car_screen) => {
+                        trace_submitted(self.submitted, &frame);
+                        self.submitted += 1;
+                        match car_screen.push_frame(frame).await {
+                            Err((ScreenTransmitError::NeedsKeyframe, _frame)) => {
+                                warn!("Dropping iPhone alt screen delta frame, requesting a keyframe ASAP");
+                                match self.uuid.as_deref() {
+                                    Some(uuid) => handle.request_display_keyframe(uuid),
+                                    None => warn!("Cannot request alt screen keyframe without display UUID"),
+                                }
                             }
+                            Err((err, _frame)) => warn!("Sink rejected iPhone alt screen frame?: {err}"),
+                            Ok(()) => {}
                         }
-                        Err((err, _frame)) => warn!("Sink rejected iPhone alt screen frame?: {err}"),
-                        Ok(()) => {}
-                    },
+                    }
                 }
                 let _ = consumed.send(());
             }
