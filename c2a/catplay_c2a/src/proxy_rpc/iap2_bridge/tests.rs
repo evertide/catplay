@@ -976,12 +976,13 @@ fn stop_after_bluetooth_start(over_bluetooth: bool) {
     let stopping_transport = if over_bluetooth { &mut bluetooth } else { &mut airplay };
     respond(stopping_transport, &phone_out, StopLocationInformation::default());
     assert!(!location.is_requested());
-    // Even before the car processes Stop, neither buffered nor late data may escape.
+    // Buffered data must not escape before the car processes Stop.
+    assert!(!airplay.process_event(phone_out.clone()).unwrap());
+    // A late fix also reconciles Stop, consuming the request notification.
     respond(&mut car, &car_out, sample());
     assert!(!airplay.process_event(phone_out.clone()).unwrap());
     assert!(airplay.wait_event().now_or_never().is_none());
     assert!(phone_out.take().is_empty());
-    pump(&mut car, &car_out);
     let commands = car_out.location_commands();
     assert_eq!(commands.len(), 1);
     assert!(commands[0].cast::<StopLocationInformation>().is_some());

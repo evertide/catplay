@@ -240,20 +240,13 @@ impl Reconcilable for ProdGadget {
                     }
                 },
             ));
-            self.rx
-                .as_mut()
-                .unwrap()
-                .child_mut()
-                .set_identity_callback(move |wireless_identity| {
-                    identity.lock().unwrap().replace(wireless_identity);
-                });
+            let rx = self.rx.as_mut().unwrap().child_mut();
+            rx.set_identity_callback(move |wireless_identity| {
+                identity.lock().unwrap().replace(wireless_identity);
+            });
             let location = self.location.clone();
             let mfi = self.cfg.mfi.clone();
-            self.rx
-                .as_mut()
-                .unwrap()
-                .child_mut()
-                .set_bluetooth_session(move |identity| Iap2LocationBridge::new(mfi.clone(), identity, location.clone(), false));
+            rx.set_bluetooth_session(move |identity| Iap2LocationBridge::new(mfi.clone(), identity, location.clone(), false));
         }
 
         if self.tx.is_none() {
