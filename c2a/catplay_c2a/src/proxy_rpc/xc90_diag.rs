@@ -15,6 +15,8 @@ pub struct Xc90Diag {
     pub main_config: u8,
     /// `xc90_suggest_ui` (default 1): forward the iPhone's suggestUI command to the car (the stock firmware does).
     pub suggest_ui: bool,
+    /// `xc90_config_flags` (default 1): VideoConfig flag bytes like the stock firmware (see `XC90_STOCK_CONFIG_FLAGS`).
+    pub config_flags: bool,
     /// `xc90_alt_resetup` (default 0): re-SETUP the car's alt screen stream whenever the iPhone's alt screen config changes.
     pub alt_resetup: bool,
     /// `xc90_alt_latency_ms` (default 25): latency announced in the car's alt screen SETUP (the iPhone uses 75).
@@ -27,6 +29,7 @@ impl Default for Xc90Diag {
             alt_config: 1,
             main_config: 1,
             suggest_ui: true,
+            config_flags: true,
             alt_resetup: false,
             alt_latency_ms: 25,
         }
@@ -37,7 +40,11 @@ impl Xc90Diag {
     /// The switches from `/persist/config.txt`, read once (the car manager logs them at the start of every car session).
     pub fn get() -> Xc90Diag {
         static DIAG: OnceLock<Xc90Diag> = OnceLock::new();
-        *DIAG.get_or_init(|| Self::parse(&std::fs::read_to_string(CONFIG_FILE).unwrap_or_default()))
+        *DIAG.get_or_init(|| {
+            let diag = Self::parse(&std::fs::read_to_string(CONFIG_FILE).unwrap_or_default());
+            catplay_carplay::screen::XC90_STOCK_CONFIG_FLAGS.store(diag.config_flags, std::sync::atomic::Ordering::Relaxed);
+            diag
+        })
     }
 
     /// VideoConfig header params passed on to the car: 0 = size only (build 13), 1 = plus view origin and size, params 3 and 4
@@ -58,6 +65,7 @@ impl Xc90Diag {
                 "xc90_alt_config" => diag.alt_config = value.parse().unwrap_or(diag.alt_config),
                 "xc90_main_config" => diag.main_config = value.parse().unwrap_or(diag.main_config),
                 "xc90_suggest_ui" => diag.suggest_ui = value == "1",
+                "xc90_config_flags" => diag.config_flags = value == "1",
                 "xc90_alt_resetup" => diag.alt_resetup = value == "1",
                 "xc90_alt_latency_ms" => diag.alt_latency_ms = value.parse().unwrap_or(diag.alt_latency_ms),
                 _ => {}
@@ -75,7 +83,7 @@ mod tests {
     fn parses_switches_and_keeps_defaults() {
         assert_eq!(Xc90Diag::parse(""), Xc90Diag::default());
         let diag = Xc90Diag::parse(
-            "bluetooth_name=Volvo XC90\nxc90_alt_resetup=1\nxc90_alt_config = 0\nxc90_main_config=2\nxc90_suggest_ui=0\nxc90_alt_latency_ms=75\n# xc90_alt_resetup=0\n",
+            "bluetooth_name=Volvo XC90\nxc90_alt_resetup=1\nxc90_alt_config = 0\nxc90_main_config=2\nxc90_suggest_ui=0\nxc90_config_flags=0\nxc90_alt_latency_ms=75\n# xc90_alt_resetup=0\n",
         );
         assert_eq!(
             diag,
@@ -83,6 +91,7 @@ mod tests {
                 alt_config: 0,
                 main_config: 2,
                 suggest_ui: false,
+                config_flags: false,
                 alt_resetup: true,
                 alt_latency_ms: 75
             }

@@ -14,6 +14,11 @@ use crate::{
     },
 };
 
+/// XC90 diagnostics: send VideoConfig frames with the flag bytes of the stock (Carlinkit) firmware, `[0x00, 0x16, 0x01]`: the
+/// unnamed flag bit 4 and NoDisplaySleep (bit 8) on top of RespectTimestamps and Encrypted. Set by the c2a switch
+/// `xc90_config_flags`.
+pub static XC90_STOCK_CONFIG_FLAGS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl ScreenFrame {
     fn scan(&mut self, nal_size_len: usize, from_length_prefixed: bool) -> Result<(), NalError> {
         self.nal_offset_cache = AnnexBConverter::scan_only(&self.data, nal_size_len, from_length_prefixed)?;
@@ -158,6 +163,10 @@ impl ScreenFrame {
 
         if avcc.respect_timestamps {
             header.small_param[1] |= ScreenFlag::RespectTimestamps.bits();
+        }
+        if XC90_STOCK_CONFIG_FLAGS.load(std::sync::atomic::Ordering::Relaxed) {
+            header.small_param[1] |= 1 << 4;
+            header.small_param[2] |= 1;
         }
 
         if avcc.hevc {

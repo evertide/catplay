@@ -130,8 +130,9 @@ impl TcpSession for ScreenReceiverSession {
             ScreenOpCode::VideoConfig => {
                 let config = msg.config_decode(self.video_latency);
                 info!(
-                    "Received VideoConfig: flags={:?} {}x{} params={:?}",
+                    "Received VideoConfig: flags={:?} raw={:?} {}x{} params={:?}",
                     msg.flags(),
+                    msg.header.small_param,
                     config.as_ref().map_or(0, |c| c.width),
                     config.as_ref().map_or(0, |c| c.height),
                     msg.header.params

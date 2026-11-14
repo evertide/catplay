@@ -179,8 +179,8 @@ impl TcpSession for ScreenTransmitSession {
                     self.nal_size_len = config.avcc.nal_size_len;
                     let frame = ScreenFrame::config(&config);
                     info!(
-                        "Writing VideoConfig: {}x{} params={:?}",
-                        config.width, config.height, frame.header.params
+                        "Writing VideoConfig: {}x{} flags={:?} params={:?}",
+                        config.width, config.height, frame.header.small_param, frame.header.params
                     );
                     sink.write(frame)?;
                 }
