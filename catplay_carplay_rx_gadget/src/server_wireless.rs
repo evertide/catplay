@@ -243,6 +243,37 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
     pub fn set_bluetooth_session(&mut self, callback: impl Fn(CarPlaySessionIdentity) -> CsmSessionBox + Send + Sync + 'static) {
         self.bluetooth_session = Some(Arc::new(callback));
     }
+
+    /// Prepare the same session factory used by the Bluetooth listener, without opening hardware.
+    pub fn bluetooth_session_factory(&self, mac: MacAddr6) -> impl Fn() -> CsmSessionBox + Send + Sync + 'static + use<T> {
+        let mfi = self.mfi.clone();
+        let identity = CarPlaySessionIdentity {
+            display_name: self.name.clone(),
+            ncm_iface: None,
+            bt_mac: Some(mac),
+            wifi_ssid: Some(self.ssid.clone()),
+            wifi_passphrase: self.pass.clone(),
+            wifi_is_wpa: self.wpa,
+            wifi_channel: self.channel,
+            is_usb_transport: false,
+            has_gps: true,
+            wants_now_playing: false,
+            ..CarPlaySessionIdentity::default()
+        };
+
+        if let Some(callback) = &self.identity_callback {
+            callback(identity.clone());
+        }
+        let bluetooth_session = self.bluetooth_session.clone();
+        move || match &bluetooth_session {
+            Some(callback) => callback(identity.clone()),
+            None => Box::new(CarPlayServerSession::new(mfi.clone(), identity.clone()).0),
+        }
+    }
+
+    pub fn airplay_session_factory(&self) -> Arc<dyn Fn() -> T + Send + Sync + 'static> {
+        self.sink.clone()
+    }
 }
 
 impl<T: AirPlayReceiverSink> AsyncShutdown for CarPlayWirelessGadget<T> {
@@ -344,31 +375,7 @@ impl<T: AirPlayReceiverSink> Reconcilable for CarPlayWirelessGadget<T> {
                 LocalState::StartingBluetooth { hci: hci.clone(), mac }.into()
             }
             LocalState::StartingBluetooth { hci, mac } => {
-                let mfi = self.mfi.clone();
-                let identity = CarPlaySessionIdentity {
-                    display_name: self.name.clone(),
-                    ncm_iface: None,
-                    bt_mac: Some(*mac),
-                    wifi_ssid: Some(self.ssid.clone()),
-                    wifi_passphrase: self.pass.clone(),
-                    wifi_is_wpa: self.wpa,
-                    wifi_channel: self.channel,
-                    is_usb_transport: false,
-                    has_gps: true,
-                    wants_now_playing: false,
-                    ..CarPlaySessionIdentity::default()
-                };
-
-                if let Some(callback) = &self.identity_callback {
-                    callback(identity.clone());
-                }
-                let bluetooth_session = self.bluetooth_session.clone();
-                let cb = move || -> CsmSessionBox {
-                    match &bluetooth_session {
-                        Some(callback) => callback(identity.clone()),
-                        None => Box::new(CarPlayServerSession::new(mfi.clone(), identity.clone()).0),
-                    }
-                };
+                let cb = self.bluetooth_session_factory(*mac);
                 let mut mgr = BluetoothManager::new(false, true, true, hci, cb);
                 mgr.start()
                     .await
@@ -450,7 +457,7 @@ impl<T: AirPlayReceiverSink> Reconcilable for CarPlayWirelessGadget<T> {
             LocalState::StartingServer { iface, mac } => {
                 const SERVER_BIND_PORT: u16 = 5000;
 
-                let sink = self.sink.clone();
+                let sink = self.airplay_session_factory();
                 let mut server = AirPlayServer::new(
                     SERVER_BIND_PORT,
                     *mac,

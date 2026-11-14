@@ -15,6 +15,7 @@ pub struct Iap2LocationBridge {
     session: CarPlayServerSession,
     location: LocationBridge,
     subscription: Option<LocationSubscription>,
+    owner: u64,
     transport: &'static str,
     waiting_for_transport: bool,
     identified: bool,
@@ -31,14 +32,10 @@ impl Iap2LocationBridge {
             identity.has_gps,
             mfi.is_some()
         );
-        if !airplay {
-            // A new Bluetooth connection begins a new phone session. Its later
-            // disconnect must preserve the request for the CarPlay handoff.
-            location.set_request(None);
-        }
         Box::new(Self {
             session: CarPlayServerSession::new(mfi, identity).0,
             subscription: airplay.then(|| location.subscribe()),
+            owner: if airplay { 0 } else { location.new_owner() },
             location,
             transport,
             waiting_for_transport: false,
@@ -47,6 +44,14 @@ impl Iap2LocationBridge {
             forwarded_location: false,
             log_first_location: false,
         })
+    }
+
+    fn set_request(&self, request: Option<StartLocationInformation>) {
+        if let Some(subscription) = &self.subscription {
+            subscription.set_request(request);
+        } else {
+            self.location.set_request(self.owner, request);
+        }
     }
 }
 
@@ -62,12 +67,12 @@ impl CsmSession for Iap2LocationBridge {
         // or an event-channel round trip back into this adapter.
         if let Some(request) = packet.cast::<StartLocationInformation>() {
             info!("iPhone StartLocationInformation: transport={}, request={request:?}", self.transport);
-            self.location.set_request(Some(request.clone()));
+            self.set_request(Some(request.clone()));
             return Ok(());
         }
         if packet.cast::<StopLocationInformation>().is_some() {
             info!("iPhone StopLocationInformation: transport={}", self.transport);
-            self.location.set_request(None);
+            self.set_request(None);
             return Ok(());
         }
         if packet.cast::<StartIdentification>().is_some() {

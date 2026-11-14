@@ -17,7 +17,7 @@ use catplay_util::{EventSleeper, EventToken};
 use log::info;
 use tokio::sync::watch;
 
-type PendingLocation = BTreeMap<String, VecDeque<String>>;
+type PendingLocation = VecDeque<(String, VecDeque<String>)>;
 
 // Covers the seven advertised types and alternate talker IDs without an unbounded backlog.
 const MAX_PENDING_SENTENCE_TYPES: usize = 16;
@@ -57,10 +57,10 @@ impl LocationUpdates {
             {
                 continue;
             }
-            if let Some(pending) = buffer.get_mut(kind) {
+            if let Some((_, pending)) = buffer.iter_mut().find(|(pending_kind, _)| pending_kind == kind) {
                 *pending = sentences;
             } else if buffer.len() < MAX_PENDING_SENTENCE_TYPES {
-                buffer.insert(kind.into(), sentences);
+                buffer.push_back((kind.into(), sentences));
             }
         }
         // Publish under the buffer lock so take() cannot mark unseen data as read.
@@ -68,12 +68,19 @@ impl LocationUpdates {
     }
 }
 
+#[derive(Default)]
+struct LocationState {
+    next_owner: u64,
+    owner: u64,
+    updates: Option<LocationUpdates>,
+}
+
 /// The current iPhone request, shared with each successive USB iAP2 session.
 /// Negotiation and the active car request remain local to the USB session.
 #[derive(Clone)]
 pub struct LocationBridge {
     request: watch::Sender<Option<StartLocationInformation>>,
-    updates: Arc<Mutex<Option<LocationUpdates>>>,
+    state: Arc<Mutex<LocationState>>,
     car: Arc<Mutex<Weak<AtomicBool>>>,
 }
 
@@ -81,7 +88,7 @@ impl Default for LocationBridge {
     fn default() -> Self {
         Self {
             request: watch::channel(None).0,
-            updates: Default::default(),
+            state: Default::default(),
             car: Default::default(),
         }
     }
@@ -97,12 +104,29 @@ impl LocationBridge {
             .is_some_and(|car| car.load(Ordering::Relaxed))
     }
 
-    /// Start/Stop belongs to the iPhone, independent of its current transport.
-    pub fn set_request(&self, request: Option<StartLocationInformation>) {
-        let updates = self.updates.lock().unwrap();
-        if let Some(updates) = updates.as_ref() {
+    /// Opening Bluetooth reserves an ID without changing the selected request.
+    pub fn new_owner(&self) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        state.next_owner += 1;
+        state.next_owner
+    }
+
+    pub fn set_request(&self, owner: u64, request: Option<StartLocationInformation>) {
+        self.update_request(&mut self.state.lock().unwrap(), owner, request);
+    }
+
+    fn update_request(&self, state: &mut LocationState, owner: u64, request: Option<StartLocationInformation>) {
+        // Only Start can select a newer Bluetooth session. Stale controls are inert.
+        if owner < state.owner || (request.is_none() && owner != state.owner) {
+            return;
+        }
+        if let Some(updates) = state.updates.as_ref() {
             updates.buffer.lock().unwrap().clear();
         }
+        if owner != state.owner {
+            state.updates = None;
+        }
+        state.owner = owner;
         self.request.send_replace(request);
     }
 
@@ -112,33 +136,44 @@ impl LocationBridge {
 
     /// AirPlay owns delivery; a Bluetooth disconnect must not cancel the request.
     pub fn subscribe(&self) -> LocationSubscription {
+        let mut state = self.state.lock().unwrap();
+        if state.owner == 0 {
+            // AirPlay can open before the first Start, or without Bluetooth.
+            state.next_owner = state.next_owner.max(1);
+            state.owner = state.next_owner;
+        }
         let (changed, updates) = watch::channel(());
         let buffer = Arc::new(Mutex::new(PendingLocation::new()));
-        *self.updates.lock().unwrap() = Some(LocationUpdates {
+        if let Some(previous) = state.updates.take() {
+            previous.buffer.lock().unwrap().clear();
+        }
+        state.updates = Some(LocationUpdates {
             changed,
             buffer: buffer.clone(),
         });
         LocationSubscription {
-            updates: Some(updates),
+            updates,
             buffer,
             pending: false,
             bridge: self.clone(),
+            owner: state.owner,
         }
     }
 }
 
-/// Keeps the latest unconsumed message per sentence type. Closing the receiver
-/// cancels its request and wakes every USB session, including overlapping reconnects.
+/// Keeps the latest unconsumed message per sentence type. Dropping the current
+/// owner's receiver cancels its request and wakes every USB session.
 pub struct LocationSubscription {
-    updates: Option<watch::Receiver<()>>,
+    updates: watch::Receiver<()>,
     buffer: Arc<Mutex<PendingLocation>>,
     pending: bool,
     bridge: LocationBridge,
+    owner: u64,
 }
 
 impl EventSleeper for LocationSubscription {
     async fn sleep(&mut self) -> Option<EventToken> {
-        let updates = self.updates.as_mut()?;
+        let updates = &mut self.updates;
         // Stop/replacement can clear a buffer whose notification was already seen.
         while !self.pending || self.buffer.lock().unwrap().is_empty() {
             updates.changed().await.ok()?;
@@ -149,19 +184,35 @@ impl EventSleeper for LocationSubscription {
 }
 
 impl LocationSubscription {
+    pub fn set_request(&self, request: Option<StartLocationInformation>) {
+        let mut state = self.bridge.state.lock().unwrap();
+        if self.is_current(&state) {
+            self.bridge.update_request(&mut state, self.owner, request);
+        }
+    }
+
+    fn is_current(&self, state: &LocationState) -> bool {
+        state.owner == self.owner
+            && state
+                .updates
+                .as_ref()
+                .is_some_and(|updates| Arc::ptr_eq(&updates.buffer, &self.buffer))
+    }
+
     pub fn take(&mut self, max_payload_bytes: usize) -> Option<LocationInformation> {
         let max_payload_bytes = max_payload_bytes.min(MAX_LOCATION_PAYLOAD_BYTES);
-        let updates = self.updates.as_mut()?;
+        let updates = &mut self.updates;
         let mut buffer = self.buffer.lock().unwrap();
         if !self.pending && !updates.has_changed().unwrap_or(false) {
             return None;
         }
         updates.borrow_and_update();
         self.pending = false;
-        while let Some(mut entry) = buffer.first_entry() {
-            let sentence = entry.get_mut().pop_front().unwrap();
-            if entry.get().is_empty() {
-                entry.remove();
+        while let Some((kind, mut sentences)) = buffer.pop_front() {
+            let sentence = sentences.pop_front().unwrap();
+            if !sentences.is_empty() {
+                // Rotate pending types, including multipart data, after every send.
+                buffer.push_back((kind, sentences));
             }
             // Four-byte TLV header plus NUL; never split a sentence across packets.
             if sentence.len() + 5 <= max_payload_bytes {
@@ -177,15 +228,10 @@ impl LocationSubscription {
 
 impl Drop for LocationSubscription {
     fn drop(&mut self) {
-        // Close before publishing cancellation. Dropping an old subscription must
-        // not clear a replacement request that already has its own live receiver.
-        self.updates.take();
-        let mut updates = self.bridge.updates.lock().unwrap();
-        if updates
-            .as_ref()
-            .is_some_and(|updates| updates.changed.is_closed())
-        {
-            *updates = None;
+        let mut state = self.bridge.state.lock().unwrap();
+        // A newer BT Start may own the request before its AirPlay endpoint exists.
+        if self.is_current(&state) {
+            state.updates = None;
             self.bridge.request.send_replace(None);
         }
     }
@@ -298,7 +344,7 @@ impl CarLocation {
             self.received_location = true;
         }
         if self.active.is_some()
-            && let Some(updates) = self.bridge.updates.lock().unwrap().as_ref()
+            && let Some(updates) = self.bridge.state.lock().unwrap().updates.as_ref()
             && let Some(request) = self.bridge.request.borrow().as_ref()
         {
             updates.push(packet, request);
@@ -379,9 +425,9 @@ mod tests {
 
     fn subscription() -> (LocationSubscription, LocationUpdates) {
         let bridge = LocationBridge::default();
-        bridge.set_request(Some(StartLocationInformation::all()));
         let subscription = bridge.subscribe();
-        let updates = bridge.updates.lock().unwrap().as_ref().unwrap().clone();
+        subscription.set_request(Some(StartLocationInformation::all()));
+        let updates = bridge.state.lock().unwrap().updates.as_ref().unwrap().clone();
         (subscription, updates)
     }
 
@@ -452,7 +498,7 @@ mod tests {
             &sentences(&["$GPGSV,2,1,new*00\r\n", "$GPGSV,2,2,new*00\r\n"]),
             &StartLocationInformation::all(),
         );
-        for sentence in ["$GPGSV,2,1,new*00\r\n", "$GPGSV,2,2,new*00\r\n", "$GPRMC,1*00\r\n"] {
+        for sentence in ["$GPGSV,2,1,new*00\r\n", "$GPRMC,1*00\r\n", "$GPGSV,2,2,new*00\r\n"] {
             assert_eq!(subscription.take(usize::MAX), Some(sentences(&[sentence])));
         }
         assert!(subscription.take(usize::MAX).is_none());
@@ -487,10 +533,10 @@ mod tests {
         updates.push(&gsv, &StartLocationInformation::all());
         updates.push(&rmc, &StartLocationInformation::all());
 
-        for sentence in gsv.nmea_sentence.into_iter().chain(rmc.nmea_sentence) {
+        for sentence in [&gsv.nmea_sentence[0], &rmc.nmea_sentence[0], &gsv.nmea_sentence[1]] {
             assert!(subscription.sleep().now_or_never().flatten().is_some());
             let batch = subscription.take(usize::MAX).unwrap();
-            assert_eq!(batch.nmea_sentence, vec![sentence]);
+            assert_eq!(batch.nmea_sentence, vec![sentence.clone()]);
             let encoded = registry.encode(&batch).unwrap();
             assert!(encoded.len() <= MAX_LOCATION_PAYLOAD_BYTES + 6);
             assert_eq!(
