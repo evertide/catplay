@@ -493,6 +493,7 @@ impl CarManager {
 
             let mut displays = other.displays;
             let mut hid_devices = other.hid_devices;
+            let mut alt_screen_suggest_ui_urls = other.alt_screen_suggest_ui_urls;
             // Per-display night mode (Volvo cluster) is a snapshot from when the car was probed; keep it in sync with the
             // live value like the top-level one, preserving the car's value type.
             for display in &mut displays {
@@ -508,6 +509,7 @@ impl CarManager {
                 // Without altScreen only the main display can be driven. Advertising additional displays (e.g. an instrument cluster)
                 // anyway makes the iPhone tear down the session right after RECORD.
                 restrict_to_main_display(&mut displays, &mut hid_devices);
+                alt_screen_suggest_ui_urls = None;
             }
 
             InfoMessageResponse {
@@ -526,6 +528,7 @@ impl CarManager {
                 manufacturer: other.manufacturer,
                 model: other.model,
                 displays,
+                alt_screen_suggest_ui_urls,
 
                 audio_latencies: other.audio_latencies,
                 features: other.features,
