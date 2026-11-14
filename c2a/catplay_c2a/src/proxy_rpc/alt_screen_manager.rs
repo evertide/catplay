@@ -423,7 +423,8 @@ mod tests {
         }
         assert!(manager.capture.is_none(), "no capture beyond the per-process limit");
         // A new manager (next car session) shares the process-wide limit.
-        AltScreenManager::default().capture_after_show_ui();
-        assert!(CAPTURES.load(std::sync::atomic::Ordering::Relaxed) > CAPTURE_MAX_COUNT);
+        let mut next_session = AltScreenManager::default();
+        next_session.capture_after_show_ui();
+        assert!(next_session.capture.is_none());
     }
 }
