@@ -129,6 +129,8 @@ plist_struct! {
     pub struct CommandSetNightMode {
         /// True if it is dark outside, false otherwise.
         pub night_mode: bool,
+        /// UUID of the display this applies to (sent by e.g. Volvo). If omitted, all displays are implied.
+        pub uuid: Option<String>,
     }
 }
 

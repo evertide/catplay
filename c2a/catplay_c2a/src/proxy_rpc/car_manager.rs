@@ -10,6 +10,7 @@ use catplay_carplay::{
     screen::tx::ScreenTransmitProxy,
     video::Pts,
 };
+use catplay_plist::Value;
 use catplay_tracing::ainfo;
 use catplay_util::{EventToken, LazyAsync, sleep, spawn};
 use catplay_util::{event_select, filling_slot, filling_slot_value, futures_xordered::FuturesOrdered, mpsc, oneshot};
@@ -26,7 +27,8 @@ use std::{
 use crate::{
     audiov2::AudioProxyUtil,
     proxy_rpc::{
-        AltScreenManager, ModesArbiter, TxAdapterOp, car_to_iphone_command_task::CarToIphoneCommandTask, overlay_manager::OverlayManager,
+        AltScreenManager, ModesArbiter, NightModes, TxAdapterOp, car_to_iphone_command_task::CarToIphoneCommandTask,
+        overlay_manager::OverlayManager,
     },
 };
 
@@ -50,7 +52,7 @@ pub struct CarManager {
 
     modes: ModesArbiter,
     initial_screen_steal_attempted: bool,
-    night_mode: bool,
+    night_modes: NightModes,
 
     tx_current: Option<LazyAsync<RtspResult<()>>>,
     tx_queue: VecDeque<BoxFuture<'static, RtspResult<()>>>,
@@ -110,7 +112,7 @@ impl CarManager {
             tx_closed: None,
 
             tx_queue: Default::default(),
-            night_mode: *info.night_mode.clone().unwrap_or_default(),
+            night_modes: NightModes::new(*info.night_mode.clone().unwrap_or_default()),
             modes: ModesArbiter::new(&info.modes),
             initial_screen_steal_attempted: false,
             error: None,
@@ -491,6 +493,17 @@ impl CarManager {
 
             let mut displays = other.displays;
             let mut hid_devices = other.hid_devices;
+            // Per-display night mode (Volvo cluster) is a snapshot from when the car was probed; keep it in sync with the
+            // live value like the top-level one, preserving the car's value type.
+            for display in &mut displays {
+                let live = self.night_modes.for_display(&display.uuid);
+                if let Some(night_mode) = display.night_mode.as_mut() {
+                    *night_mode = match night_mode {
+                        Value::Boolean(_) => Value::Boolean(live),
+                        _ => Value::Integer((live as u64).into()),
+                    };
+                }
+            }
             if !self.iphone_features.contains(&ControllerFeature::AltScreen) {
                 // Without altScreen only the main display can be driven. Advertising additional displays (e.g. an instrument cluster)
                 // anyway makes the iPhone tear down the session right after RECORD.
@@ -502,7 +515,7 @@ impl CarManager {
                 hid_languages: other.hid_languages,
                 right_hand_drive: other.right_hand_drive,
 
-                night_mode: Some(self.night_mode.into()),
+                night_mode: Some(self.night_modes.global().into()),
                 modes: self.modes.modes_mut().serialize_to_info_request(),
 
                 oem_icon: other.oem_icon,
@@ -622,7 +635,14 @@ impl CarManager {
         }
 
         if let Command::SetNightMode(mode) = cmd.command() {
-            self.night_mode = mode.night_mode;
+            let main_uuid = self
+                .car_state
+                .info_cached()
+                .displays
+                .first()
+                .map(|main| main.uuid.clone());
+            self.night_modes
+                .apply(mode.night_mode, mode.uuid.as_deref(), main_uuid.as_deref());
         }
 
         // Display switches only make sense for displays the iPhone was told about (see restrict_to_main_display).
@@ -715,7 +735,14 @@ impl CarManager {
                 cmd.respond_ok();
             }
             Command::SetNightMode(v) => {
-                self.night_mode = v.night_mode;
+                let main_uuid = self
+                    .car_state
+                    .info_cached()
+                    .displays
+                    .first()
+                    .map(|main| main.uuid.clone());
+                self.night_modes
+                    .apply(v.night_mode, v.uuid.as_deref(), main_uuid.as_deref());
                 cmd.respond_ok();
             }
             // Without an iPhone there is nothing to show; answer as before instead of pretending it worked.
