@@ -5,7 +5,7 @@ use catplay_carplay::{
     clock::{MediaClockBox, NtpU64},
     events::CommandPending,
     modes::{ChangeModesResponse, ResourceTransferPriority},
-    msg::{Command, CommandType, ControllerFeature, Display, HidDevice, InfoMessageResponse},
+    msg::{ALT_SCREEN_SUGGEST_UI_URLS, Command, CommandType, ControllerFeature, Display, HidDevice, InfoMessageResponse},
     rtsp_frame::{HttpStatus, RtspError, RtspResponse, RtspResult},
     screen::tx::ScreenTransmitProxy,
     video::Pts,
@@ -510,6 +510,10 @@ impl CarManager {
                 // anyway makes the iPhone tear down the session right after RECORD.
                 restrict_to_main_display(&mut displays, &mut hid_devices);
             }
+            let alt_screen_suggest_ui_urls = alt_screen_suggestions(
+                other.alt_screen_suggest_ui_urls,
+                self.iphone_features.contains(&ControllerFeature::AltScreen),
+            );
 
             InfoMessageResponse {
                 hid_devices,
@@ -527,6 +531,7 @@ impl CarManager {
                 manufacturer: other.manufacturer,
                 model: other.model,
                 displays,
+                alt_screen_suggest_ui_urls,
 
                 audio_latencies: other.audio_latencies,
                 features: other.features,
@@ -774,6 +779,17 @@ fn negotiate_proxied_features(offered: &[ControllerFeature], car_enabled: &[Cont
         .collect()
 }
 
+/// The car's alt screen suggestions for the iPhone, only when the alt screen is negotiated. A Volvo XC90, which has no per-display
+/// initialURL, got an empty (black) cluster from iOS without a suggestion, and names none unless the sender announced
+/// altScreenURLs; so fall back to the Apple Maps defaults, as the stock dongle firmware does.
+fn alt_screen_suggestions(car: Option<Vec<String>>, alt_screen: bool) -> Option<Vec<String>> {
+    match car {
+        _ if !alt_screen => None,
+        Some(urls) if !urls.is_empty() => Some(urls),
+        _ => Some(ALT_SCREEN_SUGGEST_UI_URLS.map(String::from).to_vec()),
+    }
+}
+
 /// Keeps only the main display, and the HID devices that belong to it.
 ///
 /// This assumes that the car lists its main display first, which holds for all head units observed so far.
@@ -892,5 +908,16 @@ mod tests {
 
         assert_eq!(displays, vec![display(MAIN_UUID)]);
         assert_eq!(hid_devices.len(), 2);
+    }
+
+    #[test]
+    fn alt_screen_suggestions_follow_the_car_or_default() {
+        let car = vec!["maps:/car/instrumentcluster".to_owned()];
+        let defaults = Some(ALT_SCREEN_SUGGEST_UI_URLS.map(String::from).to_vec());
+        assert_eq!(alt_screen_suggestions(Some(car.clone()), true), Some(car.clone()));
+        assert_eq!(alt_screen_suggestions(Some(vec![]), true), defaults);
+        assert_eq!(alt_screen_suggestions(None, true), defaults);
+        assert_eq!(alt_screen_suggestions(Some(car), false), None);
+        assert_eq!(alt_screen_suggestions(None, false), None);
     }
 }

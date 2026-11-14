@@ -22,17 +22,10 @@ use crate::{
     common::{AIRPLAY_TX_IOS_BUILD, AIRPLAY_TX_IOS_MODEL, AIRPLAY_TX_IOS_VERSION, AIRPLAY_TX_SDK_VERSION, AirPlayEncryptionType},
     events::{CommandQueue, CommandQueueDrain, EventsServer},
     keep_alive::KeepAliveClient,
-    msg::{ControllerFeature, InfoMessage, InfoMessageResponse, InitialSetup},
+    msg::{ALT_SCREEN_URLS, ControllerFeature, InfoMessage, InfoMessageResponse, InitialSetup},
     rtsp_frame::{RtspError, RtspQueue},
     rtsp_session::{RtspTransmitter, RtspTransmitterCallback, RtspTransmitterEvent, RtspTransmitterHandle},
 };
-
-/// Instrument cluster URLs an iPhone announces in its GET /info (Apple Maps), as captured from a real session.
-const ALT_SCREEN_URLS: [&str; 3] = [
-    "maps:/car/instrumentcluster/map",
-    "maps:/car/instrumentcluster/instructioncard",
-    "maps:/car/instrumentcluster",
-];
 
 #[derive(EventSleeper)]
 pub struct AirPlayTransmitterBootstrapSession {
