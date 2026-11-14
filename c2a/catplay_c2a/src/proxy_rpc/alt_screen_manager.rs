@@ -27,9 +27,11 @@ pub struct AltScreenManager {
 }
 
 /// Diagnostics (XC90 build only): after each showUI, the alt screen frames of the next few seconds are logged and written to
-/// `/tmp/altscreen-<n>.h264` (Annex-B with SPS/PPS), so a car log shows whether the iPhone draws anything at all.
+/// `/tmp/altscreen-<n>.h264` (Annex-B with SPS/PPS, starting at a keyframe), so a car log shows whether the iPhone draws anything.
+/// Bounded: at most [CAPTURE_MAX_COUNT] captures of at most [CAPTURE_MAX_BYTES] each per process.
 const CAPTURE_WINDOW: Duration = Duration::from_secs(5);
-const CAPTURE_MAX_BYTES: usize = 2 << 20;
+const CAPTURE_MAX_BYTES: usize = 1 << 20;
+const CAPTURE_MAX_COUNT: u32 = 4;
 
 struct Capture {
     n: u32,
@@ -39,8 +41,11 @@ struct Capture {
 }
 
 impl Capture {
-    /// Log and record one submitted frame; returns false once the capture is complete.
+    /// Log and record one submitted frame; returns false once the capture is complete (the frame is then not recorded).
     fn add(&mut self, frame: &EncodedVideoFrame) -> bool {
+        if Instant::now() >= self.until {
+            return false;
+        }
         let keyframe = frame.is_known_keyframe();
         info!(
             "Alt screen capture {}: frame {} {} bytes keyframe={keyframe}",
@@ -48,14 +53,23 @@ impl Capture {
             self.frames,
             frame.data.len()
         );
-        if (keyframe || self.buf.is_empty())
-            && let Some(config) = frame.config.as_ref()
-        {
-            self.buf.extend_from_slice(&config.avcc.sps_pps);
-        }
-        self.buf.extend_from_slice(&frame.data);
         self.frames += 1;
-        Instant::now() < self.until && self.buf.len() < CAPTURE_MAX_BYTES
+        // Start at a keyframe so the file decodes; repeat SPS/PPS before every keyframe.
+        if !keyframe && self.buf.is_empty() {
+            return true;
+        }
+        let config = frame
+            .config
+            .as_ref()
+            .filter(|_| keyframe)
+            .map(|c| c.avcc.sps_pps.as_slice())
+            .unwrap_or_default();
+        if self.buf.len() + config.len() + frame.data.len() > CAPTURE_MAX_BYTES {
+            return false;
+        }
+        self.buf.extend_from_slice(config);
+        self.buf.extend_from_slice(&frame.data);
+        true
     }
 
     /// Write the capture on a background thread so the frame path never waits on I/O.
@@ -67,6 +81,9 @@ impl Capture {
             self.frames,
             self.buf.len()
         );
+        if self.buf.is_empty() {
+            return;
+        }
         std::thread::spawn(move || {
             if let Err(err) = std::fs::write(&path, &self.buf) {
                 warn!("Could not write {path}: {err}");
@@ -102,6 +119,9 @@ impl AltScreenManager {
         self.uuid.take();
         self.pending_setup.take();
         self.pending_keyframe.take();
+        if let Some(capture) = self.capture.take() {
+            capture.finish();
+        }
         self.car_screen.take()
     }
 
@@ -109,6 +129,9 @@ impl AltScreenManager {
     pub fn capture_after_show_ui(&mut self) {
         if let Some(previous) = self.capture.take() {
             previous.finish();
+        }
+        if self.captures >= CAPTURE_MAX_COUNT {
+            return;
         }
         self.captures += 1;
         info!("Alt screen capture {} started (showUI)", self.captures);
@@ -189,6 +212,9 @@ impl AltScreenManager {
             }
             ScreenProxyOp::IphoneStreamFinish => {
                 info!("iPhone has finished its alt screen stream");
+                if let Some(capture) = self.capture.take() {
+                    capture.finish();
+                }
                 self.iphone_screen_rx.take();
                 return self.car_screen.take();
             }
@@ -334,5 +360,57 @@ mod tests {
 
         assert!(manager.reset().is_some());
         assert!(manager.reset().is_none());
+    }
+
+    fn frame(len: usize, keyframe: bool) -> EncodedVideoFrame {
+        EncodedVideoFrame {
+            pts: Instant::now().into(),
+            width: 1920,
+            height: 720,
+            data: vec![0u8; len].as_slice().into(),
+            config: None,
+            nal_offsets: None,
+            is_keyframe: Some(keyframe),
+            header_buf: Default::default(),
+            chacha_tag_buf: Default::default(),
+        }
+    }
+
+    fn capture() -> Capture {
+        Capture {
+            n: 1,
+            until: Instant::now() + CAPTURE_WINDOW,
+            frames: 0,
+            buf: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn capture_starts_at_a_keyframe_and_stops_at_its_byte_cap() {
+        let mut c = capture();
+        assert!(c.add(&frame(10, false)));
+        assert!(c.buf.is_empty(), "delta frames before the first keyframe are not decodable");
+        assert!(c.add(&frame(10, true)));
+        assert!(c.add(&frame(10, false)));
+        assert_eq!(c.buf.len(), 20);
+        assert!(!c.add(&frame(CAPTURE_MAX_BYTES, true)));
+        assert_eq!(c.buf.len(), 20, "a frame over the cap is not recorded");
+    }
+
+    #[test]
+    fn capture_ends_after_its_window() {
+        let mut c = capture();
+        c.until = Instant::now();
+        assert!(!c.add(&frame(10, true)));
+        assert!(c.buf.is_empty());
+    }
+
+    #[test]
+    fn captures_per_process_are_bounded() {
+        let mut manager = AltScreenManager::default();
+        for _ in 0..CAPTURE_MAX_COUNT + 2 {
+            manager.capture_after_show_ui();
+        }
+        assert_eq!(manager.captures, CAPTURE_MAX_COUNT);
     }
 }
