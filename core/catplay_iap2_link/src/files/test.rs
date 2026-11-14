@@ -239,7 +239,7 @@ fn reserve_file_tx_succeeds_when_file_session_negotiated() {
 
 #[test]
 fn file_transfer_without_negotiated_file_session_does_not_panic() {
-    // Some head units (seen on a Volvo XC90 / Sensus) negotiate only a Control session.
+    // Some head units (seen on a Volvo XC90 with Android Automotive) negotiate only a Control session.
     let mut control_only = LSPPayload::bluetooth();
     control_only
         .sessions
