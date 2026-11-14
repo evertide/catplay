@@ -22,6 +22,16 @@ type PendingLocation = BTreeMap<String, Vec<String>>;
 
 // Covers the seven advertised types and alternate talker IDs without an unbounded backlog.
 const MAX_PENDING_SENTENCE_TYPES: usize = 16;
+// Leave room below the 65,529-byte CSM payload limit and for iAP2 framing.
+const MAX_LOCATION_PAYLOAD_BYTES: usize = 60 * 1024;
+
+fn sentence_group_size(sentences: &[String]) -> usize {
+    // Each sentence has a four-byte TLV header and a terminating NUL byte.
+    sentences
+        .iter()
+        .map(|sentence| sentence.len() + 5)
+        .sum()
+}
 
 #[derive(Clone)]
 struct LocationUpdates {
@@ -43,6 +53,9 @@ impl LocationUpdates {
         let mut buffer = self.buffer.lock().unwrap();
         for (kind, sentences) in incoming {
             // Keep same-type sentences from one message together (e.g. multipart GSV).
+            if sentence_group_size(&sentences) > MAX_LOCATION_PAYLOAD_BYTES {
+                continue;
+            }
             if let Some(pending) = buffer.get_mut(kind) {
                 *pending = sentences;
             } else if buffer.len() < MAX_PENDING_SENTENCE_TYPES {
@@ -127,12 +140,19 @@ impl LocationSubscription {
         if !self.pending && !updates.has_changed().unwrap_or(false) {
             return None;
         }
-        self.pending = false;
         updates.borrow_and_update();
-        let nmea_sentence: Vec<_> = std::mem::take(&mut *buffer)
-            .into_values()
-            .flatten()
-            .collect();
+        let mut nmea_sentence = Vec::new();
+        let mut payload_bytes = 0;
+        while let Some((_, sentences)) = buffer.first_key_value() {
+            let group_bytes = sentence_group_size(sentences);
+            if payload_bytes + group_bytes > MAX_LOCATION_PAYLOAD_BYTES {
+                break;
+            }
+            payload_bytes += group_bytes;
+            nmea_sentence.extend(buffer.pop_first().unwrap().1);
+        }
+        // A split batch stays ready even though the watch notification was consumed.
+        self.pending = !buffer.is_empty();
         (!nmea_sentence.is_empty()).then_some(LocationInformation { nmea_sentence })
     }
 }
@@ -308,6 +328,7 @@ fn intersect(request: &StartLocationInformation, component: Option<&LocationInfo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use catplay_csm::decoder::CsmPacketRegistry;
     use futures::FutureExt;
 
     fn subscription() -> (LocationSubscription, LocationUpdates) {
@@ -372,6 +393,78 @@ mod tests {
             Some(sentences(&["$GPGSV,2,1,new*00\r\n", "$GPGSV,2,2,new*00\r\n", "$GPRMC,1*00\r\n"])),
         );
         assert!(subscription.take().is_none());
+    }
+
+    #[test]
+    fn merged_payloads_are_split_without_splitting_sentence_groups() {
+        let (mut subscription, updates) = subscription();
+        let gsv = sentences(&[
+            &format!("$GPGSV,2,1,{}", "x".repeat(20_000)),
+            &format!("$GPGSV,2,2,{}", "x".repeat(20_000)),
+        ]);
+        let rmc = sentences(&[&format!("$GPRMC,{}", "x".repeat(40_000))]);
+        let registry = CsmPacketRegistry::static_registry();
+        assert!(registry.encode(&gsv).is_ok());
+        assert!(registry.encode(&rmc).is_ok());
+        let mut oversized = gsv.clone();
+        oversized
+            .nmea_sentence
+            .extend(rmc.nmea_sentence.clone());
+        assert!(registry.encode(&oversized).is_err());
+        updates.push(&gsv);
+        updates.push(&rmc);
+
+        for expected in [gsv, rmc] {
+            assert!(subscription.sleep().now_or_never().flatten().is_some());
+            let batch = subscription.take().unwrap();
+            assert_eq!(batch, expected);
+            let encoded = registry.encode(&batch).unwrap();
+            assert!(encoded.len() <= MAX_LOCATION_PAYLOAD_BYTES + 6);
+            assert_eq!(
+                registry
+                    .decode(&encoded)
+                    .unwrap()
+                    .cast::<LocationInformation>(),
+                Some(&batch)
+            );
+        }
+        assert!(subscription.take().is_none());
+        assert!(subscription.sleep().now_or_never().is_none());
+    }
+
+    #[test]
+    fn payload_budget_counts_tlv_headers_nul_terminators_and_utf8_bytes() {
+        let (mut subscription, updates) = subscription();
+        let prefix = "$GPGGA,\u{00e9}";
+        let padding = "x".repeat(MAX_LOCATION_PAYLOAD_BYTES - prefix.len() - 5);
+        let exact = sentences(&[&format!("{prefix}{padding}")]);
+        let next = sentences(&["$GPRMC,next"]);
+        updates.push(&exact);
+        updates.push(&next);
+        let batch = subscription.take().unwrap();
+        assert_eq!(batch, exact);
+        assert_eq!(
+            CsmPacketRegistry::static_registry()
+                .encode(&batch)
+                .unwrap()
+                .len(),
+            MAX_LOCATION_PAYLOAD_BYTES + 6
+        );
+        assert_eq!(subscription.take(), Some(next));
+    }
+
+    #[test]
+    fn oversized_sentence_group_is_dropped_without_blocking_later_updates() {
+        let (mut subscription, updates) = subscription();
+        let prefix = "$GPGSV,";
+        let padding = "x".repeat(MAX_LOCATION_PAYLOAD_BYTES - prefix.len() - 4);
+        let oversized = sentences(&[&format!("{prefix}{padding}")]);
+        updates.push(&oversized);
+        assert!(subscription.take().is_none());
+        assert!(subscription.sleep().now_or_never().is_none());
+        let next = sentences(&["$GPGSV,1,1,new", "$GPRMC,new"]);
+        updates.push(&next);
+        assert_eq!(subscription.take(), Some(next));
     }
 
     #[test]
