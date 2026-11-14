@@ -66,11 +66,7 @@ impl EventsClient {
     fn response_log_level(&mut self, status: HttpStatus) -> Level {
         // Event responses have no CSeq. Keep FIFO slots even if the caller drops its future.
         let level = self.response_log_levels.pop_front().unwrap_or(Level::Warn);
-        if status == HttpStatus::Ok {
-            level
-        } else {
-            Level::Warn
-        }
+        if status == HttpStatus::Ok { level } else { Level::Warn }
     }
 }
 
