@@ -2,15 +2,20 @@ use std::sync::{Arc, Mutex};
 
 use catplay_carplay::{
     carplay_rx::AirPlayReceiverSink,
+    events::CommandsClient,
     msg::{Command, CommandIApSendMessage},
-    rtsp_frame::{HttpStatus, RtspResponse},
+    rtsp_frame::{HttpStatus, RtspQueue, RtspResponse},
 };
 use catplay_carplay_tx_gadget::carplay_client_session::CarPlayClientSession;
 use catplay_csm::{
     decoder::{AsCsmPacket, CsmFlag, CsmPacketId, CsmPacketRegistry},
     msg::*,
 };
-use catplay_iap2_client::{CsmClientHandle, CsmRemote, CsmSessionStatus};
+use catplay_iap2_client::{
+    CsmClient, CsmClientHandle, CsmRemote, CsmSessionCallbacks, CsmSessionStatus,
+    tokio::{AsyncClient, AsyncClientDrain},
+};
+use catplay_util::{EventReconciler, EventSleeper};
 use futures::executor::block_on;
 
 use super::*;
@@ -354,6 +359,108 @@ fn slow_phone_keeps_each_sentence_type_after_a_cancelled_wait() {
     assert_eq!(packets[0].cast::<LocationInformation>(), Some(&latest));
     assert!(!phone.process_event(phone_out.clone()).unwrap());
     assert!(phone.wait_event().now_or_never().is_none());
+}
+
+#[tokio::test]
+async fn delayed_rtsp_response_keeps_new_fixes_in_the_accumulator() {
+    async fn tick(client: &mut AsyncClient) {
+        let _ = client.sleep().now_or_never();
+        EventReconciler::reconcile(client).await.unwrap();
+    }
+
+    fn relay(drain: &mut AsyncClientDrain, client: &mut AsyncClient) {
+        let _ = drain.sleep().now_or_never();
+        if let Some(frame) = drain.take() {
+            client.read_frame(&frame);
+        }
+    }
+
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    ready(&mut car, &car_out);
+    let phone_out = Arc::new(Capture::default());
+    let captured = phone_out.clone();
+    let peer_session = CsmSessionCallbacks::new(
+        async |handle| handle.send(&StartLocationInformation::all()),
+        move |packet, _| {
+            captured.0.lock().unwrap().push(packet);
+            async { Ok(()) }
+        },
+    );
+    let (mut client, mut outgoing) = AsyncClient::new(false, CsmRemote::airplay(), phone(location));
+    let (mut peer, mut incoming) = AsyncClient::new(true, CsmRemote::airplay(), Box::new(peer_session));
+    // Complete real iAP2 link negotiation and deliver the phone's subscription.
+    for _ in 0..100 {
+        tick(&mut client).await;
+        relay(&mut outgoing, &mut peer);
+        tick(&mut peer).await;
+        relay(&mut incoming, &mut client);
+    }
+    pump(&mut car, &car_out);
+    assert_eq!(car_out.location_commands().len(), 1);
+    assert!(!client.handle().has_pending_send());
+    phone_out.take();
+
+    respond(&mut car, &car_out, sample());
+    for _ in 0..10 {
+        tick(&mut client).await;
+        let _ = outgoing.sleep().now_or_never();
+    }
+    let (frame, permit) = outgoing.take_with_permit().expect("first location frame");
+    peer.read_frame(&frame);
+    let (queue, mut responses) = RtspQueue::fifo();
+    let mut response = Box::pin(
+        queue
+            .send_command(
+                &Command::IApSendMessage(CommandIApSendMessage {
+                    data: frame.into_inner().into(),
+                }),
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap(),
+    );
+    assert_eq!(responses.drain().len(), 1);
+
+    let mut latest = sample();
+    for counter in 0..1000 {
+        latest.nmea_sentence = vec![
+            format!("$GPGGA,{counter}"),
+            format!("$GPRMC,{counter}"),
+            format!("$PASCD,{counter}"),
+        ];
+        for sentence in &latest.nmea_sentence {
+            respond(
+                &mut car,
+                &car_out,
+                LocationInformation {
+                    nmea_sentence: vec![sentence.clone()],
+                },
+            );
+        }
+        tick(&mut client).await;
+        tick(&mut peer).await;
+        relay(&mut incoming, &mut client);
+        assert!(response.as_mut().now_or_never().is_none());
+        assert!(client.handle().has_pending_send());
+        assert!(outgoing.sleep().now_or_never().is_none());
+        assert!(outgoing.take().is_none());
+    }
+    assert_eq!(phone_out.take()[0].cast::<LocationInformation>(), Some(&sample()));
+    responses.feed(RtspResponse::new(None, HttpStatus::Ok));
+    response.await.unwrap();
+    drop(permit);
+
+    for _ in 0..100 {
+        tick(&mut client).await;
+        relay(&mut outgoing, &mut peer);
+        tick(&mut peer).await;
+        relay(&mut incoming, &mut client);
+    }
+    let packets = phone_out.take();
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].cast::<LocationInformation>(), Some(&latest));
+    assert!(!client.handle().has_pending_send());
 }
 
 #[test]

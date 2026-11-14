@@ -18,6 +18,7 @@ pub struct Iap2LocationBridge {
     events: mpsc::UnboundedReceiver<CarPlayServerSessionEventTx>,
     location: LocationBridge,
     subscription: Option<LocationSubscription>,
+    waiting_for_transport: bool,
     identified: bool,
     authenticated: bool,
     received_start: bool,
@@ -37,6 +38,7 @@ impl Iap2LocationBridge {
             events,
             location,
             subscription: None,
+            waiting_for_transport: false,
             identified: false,
             authenticated: false,
             received_start: false,
@@ -76,7 +78,13 @@ impl CsmSession for Iap2LocationBridge {
     }
 
     async fn wait_event(&mut self) {
-        event_select!(self.events, self.subscription);
+        if self.waiting_for_transport {
+            // The client wakes on transmit completion. Keep accepting Stop/replacement
+            // requests without spinning on accumulated location updates meanwhile.
+            event_select!(self.events);
+        } else {
+            event_select!(self.events, self.subscription);
+        }
     }
 
     fn process_event(&mut self, handle: CsmClientHandleRef) -> CsmSessionResult<bool> {
@@ -95,13 +103,16 @@ impl CsmSession for Iap2LocationBridge {
             }
             consumed = true;
         }
-        if let Some(update) = self
-            .subscription
-            .as_mut()
-            .and_then(LocationSubscription::take)
+        self.waiting_for_transport = handle.has_pending_send();
+        if !self.waiting_for_transport
+            && let Some(update) = self
+                .subscription
+                .as_mut()
+                .and_then(LocationSubscription::take)
         {
             self.session
-                .on_event(CarPlayServerSessionEventRx::FeedGpsNmea(update), handle)?;
+                .on_event(CarPlayServerSessionEventRx::FeedGpsNmea(update), handle.clone())?;
+            self.waiting_for_transport = handle.has_pending_send();
             if !self.forwarded_location {
                 info!("AirPlay GPS first LocationInformation forwarded to iPhone");
                 self.forwarded_location = true;

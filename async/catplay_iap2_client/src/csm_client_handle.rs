@@ -42,6 +42,12 @@ pub trait CsmClientHandle: Send + Sync {
     /// I/O error will only be returned if packet is not serializable or channel is already closed at the time of call.
     fn send(&self, packet: &dyn AsCsmPacket) -> CsmSessionResult<()>;
 
+    /// Whether a CSM packet is queued or the transport still owns a transmit permit.
+    /// Sessions that coalesce updates can wait instead of adding to the send queue.
+    fn has_pending_send(&self) -> bool {
+        false
+    }
+
     /// Sends multiple packets.
     fn send_all(&self, packets: &[CsmPacketBox]) -> CsmSessionResult<()>;
 
