@@ -66,8 +66,8 @@ impl AirPlayRtspClient {
         Ok(resp)
     }
 
-    pub async fn info(&self) -> RtspResult<InfoMessageResponse> {
-        let mut req = RtspRequest::with_plist(RtspMethod::Get, "/info", InfoMessage::default())?;
+    pub async fn info(&self, req: InfoMessage) -> RtspResult<InfoMessageResponse> {
+        let mut req = RtspRequest::with_plist(RtspMethod::Get, "/info", req)?;
         req.set_header(HttpHeader::UserAgent, AIRPLAY_TX_SDK_USER_AGENT);
         let resp = self
             .rtsp
