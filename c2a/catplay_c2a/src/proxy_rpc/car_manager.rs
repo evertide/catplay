@@ -5,7 +5,7 @@ use catplay_carplay::{
     clock::{MediaClockBox, NtpU64},
     events::CommandPending,
     modes::{ChangeModesResponse, ResourceTransferPriority},
-    msg::{ALT_SCREEN_URLS, Command, CommandType, ControllerFeature, Display, HidDevice, InfoMessageResponse},
+    msg::{ALT_SCREEN_SUGGEST_UI_URLS, Command, CommandType, ControllerFeature, Display, HidDevice, InfoMessageResponse},
     rtsp_frame::{HttpStatus, RtspError, RtspResponse, RtspResult},
     screen::tx::ScreenTransmitProxy,
     video::Pts,
@@ -778,14 +778,14 @@ fn negotiate_proxied_features(offered: &[ControllerFeature], car_enabled: &[Cont
         .collect()
 }
 
-/// The car's alt screen suggestions for the iPhone, only when the alt screen is negotiated. iOS draws an empty (black) alt screen
-/// without one, and a Volvo XC90 sends none unless the sender announced altScreenURLs, so fall back to the Apple Maps defaults
-/// (as the stock dongle firmware does).
+/// The car's alt screen suggestions for the iPhone, only when the alt screen is negotiated. A Volvo XC90, which has no per-display
+/// initialURL, got an empty (black) cluster from iOS without a suggestion, and names none unless the sender announced
+/// altScreenURLs; so fall back to the Apple Maps defaults, as the stock dongle firmware does.
 fn alt_screen_suggestions(car: Option<Vec<String>>, alt_screen: bool) -> Option<Vec<String>> {
     match car {
         _ if !alt_screen => None,
         Some(urls) if !urls.is_empty() => Some(urls),
-        _ => Some(ALT_SCREEN_URLS.map(String::from).to_vec()),
+        _ => Some(ALT_SCREEN_SUGGEST_UI_URLS.map(String::from).to_vec()),
     }
 }
 
@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn alt_screen_suggestions_follow_the_car_or_default() {
         let car = vec!["maps:/car/instrumentcluster".to_owned()];
-        let defaults = Some(ALT_SCREEN_URLS.map(String::from).to_vec());
+        let defaults = Some(ALT_SCREEN_SUGGEST_UI_URLS.map(String::from).to_vec());
         assert_eq!(alt_screen_suggestions(Some(car.clone()), true), Some(car.clone()));
         assert_eq!(alt_screen_suggestions(Some(vec![]), true), defaults);
         assert_eq!(alt_screen_suggestions(None, true), defaults);
