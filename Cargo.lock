@@ -314,6 +314,7 @@ dependencies = [
  "catplay_tracing",
  "catplay_tracing_macro",
  "catplay_util",
+ "crc32fast",
  "futures",
  "if-addrs",
  "insta",

@@ -1,5 +1,5 @@
 use core::fmt;
-use std::{path::PathBuf, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use ab_glyph::InvalidFont;
 use image::ImageError;
@@ -37,9 +37,21 @@ pub enum RenderOp {
         asset_type: AssetType,
     },
 
+    /// Loads an asset from a shared in-memory buffer (e.g. one validated earlier).
+    LoadAssetShared {
+        id: String,
+        buf: Arc<[u8]>,
+        asset_type: AssetType,
+    },
+
     BlitAsset {
         id: String,
         rect: UiRect,
+    },
+
+    /// Fills the whole frame with an image, keeping its aspect ratio and cropping the overflow evenly.
+    BlitAssetCover {
+        id: String,
     },
 
     SetTextColor {
@@ -72,11 +84,18 @@ impl fmt::Debug for RenderOp {
                 .field("id", id)
                 .field("asset_type", asset_type)
                 .finish(),
+            Self::LoadAssetShared { id, buf, asset_type } => f
+                .debug_struct("LoadAssetShared")
+                .field("id", id)
+                .field("len", &buf.len())
+                .field("asset_type", asset_type)
+                .finish(),
             Self::BlitAsset { id, rect } => f
                 .debug_struct("BlitAsset")
                 .field("id", id)
                 .field("rect", rect)
                 .finish(),
+            Self::BlitAssetCover { id } => f.debug_struct("BlitAssetCover").field("id", id).finish(),
             Self::SetTextColor { argb } => f.debug_struct("SetTextColor").field("argb", argb).finish(),
             Self::DrawText {
                 text,
@@ -179,12 +198,34 @@ impl Renderer {
                         self.assets.load_font((*id).into(), (*buf).into())?;
                     }
                 },
+                RenderOp::LoadAssetShared { id, buf, asset_type } => match asset_type {
+                    AssetType::Image => {
+                        self.assets.load_buf(id.clone(), buf)?;
+                    }
+                    AssetType::Font => {
+                        self.assets.load_font(id.clone(), buf.to_vec())?;
+                    }
+                },
                 RenderOp::BlitAsset { id, rect } => {
                     let rect = resolve_rect(*rect, self.fb.width, self.fb.height, self.dpi);
                     let asset = self.assets.get_scaled(id.clone(), rect.w, rect.h)?;
                     Canvas::blit(&mut self.fb, asset, rect.x, rect.y, rect.w, rect.h);
 
                     debug!("Blit asset dirty: {rect:?}");
+                    self.fb.add_dirty(rect);
+                }
+                RenderOp::BlitAssetCover { id } => {
+                    let (fw, fh) = (self.fb.width.max(0) as u32, self.fb.height.max(0) as u32);
+                    let asset = self.assets.get_cover(id.clone(), fw, fh)?;
+                    Canvas::blit(&mut self.fb, asset, 0, 0, fw, fh);
+
+                    let rect = DirtyRect {
+                        x: 0,
+                        y: 0,
+                        w: fw as _,
+                        h: fh as _,
+                    };
+                    debug!("Blit asset cover dirty: {rect:?}");
                     self.fb.add_dirty(rect);
                 }
                 RenderOp::SetTextColor { argb } => {
@@ -246,5 +287,58 @@ impl Renderer {
 
     pub fn framebuffer(&mut self) -> &mut Surface {
         &mut self.fb
+    }
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+    use image::{ImageFormat, Rgba, RgbaImage};
+
+    /// Encodes a 40x10 (or 10x40) PNG whose first half is `a` and second half `b`.
+    fn two_tone(horizontal: bool, a: [u8; 4], b: [u8; 4]) -> &'static [u8] {
+        let (w, h) = if horizontal { (40, 10) } else { (10, 40) };
+        let img = RgbaImage::from_fn(w, h, |x, y| {
+            let first = if horizontal { x < w / 2 } else { y < h / 2 };
+            Rgba(if first { a } else { b })
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, ImageFormat::Png).unwrap();
+        Box::leak(png.into_inner().into_boxed_slice())
+    }
+
+    fn render(width: i32, height: i32, buf: &'static [u8]) -> Renderer {
+        let mut r = Renderer::new(width, height, 160.0);
+        r.execute(&[
+            RenderOp::LoadAssetConst {
+                id: "bg",
+                buf,
+                asset_type: AssetType::Image,
+            },
+            RenderOp::BlitAssetCover { id: "bg".into() },
+        ])
+        .unwrap();
+        r
+    }
+
+    fn px(r: &Renderer, x: i32, y: i32) -> u32 {
+        r.fb.rgba_u32()[(y * r.fb.width + x) as usize]
+    }
+
+    #[test]
+    fn cover_fills_frame_and_crops_evenly() {
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+        // Wide image in a square frame: scaled to the frame height, left/right halves visible.
+        let r = render(10, 10, two_tone(true, RED, BLUE));
+        assert_ne!(px(&r, 1, 5), px(&r, 8, 5));
+        assert_eq!(px(&r, 0, 0), px(&r, 1, 9));
+        assert_eq!(px(&r, 9, 0), px(&r, 8, 9));
+
+        // Tall image in a wide frame: scaled to the frame width, top/bottom halves visible.
+        let r = render(10, 4, two_tone(false, RED, BLUE));
+        assert_ne!(px(&r, 5, 0), px(&r, 5, 3));
+        assert_eq!(px(&r, 0, 0), px(&r, 9, 1));
     }
 }

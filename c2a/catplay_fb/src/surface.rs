@@ -314,7 +314,8 @@ pub enum SurfaceSaveError {
 
 impl FontPixelSink for Surface {
     fn blend_pixel(&mut self, x: i32, y: i32, coverage: u8) -> bool {
-        if x < 0 || y < 0 {
+        // Clip on all sides: the buffer is flat, so x >= width would wrap into the next row.
+        if x < 0 || y < 0 || x >= self.width || y >= self.height {
             return false;
         }
 
@@ -362,5 +363,21 @@ mod tests {
         dst.blit_checked(&source, 0, 0, 1, 1).unwrap();
 
         assert_eq!(Canvas::as_rgba(&mut dst), &[11, 22, 33, 44]);
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    #[test]
+    fn text_pixels_outside_the_surface_are_clipped() {
+        let mut surface = Surface::new(10, 2);
+        surface.set_pen_color(0xFFFFFFFF);
+        let before = surface.rgba_u32().to_vec();
+        assert!(!surface.blend_pixel(10, 0, 255), "x == width must not wrap into the next row");
+        assert!(!surface.blend_pixel(0, 2, 255));
+        assert!(!surface.blend_pixel(-1, 0, 255));
+        assert_eq!(surface.rgba_u32(), &before[..]);
     }
 }
