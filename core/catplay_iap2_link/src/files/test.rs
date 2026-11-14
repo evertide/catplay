@@ -325,3 +325,44 @@ fn work_submitted_after_negotiation_for_unsupported_sessions_is_dropped() {
     // The late submission's data was released, not left behind.
     assert!(!test.server.files().has_tx_state(), "late submission was not released");
 }
+
+/// A file id the client may allocate.
+const PEER_FILE_ID_IN_RANGE: u8 = 1;
+
+/// Sends a file Setup with `file_id` from the client and returns the file events the server reported.
+fn peer_file_setup(file_id: u8) -> (LinkLayerFileTest, Vec<(u8, FileTransferEvent)>) {
+    let mut test = LinkLayerFileTest::new();
+    test.sync();
+
+    let mut setup = Vec::new();
+    setup.extend_from_slice(&4u64.to_be_bytes());
+    setup.extend_from_slice(&0x4321u16.to_be_bytes());
+    test.client
+        .files()
+        .enqueue_test_payload(FileTransferPayload {
+            file_id,
+            op: FileTransferOp::Setup,
+            payload: setup,
+        });
+
+    for _ in 0..5 {
+        test.sync();
+    }
+
+    let events = test.server_files.drain(..).collect();
+    (test, events)
+}
+
+#[test]
+fn file_id_255_from_the_peer_does_not_panic() {
+    // Positive control: the same Setup with a valid id does reach the server.
+    let (_, events) = peer_file_setup(PEER_FILE_ID_IN_RANGE);
+    assert!(
+        matches!(events.as_slice(), [(id, FileTransferEvent::Setup { .. })] if *id == PEER_FILE_ID_IN_RANGE),
+        "valid id must produce a Setup event: {events:?}"
+    );
+
+    let (test, events) = peer_file_setup(255);
+    assert!(events.is_empty(), "id 255 is outside every valid range: {events:?}");
+    assert_eq!(test.server.status(), &LinkStatus::Writable);
+}
