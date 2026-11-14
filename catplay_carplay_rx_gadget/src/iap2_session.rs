@@ -28,7 +28,6 @@ pub struct CarPlayServerSession {
 
     gps_sub: bool,
 
-    events_rx: mpsc::UnboundedReceiver<CarPlayServerSessionEventRx>,
     events_tx: mpsc::UnboundedSender<CarPlayServerSessionEventTx>,
 }
 
@@ -158,23 +157,24 @@ impl CarPlayServerSession {
         let _ = self.events_tx.unbounded_send(event);
     }
 
-    pub fn on_event(&mut self, ev: CarPlayServerSessionEventRx, _handle: CsmClientHandleRef) {
+    pub fn on_event(&mut self, ev: CarPlayServerSessionEventRx, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
         match ev {
             CarPlayServerSessionEventRx::FeedGpsGprmc(packet) => {
                 if self.gps_sub {
-                    _handle.send(&packet);
+                    _handle.send(&packet)?;
                 } else {
                     warn!("Ignoring GPRMC because GPS sub is inactive");
                 }
             }
             CarPlayServerSessionEventRx::FeedGpsNmea(packet) => {
                 if self.gps_sub {
-                    _handle.send(&packet);
+                    _handle.send(&packet)?;
                 } else {
                     warn!("Ignoring NMEA because GPS sub is inactive");
                 }
             }
         }
+        Ok(())
     }
 
     pub fn on_now_playing(&mut self, np: NowPlayingUpdate) {
@@ -214,13 +214,8 @@ impl CarPlayServerSession {
     pub fn new(
         mfi: Option<MfiDeficeRef>,
         identity: CarPlaySessionIdentity,
-    ) -> (
-        Self,
-        mpsc::UnboundedSender<CarPlayServerSessionEventRx>,
-        mpsc::UnboundedReceiver<CarPlayServerSessionEventTx>,
-    ) {
-        let (events_tx0, events_rx0) = mpsc::unbounded();
-        let (events_tx1, events_rx1) = mpsc::unbounded();
+    ) -> (Self, mpsc::UnboundedReceiver<CarPlayServerSessionEventTx>) {
+        let (events_tx, events_rx) = mpsc::unbounded();
 
         (
             Self {
@@ -233,12 +228,10 @@ impl CarPlayServerSession {
                 now_playing_summary: NowPlayingSummary::default(),
                 now_playing_next_cover_art: None,
                 cover_art_transfer_start: None,
-                events_rx: events_rx0,
-                events_tx: events_tx1,
+                events_tx,
                 gps_sub: false,
             },
-            events_tx0,
-            events_rx1,
+            events_rx,
         )
     }
 

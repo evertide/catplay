@@ -10,6 +10,7 @@ use catplay_carplay::carplay_rx::{
 };
 use catplay_hap::HomekitStorageRef;
 use catplay_iap2_bt::{BluetoothError, BluetoothManager};
+use catplay_iap2_client::CsmSessionBox;
 use catplay_iap2_usb::{GadgetError, NcmHelper};
 use catplay_mfi::MfiDeficeRef;
 use catplay_util::{
@@ -46,6 +47,7 @@ pub struct CarPlayWirelessGadget<T: AirPlayReceiverSink> {
 
     // AirPlay sink
     sink: Arc<dyn Fn() -> T + Send + Sync + 'static>,
+    identity_callback: Option<Arc<dyn Fn(CarPlaySessionIdentity) + Send + Sync>>,
 
     invites_blocked: bool,
     last_mac: Option<MacAddr6>,
@@ -93,6 +95,7 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
                 mfi,
                 shared,
                 sink: Arc::new(sink),
+                identity_callback: None,
                 invites_blocked: false,
                 last_mac: None,
                 bt_last_connect_cache_file: bt_last_connect_cache_file.map(|p| p.into()),
@@ -228,6 +231,12 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
     pub fn set_invites_blocked(&mut self, blocked: bool) {
         self.invites_blocked = blocked;
     }
+
+    /// Publish the real wireless identity before accepting Bluetooth or AirPlay
+    /// connections, including Wi-Fi reconnects without a new Bluetooth session.
+    pub fn set_identity_callback(&mut self, callback: impl Fn(CarPlaySessionIdentity) + Send + Sync + 'static) {
+        self.identity_callback = Some(Arc::new(callback));
+    }
 }
 
 impl<T: AirPlayReceiverSink> AsyncShutdown for CarPlayWirelessGadget<T> {
@@ -344,7 +353,10 @@ impl<T: AirPlayReceiverSink> Reconcilable for CarPlayWirelessGadget<T> {
                     ..CarPlaySessionIdentity::default()
                 };
 
-                let cb = move || CarPlayServerSession::new(mfi.clone(), identity.clone()).0;
+                if let Some(callback) = &self.identity_callback {
+                    callback(identity.clone());
+                }
+                let cb = move || -> CsmSessionBox { Box::new(CarPlayServerSession::new(mfi.clone(), identity.clone()).0) };
                 let mut mgr = BluetoothManager::new(false, true, true, hci, cb);
                 mgr.start()
                     .await
