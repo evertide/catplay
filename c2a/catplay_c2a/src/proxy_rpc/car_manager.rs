@@ -89,6 +89,7 @@ impl CarManager {
         proxy_rx: mpsc::UnboundedReceiver<TxAdapterOp>,
         persist_dir: Option<PathBuf>,
     ) -> RtspResult<Self> {
+        super::xc90_diag::Xc90Diag::get(); // logs the XC90 diagnostic switches at the start of the car session
         let info = car.info_cached();
         let car_media_clock = car.media_clock();
         let screen = info.displays.first().ok_or(RtspError::Unknown)?;
@@ -277,6 +278,9 @@ impl CarManager {
         if let Some(screen) = self.alt_screen.reconcile().await {
             self.schedule_alt_screen_teardown(screen);
         }
+        if let Some(uuid) = self.alt_screen.take_resetup() {
+            self.schedule_alt_screen_setup(uuid);
+        }
 
         Ok(())
     }
@@ -347,7 +351,8 @@ impl CarManager {
         self.tx_queue.push_back(
             async move {
                 warn!("Alt screen SETUP start");
-                match tx.setup_alt_screen(Duration::from_millis(25), uuid).await {
+                let latency = Duration::from_millis(super::xc90_diag::Xc90Diag::get().alt_latency_ms);
+                match tx.setup_alt_screen(latency, uuid).await {
                     Ok(screen) => {
                         warn!("Alt screen SETUP end");
                         let _ = otx.send(screen);

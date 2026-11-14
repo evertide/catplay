@@ -1,5 +1,5 @@
-mod audio_info;
 mod alt_screen_manager;
+mod audio_info;
 mod car_manager;
 mod car_to_iphone_command_task;
 mod iap2_bridge;
@@ -10,6 +10,7 @@ mod overlay_manager;
 mod proxy_screen;
 mod rx_bridge;
 mod tx_adapter;
+mod xc90_diag;
 
 pub use alt_screen_manager::*;
 pub use car_manager::*;

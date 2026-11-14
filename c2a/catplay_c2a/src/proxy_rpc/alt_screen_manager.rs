@@ -1,8 +1,8 @@
-use super::proxy_screen::ScreenProxyOp;
+use super::{proxy_screen::ScreenProxyOp, xc90_diag::Xc90Diag};
 use catplay_carplay::{
     carplay_tx::TeardownGuard,
     screen::tx::{ScreenTransmitError, ScreenTransmitProxy, ScreenTransmitSink},
-    video::EncodedVideoFrame,
+    video::{AvccConfigExtended, EncodedVideoFrame},
 };
 use catplay_util::{EventSleeper, EventToken, event_select, mpsc, oneshot};
 use log::{debug, error, info, warn};
@@ -23,6 +23,9 @@ pub struct AltScreenManager {
     pending_keyframe: Option<EncodedVideoFrame>,
     /// Diagnostics: frame capture after the last showUI (see [Capture]).
     capture: Option<Capture>,
+    /// XC90 diagnostics: last config sent to the car stream, and whether a re-SETUP is due (see [Xc90Diag::alt_resetup]).
+    sent_config: Option<AvccConfigExtended>,
+    resetup: bool,
 }
 
 /// Diagnostics: captures started by this process (a new [AltScreenManager] is created per car session).
@@ -106,6 +109,8 @@ impl AltScreenManager {
         self.iphone_screen_rx.replace(channel);
         self.uuid = uuid;
         self.pending_keyframe.take();
+        self.sent_config = None;
+        self.resetup = false;
         self.car_screen.take()
     }
 
@@ -121,6 +126,8 @@ impl AltScreenManager {
         self.uuid.take();
         self.pending_setup.take();
         self.pending_keyframe.take();
+        self.sent_config = None;
+        self.resetup = false;
         if let Some(capture) = self.capture.take() {
             capture.finish();
         }
@@ -154,6 +161,27 @@ impl AltScreenManager {
         }
     }
 
+    /// XC90 diagnostics: the display UUID, if a re-SETUP of the car stream is due (cleared by this call).
+    pub fn take_resetup(&mut self) -> Option<Option<String>> {
+        std::mem::take(&mut self.resetup).then(|| self.uuid.clone())
+    }
+
+    /// XC90 diagnostics: apply [Xc90Diag::alt_passthrough_config], and decide whether `config` needs a new car stream.
+    fn diag_config(&mut self, diag: Xc90Diag, config: &mut AvccConfigExtended) -> bool {
+        if !diag.alt_passthrough_config {
+            config.view = Default::default();
+        }
+        let changed = self.sent_config.as_ref().is_some_and(|sent| sent != config);
+        if changed && diag.alt_resetup && self.car_screen.is_some() {
+            info!("XC90: alt screen config changed, re-SETUP of the car stream: {config:?}");
+            self.sent_config = None;
+            self.resetup = true;
+            return true;
+        }
+        self.sent_config = Some(config.clone());
+        false
+    }
+
     /// Returns a car stream that is no longer needed, if any, which should be torn down.
     pub async fn reconcile(&mut self) -> Option<TeardownGuard<ScreenTransmitProxy>> {
         if let Some(os) = self.pending_setup.as_mut()
@@ -164,6 +192,7 @@ impl AltScreenManager {
             match result {
                 Ok(mut screen) if self.iphone_screen_rx.is_some() => {
                     info!("Alt screen is ready to receive iPhone frames");
+                    self.sent_config = None;
 
                     if let Some(mut keyframe) = self.pending_keyframe.take() {
                         warn!("Repeating iPhone alt screen keyframe received during SETUP");
@@ -188,7 +217,21 @@ impl AltScreenManager {
         let op = self.iphone_screen_rx.as_mut().and_then(|rx| rx.take())?;
 
         match op {
-            ScreenProxyOp::IphoneFrame { frame, handle, consumed } => {
+            ScreenProxyOp::IphoneFrame {
+                mut frame,
+                handle,
+                consumed,
+            } => {
+                if let Some(config) = frame.config.as_mut()
+                    && self.diag_config(Xc90Diag::get(), config)
+                {
+                    let car_screen = self.car_screen.take();
+                    if frame.is_known_keyframe() {
+                        self.pending_keyframe.replace(frame);
+                    }
+                    let _ = consumed.send(());
+                    return car_screen;
+                }
                 match self.car_screen.as_mut() {
                     None if frame.is_known_keyframe() => {
                         debug!("Holding iPhone alt screen keyframe until car alt screen is ready");
@@ -214,26 +257,31 @@ impl AltScreenManager {
             }
             // A config update without a frame (for example the view switch on showUI) is passed on right away, or kept with the
             // held keyframe while the car SETUP is pending.
-            ScreenProxyOp::IphoneConfig { config } => match self.car_screen.as_mut() {
-                Some(car_screen) => {
-                    if let Err(err) = car_screen.push_avcc_config(config) {
-                        warn!("Sink rejected iPhone alt screen config?: {err}");
+            ScreenProxyOp::IphoneConfig { mut config } => {
+                if self.diag_config(Xc90Diag::get(), &mut config) {
+                    return self.car_screen.take();
+                }
+                match self.car_screen.as_mut() {
+                    Some(car_screen) => {
+                        if let Err(err) = car_screen.push_avcc_config(config) {
+                            warn!("Sink rejected iPhone alt screen config?: {err}");
+                        }
+                    }
+                    None => {
+                        // A view change keeps the held keyframe decodable; any other change needs a new keyframe from the iPhone.
+                        let held = self.pending_keyframe.take();
+                        self.pending_keyframe = held.filter(|keyframe| {
+                            keyframe
+                                .config
+                                .as_ref()
+                                .is_some_and(|c| c.same_except_view(&config))
+                        });
+                        if let Some(keyframe) = self.pending_keyframe.as_mut() {
+                            keyframe.config = Some(config);
+                        }
                     }
                 }
-                None => {
-                    // A view change keeps the held keyframe decodable; any other change needs a new keyframe from the iPhone.
-                    let held = self.pending_keyframe.take();
-                    self.pending_keyframe = held.filter(|keyframe| {
-                        keyframe
-                            .config
-                            .as_ref()
-                            .is_some_and(|c| c.same_except_view(&config))
-                    });
-                    if let Some(keyframe) = self.pending_keyframe.as_mut() {
-                        keyframe.config = Some(config);
-                    }
-                }
-            },
+            }
             ScreenProxyOp::IphoneStreamFinish => {
                 info!("iPhone has finished its alt screen stream");
                 if let Some(capture) = self.capture.take() {
@@ -492,5 +540,52 @@ mod tests {
         let _ = iphone_tx.unbounded_send(ScreenProxyOp::IphoneConfig { config: new_codec });
         assert!(step(&mut manager).is_none());
         assert!(manager.pending_keyframe.is_none(), "a keyframe for another codec config is dropped");
+    }
+
+    #[test]
+    fn diag_config_requests_a_resetup_only_for_a_changed_config_on_a_live_stream() {
+        use catplay_carplay::video::AvccConfig;
+
+        let config = |view: u8| AvccConfigExtended {
+            hevc: false,
+            avcc: AvccConfig {
+                nal_size_len: 4,
+                sps_pps: vec![1, 2],
+            },
+            video_latency: Duration::ZERO,
+            width: 1920,
+            height: 720,
+            respect_timestamps: true,
+            view: [[0; 8], [view; 8]],
+        };
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let mut manager = AltScreenManager::default();
+        manager.car_screen = Some(car_screen(&torn_down));
+        let diag = Xc90Diag {
+            alt_resetup: true,
+            ..Default::default()
+        };
+        assert!(!manager.diag_config(diag, &mut config(1)), "the first config is just recorded");
+        assert!(!manager.diag_config(diag, &mut config(1)), "an unchanged config needs nothing");
+        assert!(
+            !manager.diag_config(Default::default(), &mut config(2)),
+            "no re-SETUP unless switched on"
+        );
+        assert!(manager.diag_config(diag, &mut config(3)));
+        assert!(manager.take_resetup().is_some());
+        assert!(
+            !manager.diag_config(diag, &mut config(4)),
+            "after a re-SETUP the next config starts the new stream"
+        );
+        let mut stripped = config(5);
+        manager.diag_config(
+            Xc90Diag {
+                alt_passthrough_config: false,
+                ..Default::default()
+            },
+            &mut stripped,
+        );
+        assert_eq!(stripped.view, [[0; 8]; 2], "without pass-through the view is not sent");
+        assert!(manager.take_resetup().is_none());
     }
 }
