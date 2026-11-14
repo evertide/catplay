@@ -1,5 +1,6 @@
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -15,8 +16,8 @@ use catplay_carplay::{
     },
     carplay_tx::{AirPlayTransmitterBootstrap, AirPlayTransmitterImpl},
     msg::{AudioFormat, AudioType, Display, InfoMessageResponse, StreamType},
-    rtsp_frame::{RtspError, RtspResult},
-    rtsp_session::RtspReceiver,
+    rtsp_frame::{RtspError, RtspMethod, RtspResult},
+    rtsp_session::{RtspReceiver, RtspReceiverCallback, RtspReceiverEvent, RtspReceiverEventResult},
     screen::{
         rx::{ScreenReceiverSink, ScreenReceiverSinkBox},
         tx::ScreenTransmitSink,
@@ -26,10 +27,11 @@ use catplay_carplay::{
 use catplay_hap::HomekitStorageFile;
 use catplay_tokio::TcpHelper;
 use catplay_tracing::logger::setup_test_logger;
-use catplay_util::{AsyncShutdown, EventReconciler, EventSleeper};
+use catplay_util::{AsyncShutdown, EventReconciler, EventSink, EventSleeper, EventToken};
 use log::debug;
 use macaddr::MacAddr6;
 use tokio::{runtime::Handle, time::sleep};
+use uuid::Uuid;
 
 struct MockSink {}
 struct MockScreenSink {}
@@ -112,8 +114,55 @@ impl EventReconciler for MockSink {
     type Error = RtspError;
 }
 
+/// What the transmitter sent, in order: method, url, and whether the session was encrypted at that point.
+type RequestLog = Arc<Mutex<Vec<(RtspMethod, String, bool)>>>;
+
+/// Wraps the real receiver to record the requests it gets.
+struct RecordingReceiver {
+    inner: AirPlayReceiver,
+    log: RequestLog,
+    encrypted: bool,
+}
+
+#[async_trait]
+impl EventSink<RtspReceiverEvent<'_>, RtspReceiverEventResult> for RecordingReceiver {
+    async fn on_event<'a>(&mut self, event: RtspReceiverEvent<'a>) -> RtspReceiverEventResult {
+        if let RtspReceiverEvent::Request { request, .. } = &event {
+            let entry = (request.method, request.url.to_string(), self.encrypted);
+            self.log.lock().unwrap().push(entry);
+        }
+        let result = self.inner.on_event(event).await;
+        self.encrypted |= result.encrypt_after_response.is_some();
+        result
+    }
+}
+
+impl RtspReceiverCallback for RecordingReceiver {}
+impl AsyncShutdown for RecordingReceiver {
+    async fn shutdown(&mut self) {
+        self.inner.shutdown().await
+    }
+}
+impl EventSleeper for RecordingReceiver {
+    async fn sleep(&mut self) -> Option<EventToken> {
+        self.inner.sleep().await
+    }
+}
+impl EventReconciler for RecordingReceiver {
+    type Error = RtspError;
+
+    async fn reconcile(&mut self) -> Result<(), Self::Error> {
+        self.inner.reconcile().await
+    }
+}
+
 /// Returns the receiver handle too: dropping it would stop the mock receiver.
 async fn connect_to_mock_receiver(pair_first: bool) -> (impl Sized, AirPlayTransmitterImpl) {
+    let (rx, transmitter, _) = connect_recording(pair_first, None).await;
+    (rx, transmitter)
+}
+
+async fn connect_recording(pair_first: bool, remote_homekit_id: Option<Uuid>) -> (impl Sized, AirPlayTransmitterImpl, RequestLog) {
     let hk_rx = HomekitStorageFile::memory();
     let hk_tx = HomekitStorageFile::memory();
 
@@ -126,28 +175,71 @@ async fn connect_to_mock_receiver(pair_first: bool) -> (impl Sized, AirPlayTrans
         Box::new(MockSink {}),
         AirPlayReceiverProfile::CarPlay,
     );
-    let session = RtspReceiver::new(receiver);
+    let log = RequestLog::default();
+    let recording = RecordingReceiver {
+        inner: receiver,
+        log: log.clone(),
+        encrypted: false,
+    };
+    let session = RtspReceiver::new(recording);
     let (rx, bind) = TcpHelper::accept_timeout(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0), Duration::ZERO, session).unwrap();
 
     let bootstrap = AirPlayTransmitterBootstrap {
         homekit: hk_tx,
         peer_ip: bind,
         controller_features: vec![],
-        remote_homekit_id: None,
+        remote_homekit_id,
         pair_first,
     };
-    (rx, AirPlayTransmitterImpl::connect(bootstrap).await.unwrap())
+    (rx, AirPlayTransmitterImpl::connect(bootstrap).await.unwrap(), log)
+}
+
+fn count(log: &RequestLog, method: RtspMethod, url: &str) -> usize {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, u, _)| *m == method && u == url)
+        .count()
+}
+
+/// Encryption state of every SETUP the receiver got, in order.
+fn setups(log: &RequestLog) -> Vec<bool> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, ..)| *m == RtspMethod::Setup)
+        .map(|(.., encrypted)| *encrypted)
+        .collect()
 }
 
 #[tokio::test]
 async fn sends_pair_request() {
-    let (_rx, _transmitter) = connect_to_mock_receiver(false).await;
+    let (_rx, _transmitter, log) = connect_recording(false, None).await;
+    assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 0, "no pairing unless asked: {log:?}");
+    assert_eq!(setups(&log), [false], "{log:?}");
 }
 
 /// Recent HomeKit receivers (Volvo XC90, srcvers 365.x) are paired before the first SETUP.
 #[tokio::test]
 async fn pairs_before_setup_when_requested() {
-    let (_rx, _transmitter) = connect_to_mock_receiver(true).await;
+    let (_rx, _transmitter, log) = connect_recording(true, None).await;
+    assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 3, "M1, M3, M5: {log:?}");
+    assert_eq!(count(&log, RtspMethod::Post, "/pair-verify"), 2, "M1, M3: {log:?}");
+    assert_eq!(setups(&log), [true], "one SETUP, on the encrypted session: {log:?}");
+}
+
+/// If pairing first fails, SETUP is still tried once without pairing, as before pair-first existed.
+#[tokio::test]
+async fn falls_back_to_unpaired_setup_once_when_pairing_first_fails() {
+    // A Bonjour id the receiver doesn't have makes /pair-setup end in a uuid mismatch.
+    let (_rx, _transmitter, log) = connect_recording(true, Some(Uuid::from_u128(1))).await;
+    assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 3, "pairing was tried: {log:?}");
+    assert_eq!(
+        count(&log, RtspMethod::Post, "/pair-verify"),
+        0,
+        "pairing failed before verify: {log:?}"
+    );
+    assert_eq!(setups(&log), [false], "one SETUP, unencrypted: {log:?}");
 }
 
 #[tokio::test]
