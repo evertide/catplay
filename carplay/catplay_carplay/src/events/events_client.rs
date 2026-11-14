@@ -1,10 +1,11 @@
-use std::{net::TcpStream, time::Duration};
+use std::{collections::VecDeque, net::TcpStream, time::Duration};
 
 use async_trait::async_trait;
 use catplay_plist::CachingSerializer;
 use catplay_tokio::{CItem, TcpSession, TcpSink};
 use catplay_util::{AsyncShutdown, EventSleeper};
-use log::warn;
+use log::{Level, log};
+use serde::Deserialize;
 
 use crate::{
     cipher::AirPlayCipherSaltType,
@@ -19,6 +20,7 @@ pub struct EventsClient {
     rtsp: RtspQueue,
     #[sleep]
     rtsp_drain: RtspDrain,
+    response_log_levels: VecDeque<Level>,
 }
 
 impl EventsClient {
@@ -28,6 +30,7 @@ impl EventsClient {
             rtsp,
             rtsp_drain,
             shared_secret: Some(shared_secret),
+            response_log_levels: VecDeque::new(),
         }
     }
 
@@ -37,11 +40,34 @@ impl EventsClient {
             rtsp,
             rtsp_drain,
             shared_secret: None,
+            response_log_levels: VecDeque::new(),
         }
     }
 
     pub fn rtsp_client(&self) -> RtspQueue {
         self.rtsp.clone()
+    }
+
+    fn request_log_level(&mut self, request: &RtspRequest) -> Level {
+        #[derive(Deserialize)]
+        struct CommandType {
+            #[serde(rename = "type")]
+            name: String,
+        }
+
+        // Read only the command type; do not decode or copy the iAP2 data for logging.
+        let iap2 = request.url.as_str() == "/command"
+            && catplay_plist::from_bytes::<CommandType>(&request.payload).is_ok_and(|command| command.name == "iAPSendMessage");
+        let level = if iap2 { Level::Debug } else { Level::Warn };
+        self.response_log_levels.push_back(level);
+        level
+    }
+
+    fn response_log_level(&mut self) -> Level {
+        // Event responses have no CSeq. Keep FIFO slots even if the caller drops its future.
+        self.response_log_levels
+            .pop_front()
+            .unwrap_or(Level::Warn)
     }
 }
 
@@ -90,7 +116,8 @@ impl TcpSession for EventsClient {
     async fn on_msg(&mut self, _sink: &mut dyn TcpSink<Self>, msgs: CItem<Self::Codec>) -> RtspResult<()> {
         for msg in msgs {
             if let RtspFrame::Response(resp) = msg {
-                warn!("Event socket: <- {resp}");
+                let level = self.response_log_level();
+                log!(level, "Event socket: <- {resp}");
                 self.rtsp_drain.feed(resp);
             }
         }
@@ -99,7 +126,8 @@ impl TcpSession for EventsClient {
 
     async fn reconcile(&mut self, _sink: &mut dyn TcpSink<Self>) -> RtspResult<()> {
         for req in self.rtsp_drain.drain() {
-            warn!("Event socket: -> {}", &req);
+            let level = self.request_log_level(&req);
+            log!(level, "Event socket: -> {}", &req);
             _sink.write(vec![req.into()])?;
         }
 
@@ -112,3 +140,42 @@ impl TcpSession for EventsClient {
 }
 
 impl AsyncShutdown for EventsClient {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msg::{CommandForceKeyFrame, CommandIApSendMessage};
+
+    #[test]
+    fn only_iap2_commands_and_their_fifo_responses_use_debug() {
+        let mut client = EventsClient::unencrypted();
+        let queue = client.rtsp_client();
+        let iap2 = Command::IApSendMessage(CommandIApSendMessage {
+            data: vec![1, 2, 3].into(),
+        });
+        let video = Command::ForceKeyFrame(CommandForceKeyFrame { uuid: None });
+        let timeout = Duration::from_secs(1);
+        let cancelled = queue.send_command(&iap2, timeout).unwrap();
+        drop(cancelled);
+        let _video = queue.send_command(&video, timeout).unwrap();
+        let _iap2 = queue
+            .send_command_caching(&iap2, timeout, &mut CachingSerializer::default())
+            .unwrap();
+        let requests = client.rtsp_drain.drain();
+        assert_eq!(requests.len(), 3);
+        for (request, expected) in requests.iter().zip([Level::Debug, Level::Warn, Level::Debug]) {
+            assert_eq!(client.request_log_level(request), expected);
+        }
+        for expected in [Level::Debug, Level::Warn, Level::Debug, Level::Warn] {
+            assert_eq!(client.response_log_level(), expected);
+        }
+    }
+
+    #[test]
+    fn malformed_event_requests_keep_warn_logging() {
+        let mut client = EventsClient::unencrypted();
+        let request = RtspRequest::with_payload(RtspMethod::Post, "/command", &b"invalid plist"[..]);
+        assert_eq!(client.request_log_level(&request), Level::Warn);
+        assert_eq!(client.response_log_level(), Level::Warn);
+    }
+}

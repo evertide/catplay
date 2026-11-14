@@ -297,6 +297,53 @@ fn stop_before_authentication_cancels_deferred_request() {
 }
 
 #[test]
+fn empty_or_unsupported_replacements_stop_gps_until_a_usable_request() {
+    for rejected in [
+        StartLocationInformation::default(),
+        StartLocationInformation {
+            vehicle_gyro_data: CsmFlag::Yes,
+            ..StartLocationInformation::default()
+        },
+    ] {
+        let location = LocationBridge::default();
+        let mut car = CarPlayClientSession::with_location(location.clone());
+        let mut phone = phone(location);
+        let car_out = Arc::new(Capture::default());
+        let phone_out = Arc::new(Capture::default());
+        ready(&mut car, &car_out);
+        respond(&mut phone, &phone_out, StartLocationInformation::all());
+        pump(&mut phone, &phone_out);
+        pump(&mut car, &car_out);
+        assert_eq!(car_out.location_commands().len(), 1);
+        respond(&mut car, &car_out, sample());
+
+        for expected_stops in [1, 0] {
+            respond(&mut phone, &phone_out, rejected.clone());
+            pump(&mut phone, &phone_out);
+            pump(&mut car, &car_out);
+            let commands = car_out.location_commands();
+            assert_eq!(commands.len(), expected_stops);
+            assert!(
+                commands
+                    .iter()
+                    .all(|packet| packet.cast::<StopLocationInformation>().is_some())
+            );
+            respond(&mut car, &car_out, sample());
+            assert!(phone.wait_event().now_or_never().is_none());
+            assert!(phone_out.take().is_empty());
+        }
+
+        respond(&mut phone, &phone_out, StartLocationInformation::all());
+        pump(&mut phone, &phone_out);
+        pump(&mut car, &car_out);
+        assert_eq!(car_out.location_commands().len(), 1);
+        respond(&mut car, &car_out, sample());
+        pump(&mut phone, &phone_out);
+        assert_eq!(phone_out.take()[0].cast::<LocationInformation>(), Some(&sample()));
+    }
+}
+
+#[test]
 fn replacement_usb_session_repeats_negotiation_for_the_live_iphone_request() {
     let location = LocationBridge::default();
     let mut car = CarPlayClientSession::with_location(location.clone());

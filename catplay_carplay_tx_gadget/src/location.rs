@@ -183,6 +183,7 @@ pub(crate) struct CarLocation {
     started: bool,
     authenticated: bool,
     active: Option<StartLocationInformation>,
+    rejected: Option<StartLocationInformation>,
     received_location: bool,
 }
 
@@ -203,6 +204,7 @@ impl CarLocation {
             started: false,
             authenticated: false,
             active: None,
+            rejected: None,
             received_location: false,
         }
     }
@@ -241,12 +243,29 @@ impl CarLocation {
     }
 
     pub fn reconcile(&mut self, id: &IdentificationInformation, handle: &CsmClientHandleRef) -> CsmSessionResult<bool> {
-        let request = self.requests.borrow_and_update().clone();
+        let request = self
+            .requests
+            .borrow_and_update()
+            .as_ref()
+            .filter(|(_, updates)| !updates.changed.is_closed())
+            .map(|(request, _)| request.clone());
         // Authentication and explicit location capabilities are sufficient. Power
         // messages are independent and some cars advertise them without sending any.
         let wanted = request
-            .filter(|(_, updates)| !updates.changed.is_closed() && self.authenticated && self.supported.load(Ordering::Relaxed))
-            .and_then(|(request, _)| intersect(&request, id.location_information_component.as_ref()));
+            .as_ref()
+            .filter(|_| self.authenticated && self.supported.load(Ordering::Relaxed))
+            .and_then(|request| intersect(request, id.location_information_component.as_ref()));
+        let rejected = request.filter(|_| self.authenticated && wanted.is_none());
+        if rejected != self.rejected {
+            if let Some(request) = &rejected {
+                info!(
+                    "Car GPS request rejected: empty or unsupported subscription, request={request:?}, component={:?}, available={}",
+                    id.location_information_component,
+                    self.supported.load(Ordering::Relaxed),
+                );
+            }
+            self.rejected = rejected;
+        }
         if wanted == self.active {
             return Ok(false);
         }

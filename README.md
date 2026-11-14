@@ -83,11 +83,15 @@ The car must advertise a location component, send `LocationInformation`, and acc
 the iPhone requests it and car identification and authentication are complete.
 Only data types supported by both sides are requested; power messages are independent.
 
-Pending updates are merged by sentence type, with at most 16 types buffered.
+The accumulator merges pending updates by sentence type and holds at most 16 types.
+GPS waits for transport completion before taking the next update. Merged payloads
+are split at sentence group boundaries with a 60 KiB budget per message; a single
+group exceeding that budget is dropped.
 Bluetooth disconnects do not interrupt forwarding. An iPhone Stop request or AirPlay
 teardown cancels it, and a replacement USB session repeats car negotiation.
-GPS errors leave audio and video running. INFO logs report negotiation gates and
-the first request, received location, and forwarded location.
+AirPlay GPS endpoint errors leave audio and video running. INFO logs report identification,
+negotiation gates, subscription changes and rejections, and the first received and
+forwarded location. Per-packet AirPlay iAP2 command dumps use DEBUG.
 
 ## Known limitations
 - car GPS compatibility depends on the head unit exposing iAP2 location data

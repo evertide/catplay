@@ -27,6 +27,7 @@ pub struct CarPlayServerSession {
     cover_art_transfer_start: Option<Instant>,
 
     gps_sub: bool,
+    identification_sent: bool,
 
     events_tx: mpsc::UnboundedSender<CarPlayServerSessionEventTx>,
 }
@@ -230,6 +231,7 @@ impl CarPlayServerSession {
                 cover_art_transfer_start: None,
                 events_tx,
                 gps_sub: false,
+                identification_sent: false,
             },
             events_rx,
         )
@@ -432,6 +434,14 @@ impl CsmSession for CarPlayServerSession {
     async fn respond(&mut self, packet: CsmPacketBox, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
         debug!("Received from iPhone @ {:?}: {:?}", Instant::now() - self.start, packet);
 
+        let log_identification = packet.cast::<StartIdentification>().is_some() && !self.identification_sent;
+        if log_identification {
+            info!(
+                "iPhone StartIdentification observed: transport={:?}",
+                _handle.remote()
+            );
+        }
+
         // if let Some(_) = packet.cast::<IdentificationAccepted>() {
         //     _handle.send(&PowerSourceUpdate {
         //         available_current_for_device: Some(1000),
@@ -485,6 +495,18 @@ impl CsmSession for CarPlayServerSession {
         let mut responded_to_wifi = false;
 
         if ClientSessionHelper::handle_id(&packet, _handle.clone(), &mut accepted, &self.id).await? {
+            if log_identification {
+                self.identification_sent = true;
+                info!(
+                    "IdentificationInformation reply sent: transport={:?}, component={:?}, wants_tx(LocationInformation)={}, \
+                     wants_rx(StartLocationInformation)={}, wants_rx(StopLocationInformation)={}",
+                    _handle.remote(),
+                    self.id.location_information_component,
+                    self.id.wants_tx(LocationInformation::PACKET_ID),
+                    self.id.wants_rx(StartLocationInformation::PACKET_ID),
+                    self.id.wants_rx(StopLocationInformation::PACKET_ID),
+                );
+            }
             debug!("Handled id");
             // if accepted {}
             return Ok(());
