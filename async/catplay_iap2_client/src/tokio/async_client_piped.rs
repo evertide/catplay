@@ -28,6 +28,7 @@ pub struct AsyncClientStream<S: AsyncRead + AsyncWrite + Send> {
     rx_frame: Option<PacketFrame<Vec<u8>>>,
     rx_buf: BytesMut,
     tx_buf: BytesMut,
+    end_on_eof: bool,
 }
 
 impl<S: AsyncRead + AsyncWrite + Send> AsyncClientStream<S> {
@@ -45,7 +46,16 @@ impl<S: AsyncRead + AsyncWrite + Send> AsyncClientStream<S> {
             error: None,
             client,
             client_tx,
+            end_on_eof: false,
         }
+    }
+
+    /// Ends the session with an error when a read returns 0 bytes. For stream sockets (e.g.
+    /// Bluetooth RFCOMM) that means the peer closed the connection; USB endpoints can deliver
+    /// zero-length packets, so this is opt-in.
+    pub fn end_on_eof(mut self) -> Self {
+        self.end_on_eof = true;
+        self
     }
 
     async fn reconcile(&mut self) -> CsmSessionResult<()> {
@@ -67,9 +77,14 @@ impl<S: AsyncRead + AsyncWrite + Send> AsyncClientStream<S> {
         rx_buf: &mut BytesMut,
         tx_buf: &mut BytesMut,
         error: &mut Option<CsmSessionError>,
+        end_on_eof: bool,
     ) -> Option<EventToken> {
         select! {
             v = read_half.read_buf(rx_buf) => match v {
+                // `BytesMut` grows on demand, so 0 bytes read means the peer closed the stream.
+                Ok(0) if end_on_eof => {
+                    error.replace(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                }
                 Ok(n) => {
                     debug!("Read {n} bytes");
                     debug_assert!(rx_frame.is_none());
@@ -110,11 +125,12 @@ impl<S: AsyncRead + AsyncWrite + Send> EventSleeper for AsyncClientStream<S> {
             let rx_buf = &mut self.rx_buf;
             let tx_buf = &mut self.tx_buf;
             let error = &mut self.error;
+            let end_on_eof = self.end_on_eof;
 
             event_select!(
                 client,
                 client_tx,
-                sleeper(Self::sleep_io(read_half, write_half, rx_frame, rx_buf, tx_buf, error))
+                sleeper(Self::sleep_io(read_half, write_half, rx_frame, rx_buf, tx_buf, error, end_on_eof))
             )
         };
 
@@ -123,5 +139,37 @@ impl<S: AsyncRead + AsyncWrite + Send> EventSleeper for AsyncClientStream<S> {
         }
 
         token
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CsmRemote, CsmSessionCallbacks};
+
+    /// Runs one wake-up of a stream whose peer has already closed its end.
+    async fn after_peer_close(end_on_eof: bool) -> CsmSessionResult<()> {
+        let (ours, theirs) = tokio::io::duplex(64);
+        drop(theirs);
+        let (client, drain) = AsyncClient::new(true, CsmRemote::usb_gadget(), Box::new(CsmSessionCallbacks::noop()));
+        let mut stream = AsyncClientStream::new(client, drain, ours);
+        if end_on_eof {
+            stream = stream.end_on_eof();
+        }
+        // The first wake-ups may come from the client's own startup work; the read sees EOF
+        // within a few.
+        for _ in 0..8 {
+            EventReconciler::reconcile(&mut stream).await?;
+            tokio::time::timeout(std::time::Duration::from_millis(100), EventSleeper::sleep(&mut stream))
+                .await
+                .ok();
+        }
+        EventReconciler::reconcile(&mut stream).await
+    }
+
+    #[tokio::test]
+    async fn eof_ends_the_session_only_when_asked() {
+        assert!(after_peer_close(true).await.is_err(), "a closed Bluetooth socket ends the session");
+        assert!(after_peer_close(false).await.is_ok(), "other transports keep the old behaviour");
     }
 }

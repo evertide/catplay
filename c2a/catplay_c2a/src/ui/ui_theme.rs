@@ -178,15 +178,6 @@ impl UiTheme {
         Ok(buf.into())
     }
 
-    /// The state to render for `state`. The connecting phase is shown only with a theme; without
-    /// one the upstream waiting screen stays up until the session starts.
-    pub fn shown_state(&self, state: UiState) -> UiState {
-        match state {
-            UiState::Connecting { .. } if self.is_default() => UiState::WaitingForConnection,
-            state => state,
-        }
-    }
-
     /// The same theme without its background, used when the image cannot be rendered.
     pub fn without_background(&self) -> Self {
         Self {
@@ -577,17 +568,11 @@ mod tests {
     }
 
     #[test]
-    fn connecting_phase_needs_a_theme() {
+    fn connecting_text_comes_from_the_theme() {
         let connecting = UiState::Connecting {
             device: "iPhone".into(),
             ticks: 2,
         };
-        assert_eq!(
-            UiTheme::default().shown_state(connecting.clone()),
-            UiState::WaitingForConnection,
-            "without a theme the upstream waiting screen stays"
-        );
-
         let dir = temp_dir("connecting");
         std::fs::write(
             dir.join(UiTheme::FILE_NAME),
@@ -595,8 +580,6 @@ mod tests {
         )
         .unwrap();
         let theme = UiTheme::load(Some(&dir));
-        assert_eq!(theme.shown_state(connecting.clone()), connecting);
-        assert_eq!(theme.shown_state(UiState::Hidden), UiState::Hidden);
         assert_eq!(texts(&theme.ops(&connecting, SCREEN)), ["Verbinden met iPhone...", "Volvo XC90"]);
 
         // A theme without connecting_text still shows the phase, with the upstream text.

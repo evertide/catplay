@@ -1,5 +1,6 @@
 use std::{
     path::PathBuf,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -26,6 +27,8 @@ pub struct UiRenderer {
     persist_dir: Option<PathBuf>,
     /// Loaded on first use, inside the blocking render path rather than at construction.
     theme: Option<UiTheme>,
+    /// Set to whether a theme is configured when the theme is loaded.
+    themed: Arc<OnceLock<bool>>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -54,6 +57,7 @@ impl UiRenderer {
             last_state: UiState::Hidden,
             headers: BytesMut::new(),
             theme: None,
+            themed: Default::default(),
             persist_dir,
         })
     }
@@ -66,7 +70,22 @@ impl UiRenderer {
 
     fn theme(&mut self) -> &UiTheme {
         let persist_dir = self.persist_dir.as_deref();
-        self.theme.get_or_insert_with(|| UiTheme::load(persist_dir))
+        let themed = &self.themed;
+        self.theme.get_or_insert_with(|| {
+            let theme = UiTheme::load(persist_dir);
+            let _ = themed.set(!theme.is_default());
+            theme
+        })
+    }
+
+    /// Publishes whether a theme is configured into `themed` once the theme is loaded (at the
+    /// first render), so callers can decide without loading it themselves.
+    pub fn with_themed_flag(mut self, themed: Arc<OnceLock<bool>>) -> Self {
+        if let Some(theme) = &self.theme {
+            let _ = themed.set(!theme.is_default());
+        }
+        self.themed = themed;
+        self
     }
 
     fn ops(&mut self, state: &UiState) -> Vec<RenderOp> {
@@ -236,7 +255,6 @@ impl UiRenderer {
 
     #[trace_time(warn)]
     pub fn render_and_encode_frame(&mut self, state: UiState, latency: Duration, reset: bool) -> UiResult<EncodedVideoFrame> {
-        let state = self.theme().shown_state(state);
         if state.cache_file_name().is_some() {
             info!("UI renderer requested cacheable state {state}");
         }
@@ -387,11 +405,16 @@ fn test_theme_background_is_rendered() {
     )
     .unwrap();
 
-    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, Some(persist_dir.clone())).unwrap();
+    let themed = Arc::new(OnceLock::new());
+    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, Some(persist_dir.clone()))
+        .unwrap()
+        .with_themed_flag(themed.clone());
     assert!(renderer.theme.is_none(), "the theme is loaded lazily");
+    assert_eq!(themed.get(), None);
     renderer
         .render_and_encode_frame(UiState::WaitingForConnection, Duration::ZERO, false)
         .unwrap();
+    assert_eq!(themed.get(), Some(&true), "the first screen publishes that a theme is set");
     let theme = renderer.theme.as_ref().unwrap();
     assert!(theme.background_bytes.is_some(), "the background rendered without falling back");
     // The test image is a single colour (RGB 40, 80, 120); the centre must show it.
@@ -428,4 +451,18 @@ fn test_broken_theme_background_falls_back_to_default() {
     let theme = renderer.theme.as_ref().unwrap();
     assert!(theme.background_bytes.is_none());
     assert_eq!(theme.waiting_text.as_deref(), Some("Wachten"));
+}
+
+#[test]
+fn test_no_theme_is_published_after_the_first_screen() {
+    use std::time::Duration;
+
+    let themed = Arc::new(OnceLock::new());
+    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, None)
+        .unwrap()
+        .with_themed_flag(themed.clone());
+    renderer
+        .render_and_encode_frame(UiState::WaitingForConnection, Duration::ZERO, false)
+        .unwrap();
+    assert_eq!(themed.get(), Some(&false));
 }

@@ -7,7 +7,7 @@ use catplay_util::{EventReconciler, EventSleeper, EventToken, LazyAsync};
 use log::{debug, warn};
 use std::{
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -18,12 +18,14 @@ pub struct OverlayPolicyDefault {
     peer: OverlayPeerState,
     overlay: Option<UiState>,
     iphone_bt_links: Arc<AtomicUsize>,
+    themed: Arc<OnceLock<bool>>,
 }
 
 /// The waiting screen while no iPhone session runs: a pairing request wins, then a found iPhone
 /// (a live Bluetooth iAP2 link, kept by iOS until the AirPlay session runs), else still searching.
-fn waiting_screen(pairing: Option<UiState>, iphone_found: bool) -> UiState {
-    match (pairing, iphone_found) {
+/// The connecting phase is part of the UI theme; without one the upstream waiting screen stays.
+fn waiting_screen(pairing: Option<UiState>, iphone_found: bool, themed: bool) -> UiState {
+    match (pairing, iphone_found && themed) {
         (Some(pairing), _) => pairing,
         (None, true) => UiState::Connecting {
             // The Bluetooth link carries no name; the AirPlay name only arrives with the session.
@@ -36,12 +38,13 @@ fn waiting_screen(pairing: Option<UiState>, iphone_found: bool) -> UiState {
 }
 
 impl OverlayPolicyDefault {
-    pub fn new(iphone_bt_links: Arc<AtomicUsize>) -> Self {
+    pub fn new(iphone_bt_links: Arc<AtomicUsize>, themed: Arc<OnceLock<bool>>) -> Self {
         Self {
             bluez: LazyAsync::new(Self::start_pin_agent),
             peer: OverlayPeerState::Unconnected,
             overlay: None,
             iphone_bt_links,
+            themed,
         }
     }
     async fn start_pin_agent() -> BluezManager {
@@ -86,8 +89,10 @@ impl OverlayPolicy for OverlayPolicyDefault {
                 pin: format!("{}", req.passkey),
             });
         let iphone_found = self.iphone_bt_links.load(Ordering::Relaxed) > 0;
+        // Until the first screen loaded the theme, treat it as absent.
+        let themed = self.themed.get().copied().unwrap_or(false);
 
-        Some(waiting_screen(pairing, iphone_found))
+        Some(waiting_screen(pairing, iphone_found, themed))
     }
 
     fn on_hid_interact(&mut self) -> bool {
@@ -130,29 +135,38 @@ mod tests {
 
     #[test]
     fn waiting_screen_follows_the_connection_phase() {
-        assert_eq!(waiting_screen(None, false), UiState::WaitingForConnection);
-        let connecting = waiting_screen(None, true);
+        assert_eq!(waiting_screen(None, false, true), UiState::WaitingForConnection);
+        let connecting = waiting_screen(None, true, true);
         assert!(matches!(connecting, UiState::Connecting { .. }), "{connecting}");
+        assert_eq!(connecting, waiting_screen(None, true, true), "a phase renders the same state, so it is not redrawn");
         assert_eq!(
-            connecting,
-            waiting_screen(None, true),
-            "a phase renders the same state, so it is not redrawn"
+            waiting_screen(None, true, false),
+            UiState::WaitingForConnection,
+            "without a theme the upstream waiting screen stays"
         );
 
         let pairing = UiState::Pairing {
             device: "iPhone".into(),
             pin: "1234".into(),
         };
-        assert_eq!(waiting_screen(Some(pairing.clone()), false), pairing);
-        assert_eq!(waiting_screen(Some(pairing.clone()), true), pairing, "pairing wins over connecting");
+        for (found, themed) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(waiting_screen(Some(pairing.clone()), found, themed), pairing, "pairing wins");
+        }
     }
 
     #[test]
     fn found_iphone_switches_to_connecting_until_the_link_drops() {
         let links = Arc::new(AtomicUsize::new(0));
-        let mut policy = OverlayPolicyDefault::new(links.clone());
+        let themed = Arc::new(OnceLock::new());
+        let mut policy = OverlayPolicyDefault::new(links.clone(), themed.clone());
         assert_eq!(policy.overlay(), Some(UiState::WaitingForConnection));
         links.store(1, Ordering::Relaxed);
+        assert_eq!(
+            policy.overlay(),
+            Some(UiState::WaitingForConnection),
+            "the theme is not known before the first screen"
+        );
+        themed.set(true).unwrap();
         assert!(matches!(policy.overlay(), Some(UiState::Connecting { .. })));
         policy.set_peer_state(OverlayPeerState::ConnectedWithoutScreen);
         assert_eq!(policy.overlay(), None, "the session hides the waiting screen");

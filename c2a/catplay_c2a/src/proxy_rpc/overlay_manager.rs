@@ -15,7 +15,7 @@ use log::{debug, error, info, warn};
 use std::{
     mem,
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{Arc, Mutex, OnceLock, atomic::AtomicUsize},
     time::{Duration, Instant},
 };
 use tokio::task::spawn_blocking;
@@ -38,6 +38,8 @@ pub struct OverlayManager {
     iphone_screen_active: bool,
 
     renderer: Option<Arc<Mutex<UiRenderer>>>,
+    // Whether a UI theme is configured; known after the renderer loaded it for the first screen
+    themed: Arc<OnceLock<bool>>,
 
     policy: OverlayPolicyDefault,
     // stream_state: ResourceTransferType,
@@ -45,6 +47,7 @@ pub struct OverlayManager {
 
 impl OverlayManager {
     pub fn new(width: u32, height: u32, fps: u32, dpi: f32, persist_dir: Option<PathBuf>, iphone_bt_links: Arc<AtomicUsize>) -> Self {
+        let themed = Arc::new(OnceLock::new());
         Self {
             width,
             height,
@@ -62,8 +65,9 @@ impl OverlayManager {
             iphone_screen_active: false,
 
             renderer: None,
+            themed: themed.clone(),
 
-            policy: OverlayPolicyDefault::new(iphone_bt_links),
+            policy: OverlayPolicyDefault::new(iphone_bt_links, themed),
             lazy_screen: None,
         }
     }
@@ -253,7 +257,8 @@ impl OverlayManager {
     pub fn init_renderer(&mut self) -> Arc<Mutex<UiRenderer>> {
         if self.renderer.is_none() {
             let renderer = UiRenderer::new(self.width as _, self.height as _, self.fps, self.dpi, self.persist_dir.clone())
-                .expect("failed to init renderer");
+                .expect("failed to init renderer")
+                .with_themed_flag(self.themed.clone());
             self.renderer.replace(Arc::new(Mutex::new(renderer)));
             info!("Initialized UI renderer");
         }

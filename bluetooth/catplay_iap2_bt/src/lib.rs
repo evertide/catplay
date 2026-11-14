@@ -14,6 +14,7 @@ use catplay_iap2_client::{
     tokio::{AsyncClient, AsyncClientStream},
 };
 use catplay_util::{EventReconciler, event_select, sleep};
+use tokio::{runtime::Handle, task::AbortHandle};
 use log::{error, info, warn};
 use macaddr::MacAddr6;
 
@@ -41,7 +42,42 @@ pub struct BluetoothManager {
     csm: CsmSessionCallback,
 
     last_connect: Arc<Mutex<Option<MacAddr6>>>,
-    live_links: Arc<AtomicUsize>,
+    links: Arc<LinkTasks>,
+}
+
+/// The iAP2 session tasks of a manager: counts the live ones in a shareable counter, and aborts
+/// them when the manager is dropped, so no session (and no count) outlives a Bluetooth restart.
+struct LinkTasks {
+    live: Arc<AtomicUsize>,
+    tasks: Mutex<Vec<AbortHandle>>,
+}
+
+impl LinkTasks {
+    fn new(live: Arc<AtomicUsize>) -> Self {
+        Self {
+            live,
+            tasks: Default::default(),
+        }
+    }
+
+    fn spawn(&self, handle: &Handle, session: impl Future<Output = ()> + Send + 'static) {
+        let live_link = LiveLink::new(self.live.clone());
+        let task = handle.spawn(async move {
+            let _live_link = live_link;
+            session.await
+        });
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task.abort_handle());
+    }
+}
+
+impl Drop for LinkTasks {
+    fn drop(&mut self) {
+        for task in self.tasks.get_mut().unwrap().drain(..) {
+            task.abort();
+        }
+    }
 }
 
 /// Counts one live iAP2 link for as long as its session task runs.
@@ -81,14 +117,14 @@ impl BluetoothManager {
             bluez: None,
             csm,
             last_connect: Default::default(),
-            live_links: Default::default(),
+            links: Arc::new(LinkTasks::new(Default::default())),
         }
     }
 
     /// Counts live iAP2 links in `counter` instead of a private one, so the count can be shared
-    /// before the manager starts and survives a restart of the manager.
+    /// before the manager starts and stays valid across manager restarts.
     pub fn with_live_links(mut self, counter: Arc<AtomicUsize>) -> Self {
-        self.live_links = counter;
+        self.links = Arc::new(LinkTasks::new(counter));
         self
     }
 
@@ -203,12 +239,12 @@ impl BluetoothManager {
     }
 
     async fn start_iap2(&mut self) -> BluetoothResult<()> {
-        let handle = tokio::runtime::Handle::current();
+        let handle = Handle::current();
         let csm = self.csm.clone();
         let server = self.server;
 
         let last_connect = self.last_connect.clone();
-        let live_links = self.live_links.clone();
+        let links = Arc::downgrade(&self.links);
         self.bluez
             .as_mut()
             .unwrap()
@@ -224,11 +260,13 @@ impl BluetoothManager {
                         error!("Failed to wrap Bluetooth socket: {}", err);
                     }
                     Ok(socket) => {
-                        let live_link = LiveLink::new(live_links.clone());
-                        handle.spawn(async move {
-                            let _live_link = live_link;
+                        let Some(links) = links.upgrade() else {
+                            warn!("Dropping Bluetooth iAP2 conn from {}: the manager is gone", conn.peer);
+                            return;
+                        };
+                        links.spawn(&handle, async move {
                             let task = AsyncClient::new(server, CsmRemote::bluetooth(conn.peer, conn.local), session);
-                            let mut t = AsyncClientStream::new(task.0, task.1, socket);
+                            let mut t = AsyncClientStream::new(task.0, task.1, socket).end_on_eof();
 
                             loop {
                                 if let Err(err) = t.reconcile().await {
@@ -263,5 +301,34 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(second);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn session_tasks_are_counted_until_they_end_or_the_manager_drops() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let links = LinkTasks::new(counter.clone());
+        let handle = Handle::current();
+
+        let (end, ended) = futures::channel::oneshot::channel::<()>();
+        links.spawn(&handle, async move {
+            let _ = ended.await;
+        });
+        links.spawn(&handle, std::future::pending());
+        assert_eq!(counter.load(Ordering::Relaxed), 2, "counted from the spawn on");
+
+        end.send(()).unwrap();
+        wait_for(&counter, 1).await;
+        drop(links);
+        wait_for(&counter, 0).await;
+    }
+
+    async fn wait_for(counter: &AtomicUsize, expected: usize) {
+        for _ in 0..100 {
+            if counter.load(Ordering::Relaxed) == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("live links stayed at {}, expected {expected}", counter.load(Ordering::Relaxed));
     }
 }
