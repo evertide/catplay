@@ -176,11 +176,15 @@ impl TcpSession for ScreenReceiverSession {
     }
 }
 
-/// A ClearScreen VideoConfig is only applied when it keeps the codec config and changes the header parameters (for example the
-/// view origin and size); the codec config itself only changes through a regular VideoConfig.
+/// A ClearScreen VideoConfig is only applied when it changes nothing but the view origin and size; anything else only changes
+/// through a regular VideoConfig.
 fn clear_screen_update(config: Option<AvccConfigExtended>, current: Option<&AvccConfigExtended>) -> Option<AvccConfigExtended> {
     let (config, current) = (config?, current?);
-    (config.avcc == current.avcc && config != *current).then_some(config)
+    let view_only = AvccConfigExtended {
+        view: current.view,
+        ..config.clone()
+    } == *current;
+    (view_only && config.view != current.view).then_some(config)
 }
 
 impl EventSleeper for ScreenReceiverSession {}
@@ -197,8 +201,6 @@ mod tests {
     use crate::video::AvccConfig;
 
     fn config(sps_pps: &[u8], view: [u8; 8]) -> AvccConfigExtended {
-        let mut header_params = [[0u8; 8]; 15];
-        header_params[4] = view;
         AvccConfigExtended {
             hevc: false,
             avcc: AvccConfig {
@@ -209,21 +211,23 @@ mod tests {
             width: 1920,
             height: 720,
             respect_timestamps: true,
-            header_params,
+            view: [[0; 8], view],
         }
     }
 
     #[test]
-    fn clear_screen_only_updates_header_parameters() {
+    fn clear_screen_only_updates_the_view() {
         let current = config(&[1, 2], [0; 8]);
         let new_view = config(&[1, 2], [7; 8]);
-        assert_eq!(clear_screen_update(Some(new_view.clone()), Some(&current)), Some(new_view));
+        assert_eq!(clear_screen_update(Some(new_view.clone()), Some(&current)), Some(new_view.clone()));
         assert_eq!(clear_screen_update(Some(current.clone()), Some(&current)), None, "nothing changed");
         assert_eq!(
             clear_screen_update(Some(config(&[3], [7; 8])), Some(&current)),
             None,
             "codec config changes are ignored"
         );
+        let resized = AvccConfigExtended { width: 800, ..new_view };
+        assert_eq!(clear_screen_update(Some(resized), Some(&current)), None, "size changes are ignored");
         assert_eq!(clear_screen_update(None, Some(&current)), None);
         assert_eq!(
             clear_screen_update(Some(current.clone()), None),

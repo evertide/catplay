@@ -107,6 +107,14 @@ impl AltScreenManager {
                 }
                 let _ = consumed.send(());
             }
+            // A config update without a frame (for example the view switch on showUI) is passed on right away.
+            ScreenProxyOp::IphoneConfig { config } => {
+                if let Some(car_screen) = self.car_screen.as_mut()
+                    && let Err(err) = car_screen.push_avcc_config(config)
+                {
+                    warn!("Sink rejected iPhone alt screen config?: {err}");
+                }
+            }
             ScreenProxyOp::IphoneStreamFinish => {
                 info!("iPhone has finished its alt screen stream");
                 self.iphone_screen_rx.take();
