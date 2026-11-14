@@ -5,7 +5,9 @@ use catplay_carplay::{
     clock::{MediaClockBox, NtpU64},
     events::CommandPending,
     modes::{ChangeModesResponse, ResourceTransferPriority},
-    msg::{Command, CommandType, ControllerFeature, Display, HidDevice, InfoMessageResponse},
+    msg::{
+        AudioLatency, AudioType, Command, CommandType, ControllerFeature, Display, HidDevice, InfoMessageResponse, StreamType,
+    },
     rtsp_frame::{HttpStatus, RtspError, RtspResponse, RtspResult},
     screen::tx::ScreenTransmitProxy,
     video::Pts,
@@ -512,7 +514,7 @@ impl CarManager {
                 model: other.model,
                 displays,
 
-                audio_latencies: other.audio_latencies,
+                audio_latencies: with_main_high_latency(other.audio_latencies),
                 features: other.features,
 
                 ..info_clone
@@ -743,6 +745,29 @@ fn restrict_to_main_display(displays: &mut Vec<Display>, hid_devices: &mut Vec<H
     });
 }
 
+/// Adds a MainHighAudio latency when the car lists none, as a copy of its MainAudio/media entry for 48 kHz stereo.
+///
+/// Media is played as MainHighAudio, but cars usually list latencies for MainAudio only; iOS then logs
+/// "No latency information found for MainHighAudio/media" and guesses.
+fn with_main_high_latency(mut latencies: Vec<AudioLatency>) -> Vec<AudioLatency> {
+    let has_main_high = latencies
+        .iter()
+        .any(|l| l.stream_type == Some(StreamType::MainHighAudio));
+    let media = latencies
+        .iter()
+        .find(|l| {
+            l.stream_type == Some(StreamType::MainAudio) && l.audio_type == Some(AudioType::Media) && l.sr == Some(48000) && l.ch == Some(2)
+        })
+        .cloned();
+    if !has_main_high && let Some(media) = media {
+        latencies.push(AudioLatency {
+            stream_type: Some(StreamType::MainHighAudio),
+            ..media
+        });
+    }
+    latencies
+}
+
 impl Drop for CarManager {
     fn drop(&mut self) {
         // TODO ensure closed in all cases
@@ -757,6 +782,40 @@ impl Drop for CarManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn latency(stream_type: StreamType, audio_type: AudioType) -> AudioLatency {
+        AudioLatency {
+            stream_type: Some(stream_type),
+            audio_type: Some(audio_type),
+            sr: Some(48000),
+            ss: Some(16),
+            ch: Some(2),
+            input_latency_micros: None,
+            output_latency_micros: Some(167300),
+        }
+    }
+
+    #[test]
+    fn main_high_latency_copies_the_car_media_entry_once() {
+        let media = latency(StreamType::MainAudio, AudioType::Media);
+        let out = with_main_high_latency(vec![media.clone()]);
+        assert_eq!(
+            out,
+            vec![
+                media.clone(),
+                AudioLatency {
+                    stream_type: Some(StreamType::MainHighAudio),
+                    ..media.clone()
+                }
+            ]
+        );
+        // A car that lists one is left alone, and nothing is invented without a media entry to copy.
+        assert_eq!(with_main_high_latency(out.clone()), out);
+        let telephony = vec![latency(StreamType::MainAudio, AudioType::Telephony)];
+        assert_eq!(with_main_high_latency(telephony.clone()), telephony);
+        let mono = vec![AudioLatency { ch: Some(1), ..media }];
+        assert_eq!(with_main_high_latency(mono.clone()), mono);
+    }
 
     const MAIN_UUID: &str = "e5f7a68d-7b0f-4305-984b-974f677a150b";
     const CLUSTER_UUID: &str = "b7e6c5a0-2222-4000-8000-000000000002";
