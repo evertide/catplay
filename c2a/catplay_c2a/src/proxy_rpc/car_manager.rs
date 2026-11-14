@@ -657,6 +657,10 @@ impl CarManager {
             return;
         }
 
+        if cmd_type == CommandType::ShowUI {
+            self.alt_screen.capture_after_show_ui();
+        }
+
         if let Command::ChangeModes(cm) = cmd.command() {
             self.modes.on_peer_change_modes_start(cm);
         }
