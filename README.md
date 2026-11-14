@@ -75,8 +75,25 @@ Note that CarPlay Ultra mode is currently not supported.
 If you have a spare Aston Martin 2025 with CarPlay Ultra collecting dust, please consider donating it towards the project to help development!  
 (DM me for shipping instructions)
 
+## Car GPS forwarding
+
+Carplay2Air forwards car NMEA location data to the iPhone over the AirPlay iAP2 link.
+The car must advertise a location component, send `LocationInformation`, and accept
+`StartLocationInformation` and `StopLocationInformation`. Location is offered to the
+iPhone on the AirPlay iAP2 link only, never over Bluetooth: iOS binds Location to the
+first iAP2 endpoint that offers it, and the Bluetooth one is gone after `disableBluetooth`.
+Forwarding starts when the iPhone requests it and car identification and authentication
+are complete. Only data types supported by both sides are requested.
+
+Pending updates are merged by sentence type (at most 16 types), and the next sentence is
+sent only when the transport has finished the previous one, so a slow iPhone gets the
+latest fix instead of a backlog. Each message carries one sentence, within the peer's
+iAP2 packet limit; an oversized sentence is dropped. A Stop or AirPlay teardown cancels
+forwarding, and a replacement USB session repeats the car negotiation. Errors on the
+AirPlay iAP2 endpoint leave audio and video running.
+
 ## Known limitations
-- incomplete GPS sync
+- car GPS compatibility depends on the head unit exposing iAP2 location data
 - incomplete "now playing" sync
 - aggresive reconnects (pulling the dongle in and out several times) after few random times, trigger an iOS bug that makes it such that _all_ CarPlay invites will be ignored, until you pull out the phone and _manually_ disconnect the Wi-Fi network. there is however one way to detect this and unglitch the phone remotely, which may be implemented in the future.
 - remembering the dongle's network as "auto connect" is a trigger for the exact same iOS bug. please never do this
