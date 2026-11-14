@@ -593,7 +593,11 @@ async fn delayed_rtsp_responses_preserve_latest_fixes_and_rotate_continuously_pe
             &mut car,
             &car_out,
             LocationInformation {
-                nmea_sentence: vec![format!("$GPGGA,{counter}"), format!("$GPRMC,{counter}"), format!("$PASCD,{counter}")],
+                nmea_sentence: vec![
+                    format!("$GPGGA,{counter}"),
+                    format!("$GPRMC,{counter}"),
+                    format!("$PASCD,{counter}"),
+                ],
             },
         );
         assert!(client.handle().has_pending_send());

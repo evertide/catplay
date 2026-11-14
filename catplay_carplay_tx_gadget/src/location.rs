@@ -57,7 +57,10 @@ impl LocationUpdates {
             {
                 continue;
             }
-            if let Some((_, pending)) = buffer.iter_mut().find(|(pending_kind, _)| pending_kind == kind) {
+            if let Some((_, pending)) = buffer
+                .iter_mut()
+                .find(|(pending_kind, _)| pending_kind == kind)
+            {
                 *pending = sentences;
             } else if buffer.len() < MAX_PENDING_SENTENCE_TYPES {
                 buffer.push_back((kind.into(), sentences));
@@ -426,7 +429,14 @@ mod tests {
         let bridge = LocationBridge::default();
         let subscription = bridge.subscribe();
         subscription.set_request(Some(StartLocationInformation::all()));
-        let updates = bridge.state.lock().unwrap().updates.as_ref().unwrap().clone();
+        let updates = bridge
+            .state
+            .lock()
+            .unwrap()
+            .updates
+            .as_ref()
+            .unwrap()
+            .clone();
         (subscription, updates)
     }
 
