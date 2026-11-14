@@ -120,3 +120,51 @@ impl AirPlayBonjourEntry {
         s
     }
 }
+
+impl AirPlayBonjourEntry {
+    /// Oldest receiver SDK that is known to need HomeKit pairing before SETUP.
+    ///
+    /// A Volvo XC90 (Android Automotive, AirTunes 365.10) accepts an unpaired SETUP but cannot
+    /// decrypt the resulting screen stream: it shows black and keeps requesting keyframes. Older
+    /// receivers that advertise HomeKit (e.g. Mercedes, 280/320) work unpaired and connect faster.
+    const PAIR_FIRST_MIN_SDK: u32 = 365;
+
+    /// Whether to pair (HomeKit, ChaCha streams) before the initial SETUP instead of trying unpaired first.
+    pub fn wants_pair_first(&self) -> bool {
+        let sdk = self
+            .srcvers
+            .split('.')
+            .next()
+            .and_then(|major| major.parse::<u32>().ok());
+        self.features
+            .contains(AirPlayFeature::HK_PAIRING_AND_ENCRYPT)
+            && sdk.is_some_and(|sdk| sdk >= Self::PAIR_FIRST_MIN_SDK)
+    }
+}
+
+#[cfg(test)]
+mod pair_first_tests {
+    use super::*;
+
+    fn entry(srcvers: &str, features: AirPlayFeature) -> AirPlayBonjourEntry {
+        AirPlayBonjourEntry {
+            srcvers: srcvers.into(),
+            features,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pairs_first_only_on_recent_homekit_receivers() {
+        let hk = AirPlayFeature::HK_PAIRING_AND_ENCRYPT;
+        assert!(entry("365.10.4", hk).wants_pair_first(), "Volvo XC90 (AAOS)");
+        assert!(entry("410.2", hk).wants_pair_first());
+        assert!(!entry("320.17.3", hk).wants_pair_first(), "Mercedes keeps the fast unpaired path");
+        assert!(!entry("280.33.12.1", hk).wants_pair_first());
+        assert!(
+            !entry("365.10.4", AirPlayFeature::empty()).wants_pair_first(),
+            "no HomeKit, nothing to pair"
+        );
+        assert!(!entry("", hk).wants_pair_first(), "unknown version keeps the old behaviour");
+    }
+}
