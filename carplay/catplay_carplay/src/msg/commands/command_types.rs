@@ -19,6 +19,9 @@ pub enum CommandType {
     HidSetInputMode,
     RequestSiri,
     RequestUI,
+    ShowUI,
+    StopUI,
+    SuggestUI,
     SetNightMode,
     SetLimitedUI,
     IApSendMessage,
@@ -62,6 +65,9 @@ impl FromStr for CommandType {
             "hidSetInputMode" => CommandType::HidSetInputMode,
             "requestSiri" => CommandType::RequestSiri,
             "requestUI" => CommandType::RequestUI,
+            "showUI" => CommandType::ShowUI,
+            "stopUI" => CommandType::StopUI,
+            "suggestUI" => CommandType::SuggestUI,
             "setNightMode" => CommandType::SetNightMode,
             "setLimitedUI" => CommandType::SetLimitedUI,
             "iAPSendMessage" => CommandType::IApSendMessage,
@@ -86,6 +92,9 @@ impl AsRef<str> for CommandType {
             CommandType::HidSetInputMode => "hidSetInputMode",
             CommandType::RequestSiri => "requestSiri",
             CommandType::RequestUI => "requestUI",
+            CommandType::ShowUI => "showUI",
+            CommandType::StopUI => "stopUI",
+            CommandType::SuggestUI => "suggestUI",
             CommandType::SetNightMode => "setNightMode",
             CommandType::SetLimitedUI => "setLimitedUI",
             CommandType::IApSendMessage => "iAPSendMessage",
@@ -101,6 +110,7 @@ impl CommandType {
             | CommandType::UnduckAudio
             | CommandType::DisableBluetooth
             | CommandType::ModesChanged
+            | CommandType::SuggestUI
             | CommandType::HidSetInputMode => CommandDirection::FromDevice,
 
             CommandType::ChangeModes
@@ -108,6 +118,8 @@ impl CommandType {
             | CommandType::HidSendReport
             | CommandType::RequestSiri
             | CommandType::RequestUI
+            | CommandType::ShowUI
+            | CommandType::StopUI
             | CommandType::SetNightMode
             | CommandType::SetLimitedUI
             | CommandType::ChangeMapZoomLevel => CommandDirection::FromAccessory,

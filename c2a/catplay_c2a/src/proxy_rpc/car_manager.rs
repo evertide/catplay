@@ -134,6 +134,8 @@ impl CarManager {
             CommandType::ForceKeyFrame
             | CommandType::RequestSiri
             | CommandType::RequestUI
+            | CommandType::ShowUI
+            | CommandType::StopUI
             | CommandType::SetNightMode
             | CommandType::SetLimitedUI
             | CommandType::HidSendReport => {
@@ -546,6 +548,8 @@ impl CarManager {
                 task.detach();
                 true
             }
+            // suggestUI is only parsed so the iPhone gets 200 instead of 501; it is not forwarded, because a car that never
+            // answers it would hit the proxy timeout and tear the session down.
             _ => false,
         };
 
@@ -621,6 +625,12 @@ impl CarManager {
             self.night_mode = mode.night_mode;
         }
 
+        // Display switches only make sense for displays the iPhone was told about (see restrict_to_main_display).
+        if matches!(cmd_type, CommandType::ShowUI | CommandType::StopUI) && !self.iphone_features.contains(&ControllerFeature::AltScreen) {
+            cmd.respond_status(HttpStatus::NotImplemented);
+            return;
+        }
+
         if let Command::ChangeModes(cm) = cmd.command() {
             self.modes.on_peer_change_modes_start(cm);
         }
@@ -638,6 +648,9 @@ impl CarManager {
                 | CommandType::ForceKeyFrame // TODO
                 | CommandType::RequestSiri
                 | CommandType::RequestUI
+                // showUI/stopUI: the car switches a display (e.g. the instrument cluster) to or from CarPlay.
+                | CommandType::ShowUI
+                | CommandType::StopUI
                 | CommandType::SetNightMode
                 | CommandType::SetLimitedUI
                 | CommandType::ChangeMapZoomLevel => ProxyType::Proxy,
@@ -705,6 +718,8 @@ impl CarManager {
                 self.night_mode = v.night_mode;
                 cmd.respond_ok();
             }
+            // Without an iPhone there is nothing to show; answer as before instead of pretending it worked.
+            Command::ShowUI(_) | Command::StopUI(_) => cmd.respond_status(HttpStatus::NotImplemented),
             Command::RequestUI(_) => {
                 warn!("requestUI during overlay!");
                 self.modes
