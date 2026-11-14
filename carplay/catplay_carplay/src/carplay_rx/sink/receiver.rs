@@ -722,7 +722,9 @@ impl AirPlayReceiver {
             media_clock.boxed(),
         );
 
-        let (helper, local) = spawn_fork("screen_rx", move || TcpHelper::accept_timeout(bind_ip, Self::TCP_REVERSE_CONN_TIMEOUT, recv))?;
+        let (helper, local) = spawn_fork("screen_rx", move || {
+            TcpHelper::accept_timeout(bind_ip, Self::TCP_REVERSE_CONN_TIMEOUT, recv)
+        })?;
         match stream_type {
             StreamType::AltScreen => self.streams.alt_screen.replace(helper),
             _ => self.streams.screen.replace(helper),

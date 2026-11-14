@@ -161,10 +161,7 @@ mod tests {
         {
             assert_eq!(EventsClient::request_log_level(request), expected);
         }
-        for (status, expected) in [
-            (HttpStatus::BadRequest, Level::Warn),
-            (HttpStatus::Ok, Level::Debug),
-        ] {
+        for (status, expected) in [(HttpStatus::BadRequest, Level::Warn), (HttpStatus::Ok, Level::Debug)] {
             assert_eq!(EventsClient::response_log_level(status), expected);
         }
     }

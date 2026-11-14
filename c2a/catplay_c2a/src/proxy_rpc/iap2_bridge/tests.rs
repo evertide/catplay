@@ -121,7 +121,9 @@ fn take_location(out: &Arc<Capture>) -> LocationInformation {
         .take()
         .into_iter()
         .flat_map(|packet| {
-            let packet = packet.cast::<LocationInformation>().expect("only location data");
+            let packet = packet
+                .cast::<LocationInformation>()
+                .expect("only location data");
             assert_eq!(packet.nmea_sentence.len(), 1, "one sentence per message");
             packet.nmea_sentence.clone()
         })
@@ -490,7 +492,10 @@ async fn single_sentence_messages_fit_the_default_2048_byte_link() {
             relay(&mut incoming, &mut client);
         }
         let expected = LocationInformation {
-            nmea_sentence: expected.into_iter().flat_map(|packet| packet.nmea_sentence).collect(),
+            nmea_sentence: expected
+                .into_iter()
+                .flat_map(|packet| packet.nmea_sentence)
+                .collect(),
         };
         assert_eq!(take_location(&phone_out), expected);
         assert!(!client.handle().has_pending_send());
@@ -708,7 +713,12 @@ fn replacing_a_request_discards_old_fixes_without_cancelling_the_new_subscriptio
     assert!(second.take(2048 - 16).is_none());
     respond(&mut car, &car_out, sample());
     for sentence in sample().nmea_sentence {
-        assert_eq!(second.take(2048 - 16), Some(LocationInformation { nmea_sentence: vec![sentence] }));
+        assert_eq!(
+            second.take(2048 - 16),
+            Some(LocationInformation {
+                nmea_sentence: vec![sentence]
+            })
+        );
     }
     drop(second);
     pump(&mut car, &car_out);

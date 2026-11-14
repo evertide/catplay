@@ -36,7 +36,10 @@ impl LocationUpdates {
         for sentence in &packet.nmea_sentence {
             let kind = sentence.split_once(',').map_or("", |(kind, _)| kind);
             if requested_sentence(request, kind) && sentence.len() + 5 <= MAX_LOCATION_PAYLOAD_BYTES {
-                incoming.entry(kind).or_default().push_back(sentence.clone());
+                incoming
+                    .entry(kind)
+                    .or_default()
+                    .push_back(sentence.clone());
             }
         }
         if incoming.is_empty() {
@@ -46,7 +49,12 @@ impl LocationUpdates {
         let mut buffer = self.buffer.lock().unwrap();
         for (kind, sentences) in incoming {
             // Replace multipart data together, but transmit each sentence separately.
-            if sentences.iter().map(|sentence| sentence.len() + 5).sum::<usize>() > MAX_LOCATION_PAYLOAD_BYTES {
+            if sentences
+                .iter()
+                .map(|sentence| sentence.len() + 5)
+                .sum::<usize>()
+                > MAX_LOCATION_PAYLOAD_BYTES
+            {
                 continue;
             }
             if let Some(pending) = buffer.get_mut(kind) {
@@ -411,7 +419,11 @@ mod tests {
         let (mut subscription, updates) = subscription();
         updates.push(&sentences(&["$GPGGA,1*00\r\n"]), &StartLocationInformation::all());
         for kind in 0..1000 {
-            let talker = format!("{}{}", char::from(b'A' + (kind / 26 % 26) as u8), char::from(b'A' + (kind % 26) as u8));
+            let talker = format!(
+                "{}{}",
+                char::from(b'A' + (kind / 26 % 26) as u8),
+                char::from(b'A' + (kind % 26) as u8)
+            );
             updates.push(&sentences(&[&format!("${talker}GGA,1*00\r\n")]), &StartLocationInformation::all());
         }
         updates.push(&sentences(&["$GPGGA,2*00\r\n"]), &StartLocationInformation::all());
