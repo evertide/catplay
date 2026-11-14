@@ -192,7 +192,8 @@ mod tests {
     use catplay_plist::{Dictionary, Value, from_bytes, to_writer_binary};
 
     use crate::msg::{
-        Command, CommandChangeMapZoomLevel, CommandForceKeyFrame, CommandRequestUI, CommandShowUI, CommandStopUI, CommandSuggestUI,
+        Command, CommandChangeMapZoomLevel, CommandForceKeyFrame, CommandRequestUI, CommandSetNightMode, CommandShowUI, CommandStopUI,
+        CommandSuggestUI,
     };
 
     #[test]
@@ -333,6 +334,14 @@ mod tests {
                 url: None,
                 uuid: Some(CLUSTER.into()),
             }),
+            Command::SetNightMode(CommandSetNightMode {
+                night_mode: true,
+                uuid: None,
+            }),
+            Command::SetNightMode(CommandSetNightMode {
+                night_mode: true,
+                uuid: Some(CLUSTER.into()),
+            }),
             Command::SuggestUI(CommandSuggestUI { urls: vec![] }),
         ];
         for command in cases {
@@ -344,7 +353,11 @@ mod tests {
                 _ => None,
             };
             let has_uuid = matches!(&params, Some(Value::Dictionary(p)) if p.contains_key("uuid"));
-            let sent_uuid = matches!(&command, Command::RequestUI(CommandRequestUI { uuid: Some(_), .. }));
+            let sent_uuid = matches!(
+                &command,
+                Command::RequestUI(CommandRequestUI { uuid: Some(_), .. })
+                    | Command::SetNightMode(CommandSetNightMode { uuid: Some(_), .. })
+            );
             assert_eq!(has_uuid, sent_uuid, "{command:?}");
         }
     }
