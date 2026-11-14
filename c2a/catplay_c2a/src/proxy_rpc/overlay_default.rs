@@ -129,7 +129,11 @@ mod tests {
     fn waiting_screen_follows_the_wireless_phase() {
         assert_eq!(waiting_screen(None, false), UiState::WaitingForConnection);
         assert!(matches!(waiting_screen(None, true), UiState::Connecting { .. }));
-        assert_eq!(waiting_screen(None, true), waiting_screen(None, true), "same phase, same state: no redraw");
+        assert_eq!(
+            waiting_screen(None, true),
+            waiting_screen(None, true),
+            "same phase, same state: no redraw"
+        );
 
         let pairing = UiState::Pairing {
             device: "iPhone".into(),

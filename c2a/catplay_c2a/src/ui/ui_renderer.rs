@@ -82,7 +82,16 @@ impl UiRenderer {
         }
     }
 
-    fn render_framebuffer(&mut self, state: UiState, reset: bool) -> UiResult<()> {
+    /// The connecting phase belongs to the UI theme; without one the upstream waiting screen stays.
+    /// That is normally served from its keyframe cache; without a usable cache it is re-encoded.
+    fn shown_state(&mut self, state: UiState) -> UiState {
+        match state {
+            UiState::Connecting { .. } if self.theme().is_default() => UiState::WaitingForConnection,
+            state => state,
+        }
+    }
+
+    fn render_framebuffer(&mut self, mut state: UiState, reset: bool) -> UiResult<()> {
         if state == UiState::Hidden || (!reset && self.last_state == state) {
             return Ok(());
         }
@@ -103,6 +112,8 @@ impl UiRenderer {
             warn!("Rendering the UI theme background failed ({err}); continuing without it");
             self.theme = Some(theme.without_background());
             self.fb.reset(self.width, self.height, self.dpi);
+            // A background-only theme is the default look without its background.
+            state = self.shown_state(state);
             let ops = self.ops(&state);
             self.fb.execute(&ops)?;
         }
@@ -236,12 +247,7 @@ impl UiRenderer {
 
     #[trace_time(warn)]
     pub fn render_and_encode_frame(&mut self, state: UiState, latency: Duration, reset: bool) -> UiResult<EncodedVideoFrame> {
-        // The connecting phase belongs to the UI theme; without one the upstream waiting screen stays
-        // (served from its keyframe cache).
-        let state = match state {
-            UiState::Connecting { .. } if self.theme().is_default() => UiState::WaitingForConnection,
-            state => state,
-        };
+        let state = self.shown_state(state);
         if state.cache_file_name().is_some() {
             info!("UI renderer requested cacheable state {state}");
         }
@@ -447,7 +453,11 @@ fn test_connecting_phase_needs_a_theme() {
     renderer
         .render_and_encode_frame(connecting.clone(), Duration::ZERO, false)
         .unwrap();
-    assert_eq!(renderer.last_state, UiState::WaitingForConnection, "no theme: upstream waiting screen");
+    assert_eq!(
+        renderer.last_state,
+        UiState::WaitingForConnection,
+        "no theme: upstream waiting screen"
+    );
 
     renderer.theme = Some(UiTheme {
         connecting_text: Some("Verbinden met {device}".into()),
@@ -457,4 +467,16 @@ fn test_connecting_phase_needs_a_theme() {
         .render_and_encode_frame(connecting.clone(), Duration::ZERO, false)
         .unwrap();
     assert_eq!(renderer.last_state, connecting);
+
+    // A background-only theme whose image fails to decode falls back to the default look,
+    // and with it to the upstream waiting screen.
+    let mut renderer = UiRenderer::new(800, 480, 30, 160.0, None).unwrap();
+    renderer.theme = Some(UiTheme {
+        background_bytes: Some(include_bytes!("testdata/small.jpg")[..200].into()),
+        ..Default::default()
+    });
+    renderer
+        .render_and_encode_frame(connecting, Duration::ZERO, false)
+        .unwrap();
+    assert_eq!(renderer.last_state, UiState::WaitingForConnection);
 }

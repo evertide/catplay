@@ -282,7 +282,9 @@ impl Reconcilable for ProdGadget {
         if self.inviting_sent != Some(inviting)
             && let Some(car) = self.last_tx.lock().unwrap().as_ref()
         {
-            let _ = car.proxy_tx.unbounded_send(TxAdapterOp::InvitingIphone(inviting));
+            let _ = car
+                .proxy_tx
+                .unbounded_send(TxAdapterOp::InvitingIphone(inviting));
             self.inviting_sent = Some(inviting);
         }
 
