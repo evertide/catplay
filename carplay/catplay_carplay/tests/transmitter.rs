@@ -16,7 +16,7 @@ use catplay_carplay::{
     },
     carplay_tx::{AirPlayTransmitterBootstrap, AirPlayTransmitterImpl},
     msg::{AudioFormat, AudioType, Display, InfoMessageResponse, StreamType},
-    rtsp_frame::{RtspError, RtspMethod, RtspResult},
+    rtsp_frame::{HttpStatus, RtspError, RtspMethod, RtspResult},
     rtsp_session::{RtspReceiver, RtspReceiverCallback, RtspReceiverEvent, RtspReceiverEventResult},
     screen::{
         rx::{ScreenReceiverSink, ScreenReceiverSinkBox},
@@ -122,6 +122,8 @@ struct RecordingReceiver {
     inner: AirPlayReceiver,
     log: RequestLog,
     encrypted: bool,
+    /// Answer /pair-setup with 403, like a receiver that refuses to pair.
+    reject_pair_setup: bool,
 }
 
 #[async_trait]
@@ -130,6 +132,9 @@ impl EventSink<RtspReceiverEvent<'_>, RtspReceiverEventResult> for RecordingRece
         if let RtspReceiverEvent::Request { request, .. } = &event {
             let entry = (request.method, request.url.to_string(), self.encrypted);
             self.log.lock().unwrap().push(entry);
+            if self.reject_pair_setup && request.url.as_str() == "/pair-setup" {
+                return RtspReceiverEventResult::new(Err(RtspError::Code(HttpStatus::Forbidden)));
+            }
         }
         let result = self.inner.on_event(event).await;
         self.encrypted |= result.encrypt_after_response.is_some();
@@ -158,11 +163,15 @@ impl EventReconciler for RecordingReceiver {
 
 /// Returns the receiver handle too: dropping it would stop the mock receiver.
 async fn connect_to_mock_receiver(pair_first: bool) -> (impl Sized, AirPlayTransmitterImpl) {
-    let (rx, transmitter, _) = connect_recording(pair_first, None).await;
+    let (rx, transmitter, _) = connect_recording(pair_first, None, false).await;
     (rx, transmitter)
 }
 
-async fn connect_recording(pair_first: bool, remote_homekit_id: Option<Uuid>) -> (impl Sized, AirPlayTransmitterImpl, RequestLog) {
+async fn connect_recording(
+    pair_first: bool,
+    remote_homekit_id: Option<Uuid>,
+    reject_pair_setup: bool,
+) -> (impl Sized, AirPlayTransmitterImpl, RequestLog) {
     let hk_rx = HomekitStorageFile::memory();
     let hk_tx = HomekitStorageFile::memory();
 
@@ -180,6 +189,7 @@ async fn connect_recording(pair_first: bool, remote_homekit_id: Option<Uuid>) ->
         inner: receiver,
         log: log.clone(),
         encrypted: false,
+        reject_pair_setup,
     };
     let session = RtspReceiver::new(recording);
     let (rx, bind) = TcpHelper::accept_timeout(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0), Duration::ZERO, session).unwrap();
@@ -214,15 +224,16 @@ fn setups(log: &RequestLog) -> Vec<bool> {
 
 #[tokio::test]
 async fn sends_pair_request() {
-    let (_rx, _transmitter, log) = connect_recording(false, None).await;
+    let (_rx, _transmitter, log) = connect_recording(false, None, false).await;
     assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 0, "no pairing unless asked: {log:?}");
+    assert_eq!(count(&log, RtspMethod::Post, "/pair-verify"), 0, "no pairing unless asked: {log:?}");
     assert_eq!(setups(&log), [false], "{log:?}");
 }
 
 /// Recent HomeKit receivers (Volvo XC90, srcvers 365.x) are paired before the first SETUP.
 #[tokio::test]
 async fn pairs_before_setup_when_requested() {
-    let (_rx, _transmitter, log) = connect_recording(true, None).await;
+    let (_rx, _transmitter, log) = connect_recording(true, None, false).await;
     assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 3, "M1, M3, M5: {log:?}");
     assert_eq!(count(&log, RtspMethod::Post, "/pair-verify"), 2, "M1, M3: {log:?}");
     assert_eq!(setups(&log), [true], "one SETUP, on the encrypted session: {log:?}");
@@ -232,13 +243,22 @@ async fn pairs_before_setup_when_requested() {
 #[tokio::test]
 async fn falls_back_to_unpaired_setup_once_when_pairing_first_fails() {
     // A Bonjour id the receiver doesn't have makes /pair-setup end in a uuid mismatch.
-    let (_rx, _transmitter, log) = connect_recording(true, Some(Uuid::from_u128(1))).await;
+    let (_rx, _transmitter, log) = connect_recording(true, Some(Uuid::from_u128(1)), false).await;
     assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 3, "pairing was tried: {log:?}");
     assert_eq!(
         count(&log, RtspMethod::Post, "/pair-verify"),
         0,
         "pairing failed before verify: {log:?}"
     );
+    assert_eq!(setups(&log), [false], "one SETUP, unencrypted: {log:?}");
+}
+
+/// Same fallback when the receiver itself refuses /pair-setup.
+#[tokio::test]
+async fn falls_back_to_unpaired_setup_once_when_the_receiver_refuses_pairing() {
+    let (_rx, _transmitter, log) = connect_recording(true, None, true).await;
+    assert_eq!(count(&log, RtspMethod::Post, "/pair-setup"), 1, "refused at M1: {log:?}");
+    assert_eq!(count(&log, RtspMethod::Post, "/pair-verify"), 0, "{log:?}");
     assert_eq!(setups(&log), [false], "one SETUP, unencrypted: {log:?}");
 }
 
