@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use catplay_tokio::{CItem, TcpSession, TcpSink};
 use catplay_util::{AsyncShutdown, EventSleeper, EventToken, deadline_after, event_select, notify::Notify};
-use log::{debug, warn};
+use log::{debug, info, warn};
 
 use crate::{
     cipher::AirPlayStreamEncryption,
@@ -176,9 +176,13 @@ impl TcpSession for ScreenTransmitSession {
         while let Some(elem) = ops.pop_front() {
             match elem {
                 ScreenTransmitOp::Configure(config) => {
-                    debug!("Writing AVCC config now");
                     self.nal_size_len = config.avcc.nal_size_len;
-                    sink.write(ScreenFrame::config(&config))?;
+                    let frame = ScreenFrame::config(&config);
+                    info!(
+                        "Writing VideoConfig: {}x{} params={:?}",
+                        config.width, config.height, frame.header.params
+                    );
+                    sink.write(frame)?;
                 }
                 ScreenTransmitOp::Frame(frame) => {
                     warn!("Flushing video frame pts={:?} keyframe={}", frame.pts, frame.is_known_keyframe());

@@ -477,6 +477,7 @@ async fn streams_video_and_audio(pair_first: bool) {
         width: 1920,
         height: 1080,
         respect_timestamps: true,
+        header_params: Default::default(),
     };
 
     let (_rx, transmitter, log) = connect_recording(pair_first, None, refuse_nothing, Identities::new()).await;
