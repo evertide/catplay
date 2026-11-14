@@ -107,6 +107,17 @@ impl AltScreenManager {
                 }
                 let _ = consumed.send(());
             }
+            // Every VideoConfig of the iPhone is written to the car, also one that repeats the last: after each showUI the car
+            // asks for a keyframe and the iPhone answers with a ClearScreen VideoConfig, a regular VideoConfig and the keyframe.
+            // A car that gets only the keyframe keeps its display black (Volvo XC90). While the car SETUP is pending nothing
+            // is lost: the held keyframe carries its config.
+            ScreenProxyOp::IphoneConfig { config } => {
+                if let Some(car_screen) = self.car_screen.as_mut()
+                    && let Err(err) = car_screen.repeat_avcc_config(config)
+                {
+                    warn!("Sink rejected iPhone alt screen config?: {err}");
+                }
+            }
             ScreenProxyOp::IphoneStreamFinish => {
                 info!("iPhone has finished its alt screen stream");
                 self.iphone_screen_rx.take();
@@ -157,6 +168,46 @@ mod tests {
             manager.sleep().await;
             manager.reconcile().await
         })
+    }
+
+    #[test]
+    fn every_iphone_config_reaches_the_car_even_when_unchanged() {
+        use catplay_carplay::{
+            screen::tx::ScreenTransmitOp,
+            video::{AvccConfig, AvccConfigExtended},
+        };
+        use std::{collections::VecDeque, sync::Mutex};
+
+        let config = AvccConfigExtended {
+            hevc: false,
+            avcc: AvccConfig {
+                nal_size_len: 4,
+                sps_pps: vec![1, 2].into(),
+            },
+            video_latency: Duration::ZERO,
+            width: 1920,
+            height: 720,
+            respect_timestamps: true,
+        };
+        let queue = Arc::new(Mutex::new(VecDeque::<ScreenTransmitOp>::new()));
+        let proxy = ScreenTransmitProxy::new(Duration::ZERO, queue.clone(), Default::default(), Notify::new(), Notify::new(), 1);
+        let mut manager = AltScreenManager::default();
+        let (iphone_tx, iphone_rx) = mpsc::unbounded();
+        let (setup_tx, setup_rx) = oneshot::channel();
+        manager.set_iphone_screen(iphone_rx, Some(UUID.into()));
+        manager.set_pending_setup(setup_rx);
+        let _ = setup_tx.send(TeardownGuard::new(proxy, || {}));
+        assert!(step(&mut manager).is_none());
+
+        // The first config of the stream, then the ClearScreen and the regular VideoConfig the iPhone sends after each showUI:
+        // the same config three times. Deduplicating them leaves the car's display black.
+        for sent in 1..=3 {
+            let _ = iphone_tx.unbounded_send(ScreenProxyOp::IphoneConfig { config: config.clone() });
+            assert!(step(&mut manager).is_none());
+            let queue = queue.lock().unwrap();
+            assert_eq!(queue.len(), sent, "config {sent} was not written to the car");
+            assert!(queue.iter().all(|op| op.is_configure()));
+        }
     }
 
     #[test]

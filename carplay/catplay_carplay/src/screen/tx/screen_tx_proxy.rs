@@ -49,6 +49,17 @@ impl ScreenTransmitProxy {
     }
 }
 
+impl ScreenTransmitProxy {
+    /// Queues `config` even when it equals the last one, unlike [ScreenTransmitSink::push_avcc_config].
+    ///
+    /// For a proxied stream whose sender repeated its VideoConfig on purpose: an iPhone does so after every showUI, and a
+    /// receiver that got only the keyframe that follows kept its display black (Volvo XC90 instrument cluster).
+    pub fn repeat_avcc_config(&mut self, config: AvccConfigExtended) -> Result<(), ScreenTransmitError> {
+        self.last_config = None;
+        self.push_avcc_config(config)
+    }
+}
+
 impl ScreenTransmitSink for ScreenTransmitProxy {
     fn stream_latency(&self) -> Duration {
         self.stream_latency
@@ -146,5 +157,72 @@ impl Drop for ScreenTransmitProxy {
         debug!("Screen transmitter was dropped!");
         // self.queue.lock().unwrap().push_back(ScreenTransmitOp::TransmitterDropped);
         self.notify_frame_added.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::video::AvccConfig;
+    use futures::executor::block_on;
+    use std::time::Instant;
+
+    fn config() -> AvccConfigExtended {
+        AvccConfigExtended {
+            hevc: false,
+            avcc: AvccConfig {
+                nal_size_len: 4,
+                sps_pps: vec![1, 2].into(),
+            },
+            video_latency: Duration::ZERO,
+            width: 1920,
+            height: 720,
+            respect_timestamps: true,
+        }
+    }
+
+    fn keyframe() -> EncodedVideoFrame {
+        EncodedVideoFrame {
+            pts: Instant::now().into(),
+            width: 1920,
+            height: 720,
+            data: [0u8; 4].as_slice().into(),
+            config: Some(config()),
+            nal_offsets: None,
+            is_keyframe: Some(true),
+            header_buf: Default::default(),
+            chacha_tag_buf: Default::default(),
+        }
+    }
+
+    /// The queued ops as `C` (config) and `F` (frame).
+    fn queued(queue: &Mutex<VecDeque<ScreenTransmitOp>>) -> String {
+        let ops = queue.lock().unwrap();
+        ops.iter()
+            .map(|op| if op.is_configure() { 'C' } else { 'F' })
+            .collect()
+    }
+
+    #[test]
+    fn a_repeated_config_is_queued_again_but_a_frame_does_not_duplicate_it() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut proxy = ScreenTransmitProxy::new(Duration::ZERO, queue.clone(), Default::default(), Notify::new(), Notify::new(), 8);
+
+        block_on(proxy.push_frame(keyframe()))
+            .map_err(|(err, _)| err)
+            .unwrap();
+        assert_eq!(queued(&queue), "CF");
+
+        // An unchanged config pushed the ordinary way (or carried by a frame) is still deduplicated.
+        proxy.push_avcc_config(config()).unwrap();
+        assert_eq!(queued(&queue), "CF");
+
+        // After showUI: ClearScreen VideoConfig, regular VideoConfig, keyframe.
+        proxy.repeat_avcc_config(config()).unwrap();
+        proxy.repeat_avcc_config(config()).unwrap();
+        block_on(proxy.push_frame(keyframe()))
+            .map_err(|(err, _)| err)
+            .unwrap();
+        assert_eq!(queued(&queue), "CFCCF");
     }
 }
