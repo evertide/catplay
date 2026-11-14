@@ -94,6 +94,34 @@ plist_struct! {
 plist_struct! {
     pub struct CommandRequestUI {
         pub url: Option<String>,
+        /// UUID of the display the UI is requested on (sent by e.g. Volvo). If omitted, the main display is implied.
+        pub uuid: Option<String>,
+    }
+}
+
+// Sent by the car to show an app on a display, e.g. the Apple Maps view on the instrument cluster
+// (`maps:/car/instrumentcluster`) when the driver switches the cluster to CarPlay.
+plist_struct! {
+    pub struct CommandShowUI {
+        pub url: Option<String>,
+        /// UUID of the display to show the UI on.
+        pub uuid: Option<String>,
+    }
+}
+
+// Sent by the car when a display no longer shows CarPlay UI.
+plist_struct! {
+    pub struct CommandStopUI {
+        /// UUID of the display that stopped showing the UI.
+        pub uuid: Option<String>,
+    }
+}
+
+// Sent by the iPhone with the app URLs it suggests the car to show.
+plist_struct! {
+    pub struct CommandSuggestUI {
+        #[serde(default)]
+        pub urls: Vec<String>,
     }
 }
 
@@ -101,6 +129,8 @@ plist_struct! {
     pub struct CommandSetNightMode {
         /// True if it is dark outside, false otherwise.
         pub night_mode: bool,
+        /// UUID of the display this applies to (sent by e.g. Volvo). If omitted, all displays are implied.
+        pub uuid: Option<String>,
     }
 }
 

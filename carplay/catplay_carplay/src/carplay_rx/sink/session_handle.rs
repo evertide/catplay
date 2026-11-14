@@ -66,6 +66,7 @@ impl AirPlayReceiverHandle for AirPlayReceiverHandleImpl {
                 "" => None,
                 v => Some(v.into()),
             },
+            uuid: None,
         }));
     }
 
