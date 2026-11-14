@@ -126,7 +126,8 @@ impl LocationBridge {
         if let Some(updates) = state.updates.as_ref() {
             updates.buffer.lock().unwrap().clear();
         }
-        if owner != state.owner {
+        // Keep an idle endpoint that opened before Bluetooth Start.
+        if owner != state.owner && self.is_requested() {
             state.updates = None;
         }
         state.owner = owner;
@@ -137,13 +138,9 @@ impl LocationBridge {
         self.request.borrow().is_some()
     }
 
-    /// AirPlay owns delivery; a Bluetooth disconnect must not cancel the request.
+    /// AirPlay owns delivery without changing the request owner.
     pub fn subscribe(&self) -> LocationSubscription {
         let mut state = self.state.lock().unwrap();
-        // Bind to the newest connection even if its Bluetooth Start is still pending.
-        // Reserve the first owner when AirPlay opens without Bluetooth.
-        state.next_owner = state.next_owner.max(1);
-        state.owner = state.next_owner;
         let (changed, updates) = watch::channel(());
         let buffer = Arc::new(Mutex::new(PendingLocation::new()));
         if let Some(previous) = state.updates.take() {
@@ -158,19 +155,17 @@ impl LocationBridge {
             buffer,
             pending: false,
             bridge: self.clone(),
-            owner: state.owner,
         }
     }
 }
 
 /// Keeps the latest unconsumed message per sentence type. Dropping the current
-/// owner's receiver cancels its request and wakes every USB session.
+/// receiver cancels its request and wakes every USB session.
 pub struct LocationSubscription {
     updates: watch::Receiver<()>,
     buffer: Arc<Mutex<PendingLocation>>,
     pending: bool,
     bridge: LocationBridge,
-    owner: u64,
 }
 
 impl EventSleeper for LocationSubscription {
@@ -189,16 +184,16 @@ impl LocationSubscription {
     pub fn set_request(&self, request: Option<StartLocationInformation>) {
         let mut state = self.bridge.state.lock().unwrap();
         if self.is_current(&state) {
-            self.bridge.update_request(&mut state, self.owner, request);
+            let owner = state.owner;
+            self.bridge.update_request(&mut state, owner, request);
         }
     }
 
     fn is_current(&self, state: &LocationState) -> bool {
-        state.owner == self.owner
-            && state
-                .updates
-                .as_ref()
-                .is_some_and(|updates| Arc::ptr_eq(&updates.buffer, &self.buffer))
+        state
+            .updates
+            .as_ref()
+            .is_some_and(|updates| Arc::ptr_eq(&updates.buffer, &self.buffer))
     }
 
     pub fn take(&mut self, max_payload_bytes: usize) -> Option<LocationInformation> {

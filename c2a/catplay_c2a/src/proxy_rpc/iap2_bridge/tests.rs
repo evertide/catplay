@@ -1173,6 +1173,56 @@ fn another_bluetooth_connection_and_its_stop_leave_the_active_airplay_owner_alon
 }
 
 #[test]
+fn bluetooth_constructed_before_airplay_cannot_stop_another_connections_request() {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    let phone_out = Arc::new(Capture::default());
+    ready(&mut car, &car_out);
+    let mut first = bluetooth(location.clone());
+    respond(&mut first, &phone_out, build_12_request());
+    // This connection has never sent Start; opening AirPlay must not select it.
+    let mut next = bluetooth(location.clone());
+    let mut airplay = phone(location.clone());
+    pump(&mut car, &car_out);
+    let commands = car_out.location_commands();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].cast::<StartLocationInformation>(), Some(&build_12_request()));
+    respond(&mut car, &car_out, sample());
+    airplay.wait_event().now_or_never().unwrap();
+
+    respond(&mut next, &phone_out, StopLocationInformation::default());
+    assert!(location.is_requested());
+    assert!(!car.process_event(car_out.clone()).unwrap());
+    assert!(car_out.location_commands().is_empty());
+    pump(&mut airplay, &phone_out);
+    assert_eq!(take_location(&phone_out), sample());
+    respond(&mut car, &car_out, sample());
+    pump(&mut airplay, &phone_out);
+    assert_eq!(take_location(&phone_out), sample());
+
+    // The original Bluetooth session must still be able to change its request.
+    let mut replacement = build_12_request();
+    replacement.nmea_sentence_gpgga_interval_min = Some(500);
+    respond(&mut first, &phone_out, replacement.clone());
+    pump(&mut car, &car_out);
+    let commands = car_out.location_commands();
+    assert_eq!(commands.len(), 2);
+    assert!(commands[0].cast::<StopLocationInformation>().is_some());
+    assert_eq!(commands[1].cast::<StartLocationInformation>(), Some(&replacement));
+    respond(&mut car, &car_out, sample());
+    pump(&mut airplay, &phone_out);
+    assert_eq!(take_location(&phone_out), sample());
+
+    drop(airplay);
+    assert!(!location.is_requested());
+    pump(&mut car, &car_out);
+    let commands = car_out.location_commands();
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].cast::<StopLocationInformation>().is_some());
+}
+
+#[test]
 fn old_transports_cannot_control_or_cancel_a_new_bluetooth_handoff() {
     for replace_before_drop in [false, true] {
         let location = LocationBridge::default();
