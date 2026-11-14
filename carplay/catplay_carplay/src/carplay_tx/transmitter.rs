@@ -22,10 +22,17 @@ use crate::{
     common::{AIRPLAY_TX_IOS_BUILD, AIRPLAY_TX_IOS_MODEL, AIRPLAY_TX_IOS_VERSION, AIRPLAY_TX_SDK_VERSION, AirPlayEncryptionType},
     events::{CommandQueue, CommandQueueDrain, EventsServer},
     keep_alive::KeepAliveClient,
-    msg::{ControllerFeature, InfoMessageResponse, InitialSetup},
+    msg::{ControllerFeature, InfoMessage, InfoMessageResponse, InitialSetup},
     rtsp_frame::{RtspError, RtspQueue},
     rtsp_session::{RtspTransmitter, RtspTransmitterCallback, RtspTransmitterEvent, RtspTransmitterHandle},
 };
+
+/// Instrument cluster URLs an iPhone announces in its GET /info (Apple Maps), as captured from a real session.
+const ALT_SCREEN_URLS: [&str; 3] = [
+    "maps:/car/instrumentcluster/map",
+    "maps:/car/instrumentcluster/instructioncard",
+    "maps:/car/instrumentcluster",
+];
 
 #[derive(EventSleeper)]
 pub struct AirPlayTransmitterBootstrapSession {
@@ -430,11 +437,24 @@ impl AirPlayTransmitterBootstrapSession {
             .map_err(AirPlayTransmitterBootstrapError::FailedInitialSetup)
             .await?;
 
+        streams.enabled_features = resp.enabled_features;
+        streams
+            .enabled_features
+            .retain(|f| controller_features.contains(f));
+
         let info_start = Instant::now();
-        // Get /info
+        // Get /info. Like an iPhone, announce the instrument cluster URLs when the alt screen is enabled; a Volvo XC90 without
+        // them requested the cluster UI (showUI) and received the stream, but kept its driver display black.
+        let alt_screen = streams
+            .enabled_features
+            .contains(&ControllerFeature::AltScreen);
+        let info_req = InfoMessage {
+            alt_screen_urls: alt_screen.then(|| ALT_SCREEN_URLS.iter().map(|url| url.to_string()).collect()),
+            ..Default::default()
+        };
         debug!("Getting /info ...");
         let info = client
-            .info()
+            .info(info_req)
             .map_err(AirPlayTransmitterBootstrapError::FailedInfo)
             .await?;
         debug!("Got info: {info:?}");
@@ -447,11 +467,6 @@ impl AirPlayTransmitterBootstrapSession {
         // **DO NOT** perform two-way UDP binding
         // Receiver will re-create it's own side of the socket during idle transition, changing port, and next calls to screen SETUP will timeout trying to sync time!
         // timing_server.0.connect_finish(timing_ip).map_err(AirPlayTransmitterBootstrapError::FailedToBind)?;
-
-        streams.enabled_features = resp.enabled_features;
-        streams
-            .enabled_features
-            .retain(|f| controller_features.contains(f));
 
         let mut event_ip = peer_ip;
         event_ip.set_port(resp.event_port);

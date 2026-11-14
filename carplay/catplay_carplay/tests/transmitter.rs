@@ -18,7 +18,7 @@ use catplay_carplay::{
     carplay_tx::{AirPlayTransmitterBootstrap, AirPlayTransmitterBootstrapError, AirPlayTransmitterImpl},
     cipher::AirPlayStreamEncryption,
     common::AirPlayEncryptionType,
-    msg::{AudioFormat, AudioType, Display, InfoMessageResponse, InitialSetup, StreamType},
+    msg::{AudioFormat, AudioType, ControllerFeature, Display, InfoMessage, InfoMessageResponse, InitialSetup, StreamType},
     rtsp_frame::{HttpStatus, RtspError, RtspMethod, RtspResult},
     rtsp_session::{RtspReceiver, RtspReceiverCallback, RtspReceiverEvent, RtspReceiverEventResult},
     screen::{
@@ -41,6 +41,8 @@ use uuid::Uuid;
 
 struct MockSink {
     log: RequestLog,
+    /// Controller features the receiver enables, if offered.
+    enables: Vec<ControllerFeature>,
 }
 struct MockScreenSink {
     log: RequestLog,
@@ -91,6 +93,14 @@ impl AsyncShutdown for MockScreenSink {}
 impl AirPlayReceiverSink for MockSink {
     async fn on_info(&mut self, info: &mut InfoMessageResponse) {
         info.displays.push(Display::default());
+    }
+
+    async fn negotiate_features(&mut self, offered: &[ControllerFeature]) -> Vec<ControllerFeature> {
+        offered
+            .iter()
+            .filter(|f| self.enables.contains(f))
+            .cloned()
+            .collect()
     }
 
     async fn open_screen(&mut self, latency: Duration) -> RtspResult<ScreenReceiverSinkBox> {
@@ -144,6 +154,10 @@ struct Recorded {
     shared_secret: Option<[u8; 32]>,
     /// Payloads of the video frames the receiver decoded, in order.
     frames: Vec<Vec<u8>>,
+    /// The `altScreenURLs` of every GET /info the receiver got, in order.
+    info_alt_screen_urls: Vec<Option<Vec<String>>>,
+    /// Whether each GET /info body literally contains the key `altScreenURLs` (independent of the Rust type's spelling).
+    info_raw_key: Vec<bool>,
 }
 
 type RequestLog = Arc<Mutex<Recorded>>;
@@ -167,6 +181,16 @@ struct RecordingReceiver {
 impl EventSink<RtspReceiverEvent<'_>, RtspReceiverEventResult> for RecordingReceiver {
     async fn on_event<'a>(&mut self, event: RtspReceiverEvent<'a>) -> RtspReceiverEventResult {
         if let RtspReceiverEvent::Request { request, .. } = &event {
+            if request.method == RtspMethod::Get && request.url == "/info" {
+                let urls = request
+                    .get_plist::<InfoMessage>()
+                    .ok()
+                    .and_then(|info| info.alt_screen_urls);
+                let raw_key = request.payload.windows(13).any(|w| w == b"altScreenURLs");
+                let mut log = self.log.lock().unwrap();
+                log.info_alt_screen_urls.push(urls);
+                log.info_raw_key.push(raw_key);
+            }
             let et = match request.method {
                 RtspMethod::Setup => request
                     .get_plist::<InitialSetup>()
@@ -241,6 +265,22 @@ async fn connect_recording(
     Result<AirPlayTransmitterImpl, AirPlayTransmitterBootstrapError>,
     RequestLog,
 ) {
+    connect_with_features(vec![], vec![], pair_first, remote_homekit_id, refuse, identities).await
+}
+
+/// `offered` are the transmitter's controller features, `enabled` the ones the receiver accepts.
+async fn connect_with_features(
+    controller_features: Vec<ControllerFeature>,
+    enabled: Vec<ControllerFeature>,
+    pair_first: bool,
+    remote_homekit_id: Option<Uuid>,
+    refuse: Refuse,
+    identities: Identities,
+) -> (
+    impl Sized,
+    Result<AirPlayTransmitterImpl, AirPlayTransmitterBootstrapError>,
+    RequestLog,
+) {
     let log = RequestLog::default();
     let receiver = AirPlayReceiver::new(
         "fake_iface",
@@ -248,7 +288,10 @@ async fn connect_recording(
         identities.rx.clone(),
         None,
         AirPlayServerShared::new(),
-        Box::new(MockSink { log: log.clone() }),
+        Box::new(MockSink {
+            log: log.clone(),
+            enables: enabled,
+        }),
         AirPlayReceiverProfile::CarPlay,
     );
     let recording = RecordingReceiver {
@@ -263,7 +306,7 @@ async fn connect_recording(
     let bootstrap = AirPlayTransmitterBootstrap {
         homekit: identities.tx.clone(),
         peer_ip: bind,
-        controller_features: vec![],
+        controller_features,
         remote_homekit_id,
         pair_first,
     };
@@ -542,4 +585,29 @@ async fn setups_video_audio_streams() {
 #[tokio::test]
 async fn setups_video_audio_streams_when_paired() {
     streams_video_and_audio(true).await;
+}
+
+const CLUSTER_URLS: [&str; 3] = [
+    "maps:/car/instrumentcluster/map",
+    "maps:/car/instrumentcluster/instructioncard",
+    "maps:/car/instrumentcluster",
+];
+
+#[tokio::test]
+async fn announces_cluster_urls_only_with_alt_screen() {
+    use ControllerFeature::{AltScreen, ViewAreas};
+    let urls = CLUSTER_URLS.map(String::from).to_vec();
+    // (offered by the transmitter, enabled by the receiver, expected altScreenURLs)
+    let cases = [
+        (vec![AltScreen], vec![AltScreen], Some(urls)),
+        (vec![AltScreen], vec![], None),
+        (vec![ViewAreas], vec![AltScreen, ViewAreas], None),
+    ];
+    for (offered, enabled, expected) in cases {
+        let (_rx, tx, log) = connect_with_features(offered.clone(), enabled.clone(), false, None, refuse_nothing, Identities::new()).await;
+        tx.unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(log.info_raw_key, [expected.is_some()], "offered {offered:?}, enabled {enabled:?}");
+        assert_eq!(log.info_alt_screen_urls, [expected], "offered {offered:?}, enabled {enabled:?}");
+    }
 }
