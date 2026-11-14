@@ -444,6 +444,13 @@ impl CsmSession for CarPlayServerSession {
         }
 
         if let Some(start_location) = packet.cast::<StartLocationInformation>() {
+            if !self.gps_sub {
+                info!(
+                    "iPhone StartLocationInformation: transport={:?}, event_consumer={}, request={start_location:?}",
+                    _handle.remote(),
+                    !self.events_tx.is_closed(),
+                );
+            }
             self.gps_sub = true;
             self.publish(CarPlayServerSessionEventTx::StartLocationInformation(start_location.clone()));
         }

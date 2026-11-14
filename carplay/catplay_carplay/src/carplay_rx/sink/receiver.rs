@@ -149,6 +149,7 @@ struct Streams {
     #[sleep]
     iap2_commands: FuturesUnordered<RtspFuture>,
     iap2_optional: bool,
+    received_iap2: bool,
 
     handle: Option<AirPlayReceiverHandleRef>,
 }
@@ -630,6 +631,7 @@ impl AirPlayReceiver {
         let (client, drain) = AsyncClient::new(false, CsmRemote::airplay(), _sink);
         self.streams.iap2_drain.replace(drain);
         self.streams.iap2.replace(client);
+        info!("AirPlay iAP2 endpoint opened: optional={}", self.streams.iap2_optional);
     }
 
     async fn flush_iap2(&mut self) -> RtspResult<()> {
@@ -1031,6 +1033,16 @@ impl AirPlayReceiver {
     }
 
     async fn handle_command(&mut self, cmd: Command) -> RtspResult<RtspResponse> {
+        if let Command::IApSendMessage(message) = &cmd
+            && !self.streams.received_iap2
+        {
+            info!(
+                "First AirPlay iAPSendMessage received: bytes={}, local_endpoint={}",
+                message.data.len(),
+                self.streams.iap2.is_some(),
+            );
+            self.streams.received_iap2 = true;
+        }
         self.sink.on_command_raw(&cmd).await?;
 
         match cmd {

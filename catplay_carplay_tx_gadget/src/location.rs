@@ -110,6 +110,7 @@ pub(crate) struct CarLocation {
     started: bool,
     authenticated: bool,
     active: Option<StartLocationInformation>,
+    received_location: bool,
 }
 
 impl Default for CarLocation {
@@ -129,14 +130,19 @@ impl CarLocation {
             started: false,
             authenticated: false,
             active: None,
+            received_location: false,
         }
     }
 
     pub fn start(&mut self, handle: &CsmClientHandleRef) {
         self.started = !handle.is_downgrade();
+        info!("Car GPS bridge started: iAP2={}", self.started);
     }
 
     pub fn authenticate(&mut self) {
+        if !self.authenticated {
+            info!("Car GPS authentication complete");
+        }
         self.authenticated = true;
     }
 
@@ -149,6 +155,15 @@ impl CarLocation {
         self.authenticated = false;
         self.supported
             .store(self.started && supports_location(id), Ordering::Relaxed);
+        info!(
+            "Car GPS identification complete: component={:?}, wants_rx(StartLocationInformation)={}, \
+             wants_rx(StopLocationInformation)={}, wants_tx(LocationInformation)={}, available={}",
+            id.location_information_component,
+            id.wants_rx(StartLocationInformation::PACKET_ID),
+            id.wants_rx(StopLocationInformation::PACKET_ID),
+            id.wants_tx(LocationInformation::PACKET_ID),
+            self.supported.load(Ordering::Relaxed),
+        );
         Ok(())
     }
 
@@ -165,13 +180,21 @@ impl CarLocation {
         self.stop(handle)?;
         if let Some(request) = wanted {
             handle.send(&request)?;
-            info!("Requested car location updates: {request:?}");
+            info!("Car GPS StartLocationInformation sent: {request:?}");
             self.active = Some(request);
         }
         Ok(true)
     }
 
-    pub fn forward(&self, packet: &LocationInformation) {
+    pub fn forward(&mut self, packet: &LocationInformation) {
+        if !self.received_location {
+            info!(
+                "Car GPS first LocationInformation received: sentences={}, active={}",
+                packet.nmea_sentence.len(),
+                self.active.is_some(),
+            );
+            self.received_location = true;
+        }
         if self.active.is_some()
             && let Some((_, updates)) = self.bridge.request.borrow().as_ref()
         {

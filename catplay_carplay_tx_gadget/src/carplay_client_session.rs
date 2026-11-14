@@ -716,7 +716,10 @@ impl CsmSession for CarPlayClientSession {
         if self.start.is_none() {
             self.start.replace(Instant::now());
         }
-        warn!("-> Incoming packet @ {:?}: {:?}", Instant::now() - self.start.unwrap(), packet);
+        // Location traffic has a one-shot INFO log in CarLocation::forward.
+        if packet.cast::<LocationInformation>().is_none() {
+            warn!("-> Incoming packet @ {:?}: {:?}", Instant::now() - self.start.unwrap(), packet);
+        }
 
         if let Some(_id) = IdentificationInformation::cast(&packet) {
             self.id = _id.clone();

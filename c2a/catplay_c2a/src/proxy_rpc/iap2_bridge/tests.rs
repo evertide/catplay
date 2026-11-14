@@ -501,6 +501,52 @@ fn iap2_command() -> Command {
     })
 }
 
+#[test]
+fn volvo_negotiation_waits_for_an_iphone_location_request() {
+    let location = LocationBridge::default();
+    let mut car = CarPlayClientSession::with_location(location.clone());
+    let car_out = Arc::new(Capture::default());
+    block_on(car.start(car_out.clone())).unwrap();
+    // Message lists from the XC90 build 10 identification, including 0xFFFA/B/C.
+    respond(
+        &mut car,
+        &car_out,
+        IdentificationInformation {
+            messages_sent_by_accessory: IdentificationInformation::pack_ids(&[
+                16724, 16726, 16731, 16732, 43521, 43523, 43526, 44544, 44546, 44547, 65531, 16736, 20480, 20482, 16727, 16729,
+            ]),
+            messages_received_from_device: IdentificationInformation::pack_ids(&[
+                16725, 19982, 43520, 43525, 43524, 43522, 44545, 65530, 65532, 19979, 20481, 16728,
+            ]),
+            ..car_id()
+        },
+    );
+    respond(&mut car, &car_out, AuthenticationResponse::default());
+    assert!(location.is_available());
+
+    let (mut sink, _proxy) = airplay_sink(location, Some(wireless_identity()));
+    let mut endpoint = sink.open_iap2().now_or_never().unwrap().unwrap();
+    let phone_out = Arc::new(Capture::default());
+    respond(&mut endpoint, &phone_out, StartIdentification::default());
+    let packets = phone_out.take();
+    let id = packets[0].cast::<IdentificationInformation>().unwrap();
+    assert!(id.location_information_component.is_some());
+    assert!(id.wants_tx(LocationInformation::PACKET_ID));
+    assert!(id.wants_rx(StartLocationInformation::PACKET_ID));
+    assert!(id.wants_rx(StopLocationInformation::PACKET_ID));
+    respond(&mut endpoint, &phone_out, IdentificationAccepted::default());
+    respond(&mut endpoint, &phone_out, AuthenticationSucceeded::default());
+    assert!(!car.process_event(car_out.clone()).unwrap());
+    assert!(car_out.location_commands().is_empty());
+
+    respond(&mut endpoint, &phone_out, StartLocationInformation::all());
+    pump(&mut endpoint, &phone_out);
+    pump(&mut car, &car_out);
+    let commands = car_out.location_commands();
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].cast::<StartLocationInformation>().is_some());
+}
+
 fn assert_proxied(sink: &mut CarPlayRxSession, proxy: &mut mpsc::UnboundedReceiver<TxAdapterOp>) {
     let command = iap2_command();
     let mut future = sink.on_command_raw(&command);

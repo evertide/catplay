@@ -17,6 +17,7 @@ use catplay_carplay_tx_gadget::location::LocationBridge;
 use catplay_iap2_client::CsmSessionBox;
 use catplay_mfi::MfiDeficeRef;
 use catplay_util::{AsyncShutdown, EventReconciler, EventSleeper};
+use log::info;
 
 use crate::proxy_rpc::{Iap2LocationBridge, tx_adapter::TxAdapter};
 
@@ -114,10 +115,18 @@ impl AirPlayReceiverSink for CarPlayRxSession {
     }
 
     async fn open_iap2(&mut self) -> Option<CsmSessionBox> {
-        if self.reject || !self.location.is_available() {
+        let available = self.location.is_available();
+        let identity = self.identity.lock().unwrap().clone();
+        info!(
+            "AirPlay GPS endpoint gate: rejected={}, car_location_available={}, wireless_identity={}",
+            self.reject,
+            available,
+            identity.is_some(),
+        );
+        if self.reject || !available {
             return None;
         }
-        let identity = self.identity.lock().unwrap().clone()?;
+        let identity = identity?;
         self.local_iap2 = true;
         Some(Iap2LocationBridge::new(self.mfi.clone(), identity, self.location.clone()))
     }
