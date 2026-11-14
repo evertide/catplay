@@ -1,10 +1,11 @@
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
+use bytes::BytesMut;
 use catplay_carplay::{
     audio::{
         AudioPlayer, AudioPlayerBox, AudioPlayerEvent, AudioRecorder, AudioRecorderBox, AudioRecorderControl, AudioRecorderEvent,
@@ -24,7 +25,7 @@ use catplay_carplay::{
         rx::{ScreenReceiverSink, ScreenReceiverSinkBox},
         tx::ScreenTransmitSink,
     },
-    video::{AvccConfig, AvccConfigExtended, EncodedVideoFrame},
+    video::{AvccConfig, AvccConfigExtended, EncodedVideoFrame, Pts},
 };
 use catplay_hap::{HomekitStorageFile, HomekitStorageRef};
 use catplay_tokio::TcpHelper;
@@ -38,8 +39,12 @@ use tokio::{
 };
 use uuid::Uuid;
 
-struct MockSink {}
-struct MockScreenSink {}
+struct MockSink {
+    log: RequestLog,
+}
+struct MockScreenSink {
+    log: RequestLog,
+}
 struct MockRecorder {}
 struct MockPlayer {}
 
@@ -70,6 +75,7 @@ impl ScreenReceiverSink for MockScreenSink {
     }
 
     async fn process_frame(&mut self, frame: EncodedVideoFrame) -> RtspResult<()> {
+        self.log.lock().unwrap().frames.push(frame.data.to_vec());
         Ok(())
     }
 
@@ -88,7 +94,7 @@ impl AirPlayReceiverSink for MockSink {
     }
 
     async fn open_screen(&mut self, latency: Duration) -> RtspResult<ScreenReceiverSinkBox> {
-        Ok(Box::new(MockScreenSink {}))
+        Ok(Box::new(MockScreenSink { log: self.log.clone() }))
     }
 
     async fn open_audio(
@@ -136,6 +142,8 @@ struct Recorded {
     requests: Vec<Seen>,
     /// The session key the receiver switched to after /pair-verify.
     shared_secret: Option<[u8; 32]>,
+    /// Payloads of the video frames the receiver decoded, in order.
+    frames: Vec<Vec<u8>>,
 }
 
 type RequestLog = Arc<Mutex<Recorded>>;
@@ -223,11 +231,6 @@ impl Identities {
 }
 
 /// Returns the receiver handle too: dropping it would stop the mock receiver.
-async fn connect_to_mock_receiver(pair_first: bool) -> (impl Sized, AirPlayTransmitterImpl) {
-    let (rx, transmitter, _) = connect_recording(pair_first, None, refuse_nothing, Identities::new()).await;
-    (rx, transmitter.unwrap())
-}
-
 async fn connect_recording(
     pair_first: bool,
     remote_homekit_id: Option<Uuid>,
@@ -238,16 +241,16 @@ async fn connect_recording(
     Result<AirPlayTransmitterImpl, AirPlayTransmitterBootstrapError>,
     RequestLog,
 ) {
+    let log = RequestLog::default();
     let receiver = AirPlayReceiver::new(
         "fake_iface",
         MacAddr6::default(),
         identities.rx.clone(),
         None,
         AirPlayServerShared::new(),
-        Box::new(MockSink {}),
+        Box::new(MockSink { log: log.clone() }),
         AirPlayReceiverProfile::CarPlay,
     );
-    let log = RequestLog::default();
     let recording = RecordingReceiver {
         inner: receiver,
         log: log.clone(),
@@ -265,7 +268,8 @@ async fn connect_recording(
         pair_first,
     };
     // A bootstrap that never reports its result would hang the test instead of failing it.
-    let result = timeout(Duration::from_secs(10), AirPlayTransmitterImpl::connect(bootstrap))
+    // Generous, because a full SRP pair-setup in a debug build is slow on loaded CI runners.
+    let result = timeout(Duration::from_secs(30), AirPlayTransmitterImpl::connect(bootstrap))
         .await
         .expect("connect() must return");
     (rx, result, log)
@@ -455,8 +459,9 @@ async fn gives_up_when_the_setup_after_pairing_first_is_refused() {
     assert_eq!(setups(&log), [true], "no unpaired retry after pairing worked: {log:?}");
 }
 
-#[tokio::test]
-async fn setups_video_audio_streams() {
+/// Sets up screen and audio streams and checks that a video frame reaches the receiver intact,
+/// which proves both ends use the same stream key (the pairing secret when paired).
+async fn streams_video_and_audio(pair_first: bool) {
     setup_test_logger(true);
     let sps_pps: Vec<u8> = vec![
         0x00, 0x00, 0x00, 0x01, // start code
@@ -474,14 +479,33 @@ async fn setups_video_audio_streams() {
         respect_timestamps: true,
     };
 
-    let (_rx, mut _transmitter) = connect_to_mock_receiver(false).await;
-    let mut sink = _transmitter
+    let (_rx, transmitter, log) = connect_recording(pair_first, None, refuse_nothing, Identities::new()).await;
+    let mut transmitter = transmitter.unwrap();
+    let mut sink = transmitter
         .do_setup_video(StreamType::Screen, Duration::from_millis(75), None)
         .await
         .unwrap();
     sink.push_avcc_config(config).unwrap();
 
-    let _ = _transmitter
+    // An IDR slice in Annex-B; the receiver hands it back in Annex-B after decrypting.
+    let keyframe: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x33, 0xFF, 0x12, 0x34, 0x56, 0x78];
+    let frame = EncodedVideoFrame {
+        pts: Pts(Instant::now()),
+        width: 1920,
+        height: 1080,
+        data: BytesMut::from(keyframe.as_slice()),
+        config: None,
+        nal_offsets: None,
+        is_keyframe: Some(true),
+        header_buf: BytesMut::new(),
+        chacha_tag_buf: BytesMut::new(),
+    };
+    sink.push_frame(frame)
+        .await
+        .map_err(|(err, _)| err)
+        .unwrap();
+
+    transmitter
         .do_setup_audio(
             Duration::from_millis(32),
             StreamType::MainAudio,
@@ -492,8 +516,30 @@ async fn setups_video_audio_streams() {
         )
         .await
         .unwrap();
-    sleep(Duration::from_millis(500)).await;
 
-    // TODO assert result
-    debug!("Paired!")
+    let received = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(frame) = log.lock().unwrap().frames.first().cloned() {
+                return frame;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the receiver never decoded the video frame: {log:?}"));
+    assert_eq!(received, keyframe, "the frame must arrive intact");
+    if pair_first {
+        assert_streams_use_pairing_secret(&mut transmitter, &log);
+    }
+}
+
+#[tokio::test]
+async fn setups_video_audio_streams() {
+    streams_video_and_audio(false).await;
+}
+
+/// The Volvo black screen: after pairing, the screen stream must be encrypted with the pairing secret.
+#[tokio::test]
+async fn setups_video_audio_streams_when_paired() {
+    streams_video_and_audio(true).await;
 }
