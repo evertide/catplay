@@ -8,7 +8,7 @@ use catplay_hap::{HomekitStorageRef, auth_setup::MfiSapSuccess};
 use catplay_tokio::{TcpHelper, UdpHelper};
 use catplay_util::{AsyncShutdown, EventReconciler, EventSink, EventSleeper, LazyAsync};
 use futures::{TryFutureExt, channel::oneshot};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use rand::Rng;
 use uuid::Uuid;
 
@@ -57,6 +57,9 @@ pub struct AirPlayTransmitterBootstrapSession {
     aes_iv: Option<[u8; 16]>,
 
     wants_pair_setup: bool,
+    /// Set when pairing was tried first (recent receivers): if it fails, SETUP is still tried unpaired once,
+    /// so the change stays strictly additive for receivers that worked without pairing.
+    unpaired_fallback: bool,
     wants_auth_setup: bool,
 }
 
@@ -93,7 +96,7 @@ goto /pair-setup      goto auth gate
    +--------+--------+
    |                 |
    v ok              v error
-goto auth gate      fail bootstrap
+goto auth gate      paired first? SETUP unpaired once : fail bootstrap
 
 +-------------------------+
 | auth gate               |
@@ -224,6 +227,7 @@ impl AirPlayTransmitterBootstrapSession {
             bootstrap.remote_homekit_id,
             result_tx,
             bootstrap.controller_features,
+            bootstrap.pair_first,
         ));
         let helper = TcpHelper::connect_timeout(bootstrap.peer_ip, Self::TCP_CONN_TIMEOUT_RTSP, session)
             // Failed to initialize FDs
@@ -247,6 +251,7 @@ impl AirPlayTransmitterBootstrapSession {
         remote_uuid: Option<Uuid>,
         result_tx: BootstrapResultSender,
         controller_features: Vec<ControllerFeature>,
+        pair_first: bool,
     ) -> Self {
         let _features = [
             ControllerFeature::UiContext,
@@ -282,8 +287,9 @@ impl AirPlayTransmitterBootstrapSession {
             controller_features,
 
             // Mercedes advertises HK_PAIRING_AND_ENCRYPT, but stores identity in RAM and it's lost when you exit the car.
-            // Try to bypass /pair-setup when possible for faster connection.
-            wants_pair_setup: false,
+            // Try to bypass /pair-setup when possible for faster connection, unless the receiver needs it.
+            wants_pair_setup: pair_first,
+            unpaired_fallback: pair_first,
 
             wants_auth_setup: true,
 
@@ -300,6 +306,15 @@ impl AirPlayTransmitterBootstrapSession {
     }
 
     fn handle_pair_failure(&mut self, resp: BootstrapResult) {
+        if std::mem::take(&mut self.unpaired_fallback) {
+            if let Err(err) = &resp {
+                error!(
+                    "Pairing first failed, falling back to unpaired SETUP (receivers that need encryption may show a black screen): {err}"
+                );
+            }
+            self.start_setup_task();
+            return;
+        }
         self.send_result(resp);
     }
 
@@ -540,9 +555,12 @@ impl EventSink<RtspTransmitterEvent, ()> for AirPlayTransmitterBootstrapSession 
             RtspTransmitterEvent::SetPeerIp(ip) => self.peer_ip = ip,
             RtspTransmitterEvent::Connected => {
                 debug!("Connected - starting pairing flow");
-                self.start_setup_task();
+                if self.wants_pair_setup {
+                    self.start_pair_task();
+                } else {
+                    self.start_setup_task();
+                }
                 // self.start_auth_setup_task();
-                // self.start_pair_task();
             }
             RtspTransmitterEvent::Encrypted { shared_secret } => {
                 debug!("Paired - starting SETUP/info flow");

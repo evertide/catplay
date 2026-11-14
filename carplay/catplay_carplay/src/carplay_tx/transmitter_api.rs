@@ -26,6 +26,8 @@ pub struct AirPlayTransmitterBootstrap {
     pub controller_features: Vec<ControllerFeature>,
     /// HomeKit UUID of the remote(from Bonjour); used for fast-path in the pairing flow.
     pub remote_homekit_id: Option<Uuid>,
+    /// Pair (HomeKit) before the initial SETUP instead of trying unpaired first.
+    pub pair_first: bool,
 }
 
 #[derive(thiserror::Error, Debug, Clone, PartialEq)]
